@@ -1,0 +1,886 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+mod app;
+mod args;
+mod classify;
+mod connection;
+mod entry;
+mod help;
+mod open;
+mod scan;
+mod source;
+mod ssh;
+mod ui;
+
+use app::App;
+use args::Cli;
+use clap::Parser;
+use connection::ConnectionField;
+use ratatui::layout::Rect;
+use ssh::{SftpSource, SshTarget};
+use std::io::{self, stdout};
+use std::time::{Duration, Instant};
+
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    execute,
+};
+
+fn main() -> io::Result<()> {
+    let cli = Cli::parse();
+
+    if cli.help {
+        help::print_help()?;
+
+        return Ok(());
+    }
+
+    let mut app = if let Some(value) = cli.ssh.as_deref() {
+        let target = match SshTarget::parse(value) {
+            Ok(target) => target,
+
+            Err(error) => {
+                eprintln!("scry: invalid SSH target '{}': {}", value, error,);
+
+                std::process::exit(2);
+            }
+        };
+
+        eprintln!(
+            "scry: connecting to {} through OpenSSH...",
+            target.openssh_destination(),
+        );
+
+        let (remote_home, source) = match SftpSource::connect(&target) {
+            Ok(connection) => connection,
+
+            Err(error) => {
+                eprintln!("scry: remote connection failed: {}", error,);
+
+                std::process::exit(1);
+            }
+        };
+
+        match App::with_source(remote_home, Box::new(source)) {
+            Ok(app) => app,
+
+            Err(error) => {
+                eprintln!("scry: unable to open remote starting directory: {}", error,);
+
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match App::new(cli.path.clone()) {
+            Ok(app) => app,
+
+            Err(error) => {
+                eprintln!("scry: unable to open starting path: {}", error,);
+
+                std::process::exit(1);
+            }
+        }
+    };
+
+    if cli.all {
+        app.toggle_hidden();
+    }
+
+    if cli.tree {
+        app.toggle_tree_mode();
+    }
+
+    if cli.recursive {
+        app.enable_recursive_mode();
+    }
+
+    app.show_permissions = cli.permissions;
+
+    app.show_date = cli.date;
+
+    app.show_size = cli.size;
+
+    app.show_user = cli.user;
+
+    execute!(stdout(), EnableMouseCapture,)?;
+
+    let run_result = ratatui::run(|mut terminal| run_app(&mut terminal, &mut app));
+
+    let disable_result = execute!(stdout(), DisableMouseCapture,);
+
+    run_result?;
+
+    disable_result?;
+
+    if let Some(path) = app.opened_file_path {
+        let containing_directory = path
+            .parent()
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        println!("{} - {}", containing_directory, filename,);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarDragState {
+    start_mouse_row: u16,
+
+    start_selected: usize,
+}
+
+fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
+    let mut ui_regions = ui::UiRegions::default();
+
+    let mut last_left_click: Option<(Instant, u16, u16)> = None;
+
+    let mut scrollbar_drag: Option<ScrollbarDragState> = None;
+
+    let mut help_scrollbar_drag = false;
+
+    terminal.draw(|frame| {
+        ui_regions = ui::render(frame, app);
+    })?;
+
+    while !app.should_quit {
+        let mut needs_redraw = app.process_scan_messages();
+
+        if app.process_transfer_messages() {
+            needs_redraw = true;
+        }
+
+        if app.process_connection_messages() {
+            needs_redraw = true;
+        }
+
+        /*
+         * Redraw while a transfer is active so elapsed time and the popup remain
+         * current between genuine byte-progress messages.
+         */
+        if app.transfer_visible() && !app.transfer_finished() {
+            needs_redraw = true;
+        }
+
+        if event::poll(Duration::from_millis(25))? {
+            match event::read()? {
+                Event::Key(key_event) => {
+                    if key_event.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    handle_key_event(app, key_event);
+
+                    needs_redraw = true;
+                }
+
+                Event::Mouse(mouse_event) => {
+                    handle_mouse_event(
+                        app,
+                        mouse_event,
+                        ui_regions,
+                        &mut last_left_click,
+                        &mut scrollbar_drag,
+                        &mut help_scrollbar_drag,
+                    );
+
+                    needs_redraw = true;
+                }
+
+                Event::Resize(_, _) => {
+                    /*
+                     * The next draw recalculates every layout rectangle and
+                     * updates app.viewport_rows.
+                     */
+                    needs_redraw = true;
+                }
+
+                _ => {}
+            }
+        }
+
+        if app.process_scan_messages() {
+            needs_redraw = true;
+        }
+
+        if app.process_transfer_messages() {
+            needs_redraw = true;
+        }
+
+        if app.process_connection_messages() {
+            needs_redraw = true;
+        }
+
+        if app.connection_in_progress {
+            needs_redraw = true;
+        }
+
+        if needs_redraw {
+            terminal.draw(|frame| {
+                ui_regions = ui::render(frame, app);
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_key_event(app: &mut App, key_event: KeyEvent) {
+    if app.transfer_visible() {
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::Enter, _) | (KeyCode::Esc, _) if app.transfer_finished() => {
+                app.acknowledge_transfer();
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
+    if app.connection_visible() {
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::F(4), _) | (KeyCode::Esc, _) => {
+                app.close_connection_dialog();
+            }
+
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab, _) => {
+                app.connection_focus_previous();
+            }
+
+            (KeyCode::Tab, _) => {
+                app.connection_focus_next();
+            }
+
+            (KeyCode::Enter, _) => {
+                use crate::connection::ConnectionField;
+
+                match app.connection_dialog.focus {
+                    ConnectionField::Connect => {
+                        app.begin_connection();
+                    }
+
+                    ConnectionField::Save => {
+                        app.save_connection_profile();
+                    }
+
+                    ConnectionField::Disconnect => {
+                        app.disconnect_remote();
+                    }
+
+                    /*
+                     * Connect, Delete, and Disconnect receive their real actions in the
+                     * upcoming connection-management stages.
+                     */
+                    ConnectionField::Delete => {}
+
+                    /*
+                     * Enter inside an editable field advances to the next enabled control.
+                     */
+                    _ => {
+                        app.connection_focus_next();
+                    }
+                }
+            }
+
+            (KeyCode::Up, _) => {
+                app.connection_focus_previous();
+            }
+
+            (KeyCode::Down, _) => {
+                app.connection_focus_next();
+            }
+
+            (KeyCode::Backspace, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+                /*
+                 * Some terminals encode Backspace as Ctrl+H.
+                 */
+                app.connection_pop_character();
+            }
+
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                app.connection_clear_field();
+            }
+
+            (KeyCode::Char(character), modifiers)
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.connection_push_character(character);
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
+    if app.about_visible() {
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::Char('a'), KeyModifiers::ALT) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+                app.close_about();
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
+    if app.help_visible() {
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                app.scroll_help_up();
+            }
+
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                app.scroll_help_down();
+            }
+
+            (KeyCode::PageUp, _) => {
+                app.page_help_up();
+            }
+
+            (KeyCode::PageDown, _) => {
+                app.page_help_down();
+            }
+
+            (KeyCode::Home, _) => {
+                app.help_scroll = 0;
+            }
+
+            (KeyCode::End, _) => {
+                app.help_scroll_to_end();
+            }
+
+            (KeyCode::Char('?'), _) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+                app.close_help();
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
+    match (key_event.code, key_event.modifiers) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            app.quit();
+        }
+
+        /*      (KeyCode::F(4), _) => {
+                    app.toggle_connection_dialog();
+                }
+        */
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            app.toggle_connection_dialog();
+        }
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            app.clear_query();
+        }
+
+        (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+            /*
+             * Some terminals encode Backspace as Ctrl+H.
+             *
+             * While a search query is active, treat that sequence as Backspace.
+             * With an empty query, preserve Scry's Ctrl+H hidden-file shortcut.
+             */
+            if app.query.is_empty() {
+                app.toggle_hidden();
+            } else {
+                app.pop_query_character();
+            }
+        }
+
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            app.toggle_details();
+        }
+
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+            app.toggle_selection_panel();
+        }
+
+        (KeyCode::Char('m'), KeyModifiers::ALT) => {
+            app.toggle_columns_panel();
+        }
+
+        (KeyCode::Char('a'), KeyModifiers::ALT) => {
+            app.toggle_about();
+        }
+
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            app.toggle_tree_mode();
+        }
+
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+            app.cycle_sort_mode();
+        }
+
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            app.toggle_sort_direction();
+        }
+
+        (KeyCode::Esc, _) => {
+            app.enter_parent_directory();
+        }
+
+        (KeyCode::Up, _) => {
+            app.move_up();
+        }
+
+        (KeyCode::Down, _) => {
+            app.move_down();
+        }
+
+        (KeyCode::PageUp, _) => {
+            app.page_up();
+        }
+
+        (KeyCode::PageDown, _) => {
+            app.page_down();
+        }
+
+        (KeyCode::Home, _) => {
+            app.select_first();
+        }
+
+        (KeyCode::End, _) => {
+            app.select_last();
+        }
+
+        (KeyCode::Left, _) => {
+            app.enter_parent_directory();
+        }
+
+        (KeyCode::Right, _) => {
+            app.enter_selected_directory();
+        }
+
+        (KeyCode::Enter, _) => {
+            app.activate_selected();
+        }
+
+        (KeyCode::Backspace, _) => {
+            if app.query.is_empty() {
+                app.enter_parent_directory();
+            } else {
+                app.pop_query_character();
+            }
+        }
+
+        (KeyCode::Char('?'), _) => {
+            app.toggle_help();
+        }
+
+        (KeyCode::Char(character), modifiers)
+            if !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.push_query_character(character);
+        }
+
+        _ => {}
+    }
+}
+
+fn handle_mouse_event(
+    app: &mut App,
+    event: MouseEvent,
+    regions: ui::UiRegions,
+    last_left_click: &mut Option<(Instant, u16, u16)>,
+    scrollbar_drag: &mut Option<ScrollbarDragState>,
+    help_scrollbar_drag: &mut bool,
+) {
+    if app.transfer_visible() {
+        *scrollbar_drag = None;
+
+        *last_left_click = None;
+
+        handle_transfer_mouse_event(app, event, regions.transfer);
+
+        return;
+    }
+
+    /*
+     * The connection window is modal.
+     *
+     * Mouse input must never reach the filesystem view behind it. Actual
+     * connection-window hit testing will be added with its editable controls.
+     */
+    if app.connection_visible() {
+        *scrollbar_drag = None;
+
+        *last_left_click = None;
+
+        handle_connection_mouse_event(app, event, regions.connection);
+
+        return;
+    }
+
+    if app.about_visible() {
+        *scrollbar_drag = None;
+
+        *help_scrollbar_drag = false;
+
+        *last_left_click = None;
+
+        /*
+         * About is modal. Mouse events must not activate filesystem controls
+         * behind the popup.
+         */
+        return;
+    }
+
+    if app.help_visible() {
+        *scrollbar_drag = None;
+
+        *last_left_click = None;
+
+        let help_scrollbar = regions.help_scrollbar;
+
+        let on_help_scrollbar = help_scrollbar.is_some_and(|area| {
+            event.column >= area.x
+                && event.column < area.x.saturating_add(area.width)
+                && event.row >= area.y
+                && event.row < area.y.saturating_add(area.height)
+        });
+
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                app.scroll_help_up();
+            }
+
+            MouseEventKind::ScrollDown => {
+                app.scroll_help_down();
+            }
+
+            MouseEventKind::Down(MouseButton::Left) if on_help_scrollbar => {
+                *help_scrollbar_drag = true;
+
+                drag_help_scrollbar(
+                    app,
+                    event.row,
+                    help_scrollbar.expect("checked help scrollbar region"),
+                );
+            }
+
+            MouseEventKind::Drag(MouseButton::Left) if *help_scrollbar_drag => {
+                if let Some(area) = help_scrollbar {
+                    drag_help_scrollbar(app, event.row, area);
+                }
+            }
+
+            MouseEventKind::Up(MouseButton::Left) => {
+                *help_scrollbar_drag = false;
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
+    *help_scrollbar_drag = false;
+
+    const WHEEL_STEP: isize = 3;
+
+    let area = regions.entries;
+
+    let right_edge = area.x.saturating_add(area.width).saturating_sub(1);
+
+    let inside_entries_panel = event.column >= area.x
+        && event.column < area.x.saturating_add(area.width)
+        && event.row >= area.y
+        && event.row < area.y.saturating_add(area.height);
+
+    let inside_entry_rows = inside_entries_panel
+        && event.row > area.y
+        && event.row < area.y.saturating_add(area.height).saturating_sub(1);
+
+    let on_scrollbar = inside_entry_rows && event.column == right_edge;
+
+    match event.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_selection(-WHEEL_STEP);
+        }
+
+        MouseEventKind::ScrollDown => {
+            app.scroll_selection(WHEEL_STEP);
+        }
+
+        /*
+         * Right-click behaves like Left Arrow / Escape:
+         *
+         * - List mode: enter the parent directory.
+         * - Tree mode: collapse the selected directory or select its parent.
+         */
+        MouseEventKind::Down(MouseButton::Right) => {
+            *scrollbar_drag = None;
+            *last_left_click = None;
+
+            app.enter_parent_directory();
+        }
+
+        /*
+         * Clicking the scrollbar begins a drag immediately and moves the
+         * selection to the clicked proportional position.
+         */
+        MouseEventKind::Down(MouseButton::Left) if on_scrollbar => {
+            *last_left_click = None;
+
+            *scrollbar_drag = Some(ScrollbarDragState {
+                start_mouse_row: event.row,
+
+                start_selected: app.selected,
+            });
+        }
+
+        /*
+         * Continue moving while the left button remains held.
+         */
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(drag) = *scrollbar_drag else {
+                return;
+            };
+
+            drag_scrollbar(app, event.row, area, drag);
+        }
+
+        /*
+         * Releasing the mouse ends scrollbar dragging.
+         */
+        MouseEventKind::Up(MouseButton::Left) => {
+            *scrollbar_drag = None;
+        }
+
+        MouseEventKind::Down(MouseButton::Left) => {
+            *scrollbar_drag = None;
+
+            if !inside_entry_rows {
+                *last_left_click = None;
+
+                return;
+            }
+
+            /*
+             * The top border occupies one row.
+             */
+            let visible_row = event.row.saturating_sub(area.y).saturating_sub(1) as usize;
+
+            let selected_position = app.list_offset.saturating_add(visible_row);
+
+            app.select_visible_position(selected_position);
+
+            let now = Instant::now();
+
+            let is_double_click =
+                last_left_click.is_some_and(|(previous_time, previous_column, previous_row)| {
+                    previous_column == event.column
+                        && previous_row == event.row
+                        && now.duration_since(previous_time) <= Duration::from_millis(400)
+                });
+
+            if is_double_click {
+                app.activate_selected();
+
+                *last_left_click = None;
+            } else {
+                *last_left_click = Some((now, event.column, event.row));
+            }
+        }
+
+        _ => {}
+    }
+}
+
+fn drag_help_scrollbar(app: &mut App, mouse_row: u16, area: Rect) {
+    if app.help_max_scroll == 0 || area.height <= 1 {
+        app.help_scroll = 0;
+
+        return;
+    }
+
+    let track_position = mouse_row
+        .saturating_sub(area.y)
+        .min(area.height.saturating_sub(1)) as usize;
+
+    let track_maximum = area.height.saturating_sub(1) as usize;
+
+    let scroll = track_position * app.help_max_scroll as usize / track_maximum;
+
+    app.help_scroll = scroll.min(app.help_max_scroll as usize) as u16;
+}
+
+fn handle_transfer_mouse_event(
+    app: &mut App,
+    event: MouseEvent,
+    regions: Option<ui::TransferUiRegions>,
+) {
+    let Some(regions) = regions else {
+        return;
+    };
+
+    if event.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+
+    let area = regions.action;
+
+    let inside_action = event.column >= area.x
+        && event.column < area.x.saturating_add(area.width)
+        && event.row >= area.y
+        && event.row < area.y.saturating_add(area.height);
+
+    if !inside_action {
+        return;
+    }
+
+    if app.transfer_finished() {
+        app.acknowledge_transfer();
+    } else {
+        app.request_transfer_cancel();
+    }
+}
+
+fn handle_connection_mouse_event(
+    app: &mut App,
+    event: MouseEvent,
+    regions: Option<ui::ConnectionUiRegions>,
+) {
+    let Some(regions) = regions else {
+        return;
+    };
+
+    if event.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+
+    let point_inside = |area: Rect| {
+        event.column >= area.x
+            && event.column < area.x.saturating_add(area.width)
+            && event.row >= area.y
+            && event.row < area.y.saturating_add(area.height)
+    };
+
+    if point_inside(regions.name) {
+        app.set_connection_focus(ConnectionField::Name);
+    } else if point_inside(regions.host) {
+        app.set_connection_focus(ConnectionField::Host);
+    } else if point_inside(regions.username) {
+        app.set_connection_focus(ConnectionField::Username);
+    } else if point_inside(regions.port) {
+        app.set_connection_focus(ConnectionField::Port);
+    } else if point_inside(regions.identity_file) {
+        app.set_connection_focus(ConnectionField::IdentityFile);
+    } else if point_inside(regions.start_directory) {
+        app.set_connection_focus(ConnectionField::StartDirectory);
+    } else if point_inside(regions.connect) {
+        if !app.connection_in_progress {
+            app.set_connection_focus(ConnectionField::Connect);
+
+            app.begin_connection();
+        }
+    } else if point_inside(regions.save) {
+        app.set_connection_focus(ConnectionField::Save);
+
+        app.save_connection_profile();
+    } else if point_inside(regions.delete) {
+        if !app.connection_store.profiles().is_empty() {
+            app.set_connection_focus(ConnectionField::Delete);
+        }
+    } else if point_inside(regions.disconnect) {
+        if app.source_is_remote() {
+            app.set_connection_focus(ConnectionField::Disconnect);
+
+            app.disconnect_remote();
+        }
+    } else if point_inside(regions.profiles) && !app.connection_store.profiles().is_empty() {
+        app.set_connection_focus(ConnectionField::Profiles);
+    }
+}
+
+fn scrollbar_thumb_length(
+    content_length: usize,
+    viewport_length: usize,
+    track_length: usize,
+) -> usize {
+    if content_length == 0 || track_length == 0 {
+        return 0;
+    }
+
+    let numerator = viewport_length
+        .saturating_mul(track_length)
+        .saturating_add(content_length.saturating_sub(1));
+
+    let thumb_length = numerator / content_length;
+
+    thumb_length.max(1).min(track_length)
+}
+
+fn drag_scrollbar(
+    app: &mut App,
+    mouse_row: u16,
+    area: ratatui::layout::Rect,
+    drag: ScrollbarDragState,
+) {
+    let content_length = app.current_visible_entry_count();
+
+    let viewport_length = app.viewport_rows;
+
+    let track_length = area.height.saturating_sub(2) as usize;
+
+    if content_length <= viewport_length || track_length == 0 {
+        return;
+    }
+
+    let thumb_length = scrollbar_thumb_length(content_length, viewport_length, track_length);
+
+    /*
+     * The thumb itself occupies part of the track, so this is the actual
+     * distance through which its top edge can travel.
+     */
+    let thumb_travel = track_length.saturating_sub(thumb_length);
+
+    let selection_travel = content_length.saturating_sub(1);
+
+    if thumb_travel == 0 || selection_travel == 0 {
+        return;
+    }
+
+    let mouse_delta = mouse_row as isize - drag.start_mouse_row as isize;
+
+    let selection_delta =
+        mouse_delta.saturating_mul(selection_travel as isize) / thumb_travel as isize;
+
+    let new_position = drag.start_selected as isize + selection_delta;
+
+    let new_position = new_position.clamp(0, selection_travel as isize) as usize;
+
+    app.select_visible_position(new_position);
+}
