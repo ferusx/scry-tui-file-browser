@@ -24,7 +24,37 @@
 
 ## Screenshots
 
-Screenshots will be added here.
+## Screenshots
+
+### Local browsing
+
+<p align="center">
+  <img src="screenshots/scry1.png" alt="Scry local browser with Details visible and metadata hidden" width="49%">
+  <img src="screenshots/scry2.png" alt="Scry local browser with metadata and Selection visible" width="49%">
+</p>
+
+### Tree view
+
+<p align="center">
+  <img src="screenshots/scry3.png" alt="Scry Tree view with metadata and Details pane" width="95%">
+</p>
+
+### SSH browsing
+
+<p align="center">
+  <img src="screenshots/scry4.png" alt="Scry SSH connection manager" width="95%">
+</p>
+
+<p align="center">
+  <img src="screenshots/scry5.png" alt="Scry browsing a remote filesystem over SSH" width="95%">
+</p>
+
+### Shortcuts and About
+
+<p align="center">
+  <img src="screenshots/scry6.png" alt="Scry shortcuts window" width="49%">
+  <img src="screenshots/scry7.png" alt="About Scry window" width="49%">
+</p>
 
 ## Building
 
