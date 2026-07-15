@@ -24,8 +24,6 @@
 
 ## Screenshots
 
-## Screenshots
-
 ### Local browsing
 
 <p align="center">
