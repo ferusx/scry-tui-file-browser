@@ -12,15 +12,11 @@ use ratatui::{
 };
 use std::time::{Duration, SystemTime};
 
-use crate::app::{App, SearchMode, TreeRow, ViewMode};
+use crate::app::{App, DeletionChoice, SearchMode, TreeRow, ViewMode};
 use crate::connection::ConnectionField;
 use crate::fuzzy::fuzzy_highlight_positions;
 use crate::scan::FileEntry;
-
-// SCROLLBAR CONSTANTS
-const COLOR_SCROLLBAR_THUMB: Color = COLOR_FRAME;
-
-const COLOR_SCROLLBAR_TRACK: Color = Color::Rgb(45, 50, 60);
+use crate::themes::Theme;
 
 // COLOR CONSTANTS
 const COLOR_FRAME: Color = Color::Rgb(160, 110, 220);
@@ -35,8 +31,6 @@ const COLOR_SYMLINK: Color = Color::Rgb(75, 195, 210);
 
 // const COLOR_SELECTED_BACKGROUND: Color = Color::Rgb(55, 40, 75);
 
-const COLOR_SELECTED_TEXT: Color = Color::Rgb(240, 240, 245);
-
 const COLOR_MUTED: Color = Color::Rgb(95, 105, 120);
 
 const COLOR_ERROR: Color = Color::Rgb(220, 55, 70);
@@ -45,10 +39,6 @@ const COLOR_QUERY: Color = Color::Rgb(110, 220, 225);
 
 const COLOR_MATCH: Color = Color::Rgb(166, 119, 199);
 
-const COLOR_SELECTED_BACKGROUND: Color = Color::Rgb(55, 40, 75);
-
-const COLOR_CLASSIFICATION: Color = Color::Rgb(240, 240, 245);
-
 // const COLOR_PERMISSIONS: Color = COLOR_FRAME; // Color::Rgb(255, 255, 255);
 
 const COLOR_DATE: Color = COLOR_DIRECTORY; // Color::Rgb(160, 110, 220);
@@ -56,22 +46,6 @@ const COLOR_DATE: Color = COLOR_DIRECTORY; // Color::Rgb(160, 110, 220);
 const COLOR_USER: Color = Color::Rgb(91, 93, 99); //rgb(91, 93, 99)
 
 const COLOR_SIZE: Color = COLOR_QUERY;
-
-// INDIVIDUAL PERMISSION COLORS
-const COLOR_PERMISSION_READ: Color = COLOR_MUTED;
-
-const COLOR_PERMISSION_WRITE: Color = COLOR_DIRECTORY;
-
-const COLOR_PERMISSION_EXECUTE: Color = COLOR_FRAME;
-
-/*
- * Temporary neutral choices until we test alternatives.
- */
-const COLOR_PERMISSION_TYPE: Color = COLOR_FILE;
-
-const COLOR_PERMISSION_MISSING: Color = COLOR_MUTED;
-
-const COLOR_PERMISSION_SPECIAL: Color = COLOR_CLASSIFICATION;
 
 /*
  * Permissions and modification dates use fixed-width formats:
@@ -82,6 +56,17 @@ const COLOR_PERMISSION_SPECIAL: Color = COLOR_CLASSIFICATION;
 const PERMISSIONS_COLUMN_WIDTH: u16 = 10;
 
 const DATE_COLUMN_WIDTH: u16 = 16;
+
+/*
+ * Special clickable area in the main listing frame
+ * for going up one entry in the hierarchy.
+ *
+*/
+const PARENT_BUTTON_LEFT_BRACKET: &str = "[ ";
+
+const PARENT_BUTTON_TEXT: &str = "← go back";
+
+const PARENT_BUTTON_RIGHT_BRACKET: &str = " ]";
 
 /*
  * Size and owner widths adapt to the current result set.
@@ -157,6 +142,8 @@ pub struct ConnectionUiRegions {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UiRegions {
     pub entries: Rect,
+
+    pub parent_button: Rect,
 
     pub help_scrollbar: Option<Rect>,
 
@@ -251,6 +238,21 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
 
     let entries_area = render_entries(frame, app, entries_area);
 
+    let parent_button = Rect {
+        /*
+         * A Block title begins immediately after the top-left border.
+         */
+        x: entries_area.x.saturating_add(1),
+
+        y: entries_area.y,
+
+        width: (PARENT_BUTTON_LEFT_BRACKET.chars().count()
+            + PARENT_BUTTON_TEXT.chars().count()
+            + PARENT_BUTTON_RIGHT_BRACKET.chars().count()) as u16,
+
+        height: 1,
+    };
+
     if let Some(area) = selection_area {
         render_selection(frame, app, area);
     }
@@ -262,7 +264,7 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
     }
 
     if app.about_visible() {
-        render_about_overlay(frame, frame.area());
+        render_about_overlay(frame, app, frame.area());
     }
 
     if app.connection_visible() {
@@ -273,8 +275,14 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
         transfer_regions = Some(render_transfer_overlay(frame, app, frame.area()));
     }
 
+    if app.deletion_visible() {
+        render_deletion_overlay(frame, app, frame.area());
+    }
+
     UiRegions {
         entries: entries_area,
+
+        parent_button,
 
         help_scrollbar: help_scrollbar_region,
 
@@ -285,6 +293,8 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
 }
 
 fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = &app.theme;
+
     let title = format!(
         " Scry — {} — {} ",
         app.source_label(),
@@ -314,13 +324,13 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let emphasized_mode = app.search_mode == SearchMode::Fuzzy || app.recursive_mode;
 
     let mode_color = if emphasized_mode {
-        COLOR_QUERY
+        theme.ui.query
     } else {
-        COLOR_MUTED
+        theme.ui.muted
     };
 
     let search = Paragraph::new(Line::from(vec![
-        Span::styled("Search [", Style::default().fg(COLOR_MUTED)),
+        Span::styled("Search [", Style::default().fg(theme.ui.muted)),
         Span::styled(
             mode_label,
             Style::default()
@@ -331,31 +341,33 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     Modifier::empty()
                 }),
         ),
-        Span::styled("]: ", Style::default().fg(COLOR_MUTED)),
+        Span::styled("]: ", Style::default().fg(theme.ui.muted)),
         Span::styled(
             if app.query.is_empty() {
                 placeholder
             } else {
                 &app.query
             },
-            Style::default().fg(COLOR_QUERY),
+            Style::default().fg(theme.ui.query),
         ),
     ]))
     .block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(COLOR_FRAME)),
+            .border_style(Style::default().fg(theme.frames.search)),
     );
 
     frame.render_widget(search, area);
 }
 
 fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
+    let theme = app.theme;
+
     let block = Block::default()
         .title(" Details ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_FRAME));
+        .border_style(Style::default().fg(theme.frames.details));
 
     let inner = block.inner(area);
 
@@ -373,7 +385,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 " No entry selected",
-                Style::default().fg(COLOR_MUTED),
+                Style::default().fg(theme.ui.muted),
             )),
             inner,
         );
@@ -394,11 +406,11 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
     let age = format_file_age(entry.modified_time);
 
     let name_color = if entry.is_directory {
-        COLOR_DIRECTORY
+        theme.ui.directory
     } else if entry.is_symlink {
-        COLOR_SYMLINK
+        theme.ui.symlink
     } else {
-        COLOR_FILE
+        theme.ui.file
     };
 
     let rows = Layout::default()
@@ -424,17 +436,25 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(rows[0]);
 
-    render_detail_name(frame, first_row[0], &entry, app.show_icons, name_color);
+    render_detail_name(
+        frame,
+        first_row[0],
+        &entry,
+        app.show_icons,
+        name_color,
+        &theme,
+    );
 
     render_detail_value(
         frame,
         first_row[1],
         "Type",
         classification,
-        COLOR_CLASSIFICATION,
+        theme.ui.classification,
+        &theme,
     );
 
-    render_detail_value(frame, first_row[2], "Size", size, COLOR_SIZE);
+    render_detail_value(frame, first_row[2], "Size", size, theme.ui.size, &theme);
 
     /*
      * Row two:
@@ -455,12 +475,13 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         second_row[0],
         "Modified",
         entry.modified.clone(),
-        COLOR_DATE,
+        theme.ui.date,
+        &theme,
     );
 
-    render_detail_value(frame, second_row[1], "Age", age, COLOR_QUERY);
+    render_detail_value(frame, second_row[1], "Age", age, theme.ui.query, &theme);
 
-    render_detail_value(frame, second_row[2], "Owner", owner, COLOR_USER);
+    render_detail_value(frame, second_row[2], "Owner", owner, theme.ui.user, &theme);
 
     /*
      * Row three:
@@ -472,7 +493,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(rows[2]);
 
-    render_detail_permissions(frame, third_row[0], &entry.permissions);
+    render_detail_permissions(frame, third_row[0], &entry.permissions, &theme);
 
     render_detail_value(
         frame,
@@ -480,6 +501,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         "Path",
         entry.path.display().to_string(),
         name_color,
+        &theme,
     );
 }
 
@@ -489,13 +511,14 @@ fn render_detail_name(
     entry: &FileEntry,
     show_icons: bool,
     name_color: Color,
+    theme: &Theme,
 ) {
-    let mut spans = vec![Span::styled(" Name: ", Style::default().fg(COLOR_MUTED))];
+    let mut spans = vec![Span::styled(" Name: ", Style::default().fg(theme.ui.muted))];
 
     if show_icons {
         spans.push(Span::styled(
             format!("{} ", file_icon(entry)),
-            Style::default().fg(file_icon_color(entry)),
+            Style::default().fg(file_icon_color(entry, theme)),
         ));
     }
 
@@ -513,25 +536,26 @@ fn render_detail_value(
     label: &str,
     value: String,
     value_color: Color,
+    theme: &Theme,
 ) {
     let line = Line::from(vec![
-        Span::styled(format!(" {}: ", label,), Style::default().fg(COLOR_MUTED)),
+        Span::styled(format!(" {}: ", label), Style::default().fg(theme.ui.muted)),
         Span::styled(value, Style::default().fg(value_color)),
     ]);
 
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_detail_permissions(frame: &mut Frame, area: Rect, permissions: &str) {
+fn render_detail_permissions(frame: &mut Frame, area: Rect, permissions: &str, theme: &Theme) {
     let mut spans = vec![Span::styled(
         " Permissions: ",
-        Style::default().fg(COLOR_MUTED),
+        Style::default().fg(theme.ui.muted),
     )];
 
     /*
      * Reuse the same per-character permission palette as the metadata column.
      */
-    spans.extend(permission_spans(permissions));
+    spans.extend(permission_spans(permissions, theme));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -862,11 +886,13 @@ fn render_metadata(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_FRAME)),
+                .border_style(Style::default().fg(app.theme.frames.entries)),
         )
+        .highlight_symbol("▶ ")
         .highlight_style(
             Style::default()
-                .bg(COLOR_SELECTED_BACKGROUND)
+                .fg(app.theme.selection.text)
+                .bg(app.theme.selection.background)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -902,7 +928,7 @@ fn metadata_title(app: &App, widths: MetadataWidths) -> String {
         columns.push(format!("{:<width$}", "User", width = widths.user as usize,));
     }
 
-    format!(" {} ", columns.join("  "),)
+    format!("   {} ", columns.join("  "),)
 }
 
 fn metadata_list_item(
@@ -919,7 +945,7 @@ fn metadata_list_item(
     let mut needs_gap = false;
 
     if app.show_permissions {
-        spans.extend(permission_spans(permissions));
+        spans.extend(permission_spans(permissions, &app.theme));
 
         let permission_length = permissions.chars().count();
 
@@ -984,7 +1010,7 @@ fn metadata_list_item(
     ListItem::new(Line::from(spans))
 }
 
-fn permission_spans(permissions: &str) -> Vec<Span<'static>> {
+fn permission_spans(permissions: &str, theme: &Theme) -> Vec<Span<'static>> {
     permissions
         .chars()
         .enumerate()
@@ -995,22 +1021,22 @@ fn permission_spans(permissions: &str) -> Vec<Span<'static>> {
                  *
                  * d l . b c p s
                  */
-                Style::default().fg(COLOR_PERMISSION_TYPE)
+                Style::default().fg(theme.permissions.file_type)
             } else {
                 match character {
-                    'r' => Style::default().fg(COLOR_PERMISSION_READ),
+                    'r' => Style::default().fg(theme.permissions.read),
 
-                    'w' => Style::default().fg(COLOR_PERMISSION_WRITE),
+                    'w' => Style::default().fg(theme.permissions.write),
 
-                    'x' => Style::default().fg(COLOR_PERMISSION_EXECUTE),
+                    'x' => Style::default().fg(theme.permissions.execute),
 
                     's' | 'S' | 't' | 'T' => Style::default()
-                        .fg(COLOR_PERMISSION_SPECIAL)
+                        .fg(theme.permissions.special)
                         .add_modifier(Modifier::BOLD),
 
-                    '-' => Style::default().fg(COLOR_PERMISSION_MISSING),
+                    '-' => Style::default().fg(theme.permissions.missing),
 
-                    _ => Style::default().fg(COLOR_PERMISSION_TYPE),
+                    _ => Style::default().fg(theme.permissions.file_type),
                 }
             };
 
@@ -1050,6 +1076,26 @@ fn format_file_size(bytes: u64) -> String {
     } else {
         format!("{:.1} TiB", bytes_as_float / TIB,)
     }
+}
+
+fn entries_title_with_parent_button(title: String, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            PARENT_BUTTON_LEFT_BRACKET,
+            Style::default().fg(theme.frames.parent_brackets),
+        ),
+        Span::styled(
+            PARENT_BUTTON_TEXT,
+            Style::default()
+                .fg(theme.frames.parent_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            PARENT_BUTTON_RIGHT_BRACKET,
+            Style::default().fg(theme.frames.parent_brackets),
+        ),
+        Span::raw(title),
+    ])
 }
 
 fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
@@ -1097,6 +1143,7 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             search_mode,
             has_content,
             app.show_icons,
+            &app.theme,
         ));
     }
 
@@ -1141,15 +1188,15 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
     let list = List::new(items)
         .block(
             Block::default()
-                .title(title)
+                .title(entries_title_with_parent_button(title, &app.theme))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_FRAME)),
+                .border_style(Style::default().fg(app.theme.frames.entries)),
         )
         .highlight_symbol("▶ ")
         .highlight_style(
             Style::default()
-                .fg(COLOR_SELECTED_TEXT)
-                .bg(COLOR_SELECTED_BACKGROUND)
+                .fg(app.theme.selection.text)
+                .bg(app.theme.selection.background)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -1167,6 +1214,7 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         app.filtered_indices.len(),
         visible_rows,
         app.selected,
+        &app.theme,
     );
 }
 
@@ -1176,6 +1224,7 @@ fn render_entries_scrollbar(
     content_length: usize,
     viewport_length: usize,
     position: usize,
+    theme: &Theme,
 ) {
     /*
      * Do not render a scrollbar when every entry already fits inside
@@ -1190,8 +1239,8 @@ fn render_entries_scrollbar(
         .end_symbol(None)
         .track_symbol(Some("│"))
         .thumb_symbol("█")
-        .track_style(Style::default().fg(COLOR_SCROLLBAR_TRACK))
-        .thumb_style(Style::default().fg(COLOR_SCROLLBAR_THUMB));
+        .track_style(Style::default().fg(theme.scrollbar.track))
+        .thumb_style(Style::default().fg(theme.scrollbar.thumb));
 
     let mut scrollbar_state = ScrollbarState::new(content_length)
         .position(position)
@@ -1242,6 +1291,7 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             &highlight_query,
             has_content,
             app.show_icons,
+            &app.theme,
         ));
     }
 
@@ -1262,7 +1312,7 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         };
 
         format!(
-            " {} — {} shown / {} expanded nodes — {} {} ",
+            " {} — {} shown / {} nodes — {} {} ",
             tree_kind,
             app.filtered_tree_indices.len(),
             app.tree_rows.len(),
@@ -1274,15 +1324,15 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
     let list = List::new(items)
         .block(
             Block::default()
-                .title(title)
+                .title(entries_title_with_parent_button(title, &app.theme))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_FRAME)),
+                .border_style(Style::default().fg(app.theme.frames.entries)),
         )
         .highlight_symbol("▶ ")
         .highlight_style(
             Style::default()
-                .fg(COLOR_SELECTED_TEXT)
-                .bg(COLOR_SELECTED_BACKGROUND)
+                .fg(app.theme.selection.text)
+                .bg(app.theme.selection.background)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -1300,6 +1350,7 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         app.filtered_tree_indices.len(),
         visible_rows,
         app.selected,
+        &app.theme,
     );
 }
 
@@ -1308,6 +1359,7 @@ fn tree_list_item(
     query: &str,
     has_content: bool,
     show_icons: bool,
+    theme: &Theme,
 ) -> ListItem<'static> {
     let mut spans = Vec::new();
 
@@ -1344,7 +1396,7 @@ fn tree_list_item(
     if show_icons {
         spans.push(Span::styled(
             format!("{} ", file_icon(&row.entry)),
-            Style::default().fg(file_icon_color(&row.entry)),
+            file_icon_color(&row.entry, theme),
         ));
     }
 
@@ -1393,69 +1445,71 @@ fn file_icon(entry: &FileEntry) -> &'static str {
     }
 }
 
-fn file_icon_color(entry: &FileEntry) -> Color {
+fn file_icon_color(entry: &FileEntry, theme: &Theme) -> Color {
     use crate::classify::FileClass;
 
     if entry.is_directory {
-        return COLOR_DIRECTORY;
+        return theme.icons.directory;
     }
 
     if entry.is_symlink {
-        return COLOR_SYMLINK;
+        return theme.icons.symlink;
     }
 
     match entry.class {
-        FileClass::Rust => Color::Rgb(230, 125, 70),
+        FileClass::Rust => theme.icons.rust,
 
-        FileClass::Python => Color::Rgb(80, 170, 235),
+        FileClass::Python => theme.icons.python,
 
-        FileClass::ShellScript | FileClass::Executable => Color::Rgb(90, 200, 125),
+        FileClass::ShellScript | FileClass::Executable => theme.icons.shell,
 
-        FileClass::C | FileClass::Cpp | FileClass::SourceCode => Color::Rgb(105, 145, 225),
+        FileClass::C | FileClass::Cpp | FileClass::SourceCode => theme.icons.source,
 
-        FileClass::Java | FileClass::Kotlin => Color::Rgb(220, 105, 85),
+        FileClass::Java | FileClass::Kotlin => theme.icons.java,
 
-        FileClass::JavaScript | FileClass::TypeScript => Color::Rgb(235, 205, 65),
+        FileClass::JavaScript | FileClass::TypeScript => theme.icons.javascript,
 
-        FileClass::Web => Color::Rgb(210, 100, 190),
+        FileClass::Web => theme.icons.web,
 
-        FileClass::Config | FileClass::StructuredData | FileClass::Build => {
-            Color::Rgb(80, 185, 205)
-        }
+        FileClass::Config | FileClass::StructuredData | FileClass::Build => theme.icons.config,
 
-        FileClass::Archive | FileClass::Package => Color::Rgb(215, 135, 80),
+        FileClass::Archive | FileClass::Package => theme.icons.archive,
 
-        FileClass::Document | FileClass::Text => Color::Rgb(195, 205, 220),
+        FileClass::Document | FileClass::Text => theme.icons.document,
 
-        FileClass::Spreadsheet => Color::Rgb(70, 195, 115),
+        FileClass::Spreadsheet => theme.icons.spreadsheet,
 
-        FileClass::Presentation => Color::Rgb(230, 135, 70),
+        FileClass::Presentation => theme.icons.presentation,
 
-        FileClass::Image | FileClass::VectorImage => Color::Rgb(215, 105, 220),
+        FileClass::Image | FileClass::VectorImage => theme.icons.image,
 
-        FileClass::Audio => Color::Rgb(105, 165, 225),
+        FileClass::Audio => theme.icons.audio,
 
-        FileClass::Video => Color::Rgb(195, 100, 220),
+        FileClass::Video => theme.icons.video,
 
-        FileClass::Font => Color::Rgb(195, 145, 225),
+        FileClass::Font => theme.icons.font,
 
-        FileClass::Database => Color::Rgb(70, 190, 205),
+        FileClass::Database => theme.icons.database,
 
-        FileClass::Log => Color::Rgb(155, 165, 180),
+        FileClass::Log => theme.icons.log,
 
-        FileClass::Backup => Color::Rgb(175, 125, 195),
+        FileClass::Backup => theme.icons.backup,
 
-        FileClass::Certificate => Color::Rgb(225, 190, 75),
+        FileClass::Certificate => theme.icons.certificate,
 
-        FileClass::DiskImage => Color::Rgb(125, 155, 215),
+        FileClass::DiskImage => theme.icons.disk_image,
 
-        FileClass::Torrent => Color::Rgb(80, 190, 145),
+        FileClass::Torrent => theme.icons.torrent,
 
-        FileClass::DesktopEntry | FileClass::Plugin => Color::Rgb(155, 130, 220),
+        FileClass::DesktopEntry | FileClass::Plugin => theme.icons.desktop_plugin,
 
-        FileClass::Binary | FileClass::Unknown => COLOR_FILE,
+        FileClass::Binary => theme.icons.binary,
 
-        FileClass::Directory | FileClass::Symlink => COLOR_FILE,
+        FileClass::Unknown => theme.icons.unknown,
+
+        FileClass::Directory => theme.icons.directory,
+
+        FileClass::Symlink => theme.icons.symlink,
     }
 }
 
@@ -1465,6 +1519,7 @@ fn entry_list_item(
     search_mode: SearchMode,
     has_content: bool,
     show_icons: bool,
+    theme: &Theme,
 ) -> ListItem<'static> {
     let (prefix, color, suffix) = if entry.is_directory {
         ("▸ ", COLOR_DIRECTORY, if has_content { " →" } else { "/" })
@@ -1479,7 +1534,7 @@ fn entry_list_item(
     if show_icons {
         spans.push(Span::styled(
             format!("{} ", file_icon(entry)),
-            Style::default().fg(file_icon_color(entry)),
+            Style::default().fg(file_icon_color(entry, theme)),
         ));
     }
 
@@ -1648,38 +1703,42 @@ fn fold_with_source_ranges(text: &str) -> Vec<(char, usize, usize)> {
 }
 
 fn render_selection(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let theme = app.theme;
+
     let selected_classification = app.selected_classification();
 
     let content = if let Some(error) = &app.error_message {
-        Line::styled(error.clone(), Style::default().fg(COLOR_ERROR))
+        Line::styled(error.clone(), Style::default().fg(theme.ui.error))
     } else if let Some(entry) = app.selected_entry() {
         Line::styled(
             entry.path.display().to_string(),
             Style::default().fg(if entry.is_directory {
-                COLOR_DIRECTORY
+                theme.ui.directory
+            } else if entry.is_symlink {
+                theme.ui.symlink
             } else {
-                COLOR_FILE
+                theme.ui.file
             }),
         )
     } else {
-        Line::styled("No matching entries", Style::default().fg(COLOR_MUTED))
+        Line::styled("No matching entries", Style::default().fg(theme.ui.muted))
     };
 
     let title = if let Some(class) = selected_classification {
         Line::from(vec![
-            Span::styled(" Selection — ", Style::default().fg(COLOR_FRAME)),
+            Span::styled(" Selection — ", Style::default().fg(theme.frames.selection)),
             Span::styled(
                 class.label(),
                 Style::default()
-                    .fg(COLOR_CLASSIFICATION)
+                    .fg(theme.ui.classification)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" ", Style::default().fg(COLOR_FRAME)),
+            Span::styled(" ", Style::default().fg(theme.frames.selection)),
         ])
     } else {
         Line::from(Span::styled(
             " Selection ",
-            Style::default().fg(COLOR_FRAME),
+            Style::default().fg(theme.frames.selection),
         ))
     };
 
@@ -1687,7 +1746,7 @@ fn render_selection(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rec
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(COLOR_FRAME)),
+            .border_style(Style::default().fg(theme.frames.selection)),
     );
 
     frame.render_widget(paragraph, area);
@@ -1743,6 +1802,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::Name,
             app.connection_dialog.focus,
+            &app.theme,
         ),
         connection_field_line(
             "Host / IP",
@@ -1750,6 +1810,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::Host,
             app.connection_dialog.focus,
+            &app.theme,
         ),
         connection_field_line(
             "Username",
@@ -1757,6 +1818,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::Username,
             app.connection_dialog.focus,
+            &app.theme,
         ),
         connection_field_line(
             "Port",
@@ -1764,6 +1826,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::Port,
             app.connection_dialog.focus,
+            &app.theme,
         ),
         connection_field_line(
             "Identity file",
@@ -1771,6 +1834,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             Some("Optional — e.g. ~/.ssh/id_ed25519"),
             ConnectionField::IdentityFile,
             app.connection_dialog.focus,
+            &app.theme,
         ),
         connection_field_line(
             "Start directory",
@@ -1778,6 +1842,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::StartDirectory,
             app.connection_dialog.focus,
+            &app.theme,
         ),
         Line::raw(""),
         Line::from(vec![
@@ -1790,6 +1855,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
                 ConnectionField::Connect,
                 app.connection_dialog.focus,
                 !app.connection_in_progress,
+                &app.theme,
             ),
             Span::raw("   "),
             connection_button_span(
@@ -1797,6 +1863,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
                 ConnectionField::Save,
                 app.connection_dialog.focus,
                 true,
+                &app.theme,
             ),
             Span::raw("   "),
             connection_button_span(
@@ -1804,6 +1871,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
                 ConnectionField::Delete,
                 app.connection_dialog.focus,
                 !profiles.is_empty(),
+                &app.theme,
             ),
             Span::raw("   "),
             connection_button_span(
@@ -1811,6 +1879,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
                 ConnectionField::Disconnect,
                 app.connection_dialog.focus,
                 app.source_is_remote(),
+                &app.theme,
             ),
         ])
         .alignment(Alignment::Center),
@@ -1851,7 +1920,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             Block::default()
                 .title(" SSH Connections ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_FRAME)),
+                .border_style(Style::default().fg(app.theme.frames.popup)),
         )
         .style(Style::default().bg(Color::Rgb(15, 16, 22)));
 
@@ -1961,6 +2030,7 @@ fn connection_field_line(
     placeholder: Option<&str>,
     field: ConnectionField,
     focused_field: ConnectionField,
+    theme: &Theme,
 ) -> Line<'static> {
     const FIELD_WIDTH: usize = 47;
 
@@ -1994,8 +2064,8 @@ fn connection_field_line(
             .add_modifier(Modifier::ITALIC)
     } else if focused {
         Style::default()
-            .fg(COLOR_SELECTED_TEXT)
-            .bg(Color::Rgb(38, 40, 50))
+            .fg(theme.selection.text)
+            .bg(theme.selection.background)
     } else {
         Style::default().fg(COLOR_FILE)
     };
@@ -2019,6 +2089,7 @@ fn connection_button_span(
     field: ConnectionField,
     focused_field: ConnectionField,
     enabled: bool,
+    theme: &Theme,
 ) -> Span<'static> {
     let focused = field == focused_field;
 
@@ -2026,8 +2097,8 @@ fn connection_button_span(
         Style::default().fg(COLOR_MUTED)
     } else if focused {
         Style::default()
-            .fg(COLOR_SELECTED_TEXT)
-            .bg(COLOR_SELECTED_BACKGROUND)
+            .fg(theme.selection.text)
+            .bg(theme.selection.background)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(COLOR_FILE)
@@ -2203,8 +2274,8 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
             Line::styled(
                 "[ OK ]",
                 Style::default()
-                    .fg(COLOR_SELECTED_TEXT)
-                    .bg(COLOR_SELECTED_BACKGROUND)
+                    .fg(app.theme.selection.text)
+                    .bg(app.theme.selection.background)
                     .add_modifier(Modifier::BOLD),
             )
             .alignment(Alignment::Center)
@@ -2215,8 +2286,8 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
             Line::styled(
                 "[ Cancel ]",
                 Style::default()
-                    .fg(COLOR_SELECTED_TEXT)
-                    .bg(COLOR_SELECTED_BACKGROUND)
+                    .fg(app.theme.selection.text)
+                    .bg(app.theme.selection.background)
                     .add_modifier(Modifier::BOLD),
             )
             .alignment(Alignment::Center)
@@ -2228,7 +2299,7 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(if failed { COLOR_ERROR } else { COLOR_FRAME })),
+                .border_style(Style::default().fg(app.theme.frames.popup)),
         )
         .style(Style::default().bg(Color::Rgb(15, 16, 22)));
 
@@ -2301,7 +2372,153 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
-fn render_about_overlay(frame: &mut Frame, area: Rect) {
+fn render_deletion_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    const POPUP_WIDTH: u16 = 74;
+
+    const FILE_POPUP_HEIGHT: u16 = 12;
+
+    const DIRECTORY_POPUP_HEIGHT: u16 = 14;
+
+    let Some(deletion) = app.deletion.as_ref() else {
+        return;
+    };
+
+    let popup_height =
+        if deletion.is_directory && !deletion.is_symlink && deletion.directory_has_content {
+            DIRECTORY_POPUP_HEIGHT
+        } else {
+            FILE_POPUP_HEIGHT
+        };
+
+    let popup_width = POPUP_WIDTH.min(area.width.saturating_sub(4).max(1));
+
+    let popup_height = popup_height.min(area.height.saturating_sub(2).max(1));
+
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    let target_kind = if deletion.is_symlink {
+        "symbolic link"
+    } else if deletion.is_directory {
+        "directory"
+    } else {
+        "file"
+    };
+
+    let delete_focused = deletion.choice == DeletionChoice::Delete;
+
+    let cancel_focused = deletion.choice == DeletionChoice::Cancel;
+
+    let button_style = |focused: bool, dangerous: bool| {
+        if focused {
+            Style::default()
+                .fg(app.theme.selection.text)
+                .bg(if dangerous {
+                    app.theme.ui.error
+                } else {
+                    app.theme.selection.background
+                })
+                .add_modifier(Modifier::BOLD)
+        } else if dangerous {
+            Style::default().fg(app.theme.ui.error)
+        } else {
+            Style::default().fg(app.theme.ui.file)
+        }
+    };
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                "Delete ",
+                Style::default()
+                    .fg(app.theme.ui.error)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                target_kind,
+                Style::default().fg(app.theme.ui.classification),
+            ),
+            Span::raw("?"),
+        ])
+        .alignment(Alignment::Center),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Name: ", Style::default().fg(app.theme.ui.muted)),
+            Span::styled(
+                deletion.name.clone(),
+                Style::default()
+                    .fg(app.theme.ui.file)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .alignment(Alignment::Center),
+        Line::from(vec![
+            Span::styled("Path: ", Style::default().fg(app.theme.ui.muted)),
+            Span::styled(
+                deletion.path.display().to_string(),
+                Style::default().fg(app.theme.ui.query),
+            ),
+        ])
+        .alignment(Alignment::Center),
+        Line::raw(""),
+    ];
+
+    if deletion.is_directory && !deletion.is_symlink && deletion.directory_has_content {
+        lines.push(
+            Line::styled(
+                "This directory is not empty.",
+                Style::default()
+                    .fg(app.theme.ui.error)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center),
+        );
+
+        lines.push(
+            Line::styled(
+                "Its complete contents will be removed.",
+                Style::default().fg(app.theme.ui.error),
+            )
+            .alignment(Alignment::Center),
+        );
+
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(
+        Line::from(vec![
+            Span::styled("[ Delete ]", button_style(delete_focused, true)),
+            Span::raw("     "),
+            Span::styled("[ Cancel ]", button_style(cancel_focused, false)),
+        ])
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "←/→ or Tab selects · Enter confirms · Esc cancels",
+            Style::default().fg(app.theme.ui.muted),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    let popup = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm Deletion ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.frames.popup)),
+        )
+        .style(Style::default().bg(Color::Rgb(15, 16, 22)));
+
+    frame.render_widget(Clear, popup_area);
+
+    frame.render_widget(popup, popup_area);
+}
+
+fn render_about_overlay(frame: &mut Frame, app: &App, area: Rect) {
     const POPUP_WIDTH: u16 = 76;
 
     const POPUP_HEIGHT: u16 = 20;
@@ -2370,7 +2587,7 @@ fn render_about_overlay(frame: &mut Frame, area: Rect) {
             Block::default()
                 .title(" About Scry ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_FRAME)),
+                .border_style(Style::default().fg(app.theme.frames.popup)),
         )
         .style(Style::default().bg(Color::Rgb(15, 16, 22)));
 
@@ -2395,7 +2612,7 @@ fn about_information_line(label: &str, value: &str) -> Line<'static> {
 }
 
 fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
-    const POPUP_MAX_WIDTH: u16 = 58;
+    const POPUP_MAX_WIDTH: u16 = 62;
 
     const HORIZONTAL_MARGIN: u16 = 4;
 
@@ -2416,81 +2633,87 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    push_shortcut_section(
-        &mut lines,
-        "Normal Mode",
-        &[
-            ("↑ / ↓", "Move the selection"),
-            ("PgUp / PgDn", "Move one visible page"),
-            ("Home / End", "Select first or last entry"),
-            ("← / Esc", "Enter the parent directory"),
-            ("→", "Open the selected directory"),
-            ("Enter", "Open or activate the selection"),
-            ("Ctrl+T", "Enter Tree mode"),
-            ("Alt+H", "Show or hide hidden entries"),
-            ("Ctrl+O", "Cycle through sort modes"),
-            ("Alt+R", "Toggle recursive mode"),
-            ("Ctrl+R", "Reverse the sort direction"),
-            ("Ctrl+D", "Show or hide Details"),
-            ("Ctrl+S", "Show or hide Selection"),
-            ("Alt+M", "Show or hide metadata"),
-            ("F4", "Open SSH connections manager"),
-            ("?", "Open or close this window"),
-            ("Alt+A", "Open the About window"),
-            ("Ctrl+C", "Exit Scry"),
-        ],
-    );
+    let deletion_binding = if app.enable_deletion {
+        ("Delete", "Delete the selected local entry")
+    } else {
+        ("Delete", "Delete sel. entry (enable via scry.toml)")
+    };
 
-    push_shortcut_section(
-        &mut lines,
-        "Tree Mode",
-        &[
-            ("↑ / ↓", "Move through visible nodes"),
-            ("PgUp / PgDn", "Move one visible page"),
-            ("Home / End", "Select first or last node"),
-            ("→", "Expand the selected directory"),
-            ("← / Esc", "Collapse or select the parent"),
-            ("Enter", "Make directory the new root"),
-            ("Ctrl+T", "Return to List mode"),
-            ("Alt+H", "Show or hide hidden entries"),
-            ("Ctrl+O", "Cycle through sort modes"),
-            ("Alt+R", "Toggle recursive mode"),
-            ("Ctrl+R", "Reverse the sort direction"),
-            ("Ctrl+D", "Show or hide Details"),
-            ("Ctrl+S", "Show or hide Selection"),
-            ("Alt+M", "Show or hide metadata"),
-            ("F4", "Open SSH connections manager"),
-            ("?", "Open or close this window"),
-            ("Alt+A", "Open the About window"),
-            ("Ctrl+C", "Exit Scry"),
-        ],
-    );
+    let mut normal_bindings = vec![
+        ("↑ / ↓", "Move the selection"),
+        ("PgUp / PgDn", "Move one visible page"),
+        ("Home / End", "Select first or last entry"),
+        ("← / Esc", "Enter the parent directory"),
+        ("→", "Open the selected directory"),
+        ("Enter", "Open or activate the selection"),
+        ("Ctrl+T", "Enter Tree mode"),
+        ("Alt+H", "Show or hide hidden entries"),
+        ("Ctrl+O", "Cycle through sort modes"),
+        ("Alt+R", "Toggle recursive mode"),
+        ("Ctrl+R", "Reverse the sort direction"),
+        ("Ctrl+D", "Show or hide Details"),
+        ("Ctrl+S", "Show or hide Selection"),
+        ("Alt+M", "Show or hide metadata"),
+        ("F4", "Open SSH connections manager"),
+        ("?", "Open or close this window"),
+        ("Alt+A", "Open the About window"),
+        ("Ctrl+C", "Exit Scry"),
+    ];
 
-    push_shortcut_section(
-        &mut lines,
-        "Search Mode",
-        &[
-            ("Type", "Filter or search entries"),
-            ("↑ / ↓", "Move through results"),
-            ("PgUp / PgDn", "Move one visible page"),
-            ("Home / End", "Select first or last result"),
-            ("Backspace", "Delete one search character"),
-            ("Ctrl+H", "Delete one character"),
-            ("Alt+H", "Show or hide hidden entries"),
-            ("Ctrl+U", "Clear the complete search"),
-            ("Enter", "Open or locate the result"),
-            ("← / Esc", "Enter the parent directory"),
-            ("Alt+R", "Toggle recursive mode"),
-            ("Ctrl+R", "Reverse the sort direction"),
-            ("Ctrl+D", "Show or hide Details"),
-            ("Ctrl+S", "Show or hide Selection"),
-            ("Alt+M", "Show or hide metadata"),
-            ("F4", "Open SSH connections manager"),
-            ("?", "Open or close this window"),
-            ("Alt+A", "Open the About window"),
-            ("Ctrl+C", "Exit Scry"),
-        ],
-    );
+    normal_bindings.insert(6, deletion_binding);
+
+    push_shortcut_section(&mut lines, "Normal Mode", &normal_bindings);
+
+    let mut tree_bindings = vec![
+        ("↑ / ↓", "Move through visible nodes"),
+        ("PgUp / PgDn", "Move one visible page"),
+        ("Home / End", "Select first or last node"),
+        ("→", "Expand the selected directory"),
+        ("← / Esc", "Collapse or select the parent"),
+        ("Enter", "Make directory the new root"),
+        ("Ctrl+T", "Return to List mode"),
+        ("Alt+H", "Show or hide hidden entries"),
+        ("Ctrl+O", "Cycle through sort modes"),
+        ("Alt+R", "Toggle recursive mode"),
+        ("Ctrl+R", "Reverse the sort direction"),
+        ("Ctrl+D", "Show or hide Details"),
+        ("Ctrl+S", "Show or hide Selection"),
+        ("Alt+M", "Show or hide metadata"),
+        ("F4", "Open SSH connections manager"),
+        ("?", "Open or close this window"),
+        ("Alt+A", "Open the About window"),
+        ("Ctrl+C", "Exit Scry"),
+    ];
+
+    tree_bindings.insert(6, deletion_binding);
+
+    push_shortcut_section(&mut lines, "Tree Mode", &tree_bindings);
+
+    let mut search_bindings = vec![
+        ("Type", "Filter or search entries"),
+        ("↑ / ↓", "Move through results"),
+        ("PgUp / PgDn", "Move one visible page"),
+        ("Home / End", "Select first or last result"),
+        ("Backspace", "Delete one search character"),
+        ("Ctrl+H", "Delete one character"),
+        ("Alt+H", "Show or hide hidden entries"),
+        ("Ctrl+U", "Clear the complete search"),
+        ("Enter", "Open or locate the result"),
+        ("← / Esc", "Enter the parent directory"),
+        ("Alt+R", "Toggle recursive mode"),
+        ("Ctrl+R", "Reverse the sort direction"),
+        ("Ctrl+D", "Show or hide Details"),
+        ("Ctrl+S", "Show or hide Selection"),
+        ("Alt+M", "Show or hide metadata"),
+        ("F4", "Open SSH connections manager"),
+        ("?", "Open or close this window"),
+        ("Alt+A", "Open the About window"),
+        ("Ctrl+C", "Exit Scry"),
+    ];
+
+    search_bindings.insert(9, deletion_binding);
+
+    push_shortcut_section(&mut lines, "Search Mode", &search_bindings);
 
     push_shortcut_section(
         &mut lines,
@@ -2499,7 +2722,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
             ("Wheel", "Move through entries"),
             ("Left-click", "Select an entry"),
             ("Double-click", "Activate the selected entry"),
-            ("Right-click", "Collapse or enter parent"),
+            ("Middle-click", "Collapse or enter parent"),
             ("Scrollbar drag", "Move through long listings"),
             ("Popup buttons", "Activate visible actions"),
         ],
@@ -2515,7 +2738,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
     let block = Block::default()
         .title(" Scry Shortcuts ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_FRAME));
+        .border_style(Style::default().fg(app.theme.frames.popup));
 
     let content_area = block.inner(popup_area);
 
@@ -2542,8 +2765,8 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
             .end_symbol(None)
             .track_symbol(Some("│"))
             .thumb_symbol("█")
-            .track_style(Style::default().fg(COLOR_SCROLLBAR_TRACK))
-            .thumb_style(Style::default().fg(COLOR_SCROLLBAR_THUMB));
+            .track_style(Style::default().fg(app.theme.scrollbar.track))
+            .thumb_style(Style::default().fg(app.theme.scrollbar.thumb));
 
         let scrollbar_position = if app.help_max_scroll == 0 {
             0
@@ -2666,23 +2889,29 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         "recursive:off"
     };
 
+    let delete_hint = if app.enable_deletion {
+        " Del Delete "
+    } else {
+        ""
+    };
+
     let footer = if app.view_mode == ViewMode::Tree {
         // Tree View Help Text
         format!(
-            " ^? More  F4 SSH  ↑/↓ Move  ← Collapse  → Expand  Enter Select/open  Alt+H {}  ^C Exit ",
-            hidden_state,
+            " ^? More  F4 SSH  ↑/↓ Move  ← Collapse  → Expand  Alt+H ({})  Enter Select/open {} ^C Exit ",
+            hidden_state, delete_hint,
         )
     } else if app.query.is_empty() {
         // Normal View Help Text
         format!(
-            " ^? More  F4 SSH  Enter Select/open  Alt+H {}  ^D {} ^S {}  Alt+M {}  ^C Exit ",
-            hidden_state, details_state, selection_state, columns_state,
+            " ^? More  F4 SSH  Enter Select/open {} Alt+H ({})  ^D {} ^S {}  Alt+M {}  ^C Exit ",
+            delete_hint, hidden_state, details_state, selection_state, columns_state,
         )
     } else {
         // Active Search Help Text
         format!(
-            " ^? More  ↑/↓ Move  PgUp ↑  PgDn ↓  Enter Select/open  Alt+R {}  ^U Clear  ^C Exit ",
-            recursive_state,
+            " ^? More  ↑/↓ Move  PgUp ↑  PgDn ↓  Enter Select/open {} Alt+R {}  ^U Clear  ^C Exit ",
+            delete_hint, recursive_state,
         )
     };
 

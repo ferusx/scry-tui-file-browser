@@ -24,6 +24,7 @@ use crate::scan::{
 use crate::search_index::SearchIndex;
 use crate::source::{FileSource, LocalSource, TransferControl, TransferProgress};
 use crate::ssh::{SftpSource, SshTarget};
+use crate::themes::Theme;
 
 #[derive(Debug, Clone)]
 struct LocalSessionState {
@@ -89,6 +90,28 @@ pub enum Overlay {
     About,
 
     Connection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionChoice {
+    Delete,
+
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeletionState {
+    pub path: PathBuf,
+
+    pub name: String,
+
+    pub is_directory: bool,
+
+    pub is_symlink: bool,
+
+    pub directory_has_content: bool,
+
+    pub choice: DeletionChoice,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +281,8 @@ pub struct App {
 
     pub search_mode: SearchMode,
 
+    pub theme: Theme,
+
     pub show_hidden: bool,
 
     pub show_icons: bool,
@@ -285,6 +310,10 @@ pub struct App {
     pub opened_file_path: Option<PathBuf>,
 
     pub transfer: Option<TransferState>,
+
+    pub enable_deletion: bool,
+
+    pub deletion: Option<DeletionState>,
 
     pub list_offset: usize,
 
@@ -410,6 +439,8 @@ impl App {
 
             search_mode: SearchMode::Exact,
 
+            theme: Theme::default(),
+
             show_hidden: false,
 
             show_icons: true,
@@ -435,6 +466,10 @@ impl App {
             opened_file_path: None,
 
             transfer: None,
+
+            enable_deletion: false,
+
+            deletion: None,
 
             selected: 0,
 
@@ -530,10 +565,20 @@ impl App {
 
     pub fn apply_startup_config(&mut self, config: &ScryConfig) {
         /*
+         * Resolve the selected theme once during startup.
+         *
+         * Missing files, malformed TOML, and invalid individual colors all fall
+         * back safely through Theme::load().
+         */
+        self.theme = Theme::load(&config.theme);
+
+        /*
          * Display panels can be assigned directly because the application has
          * only just been constructed and has not yet entered its event loop.
          */
         self.ssh_config = config.ssh;
+
+        self.enable_deletion = config.features.enable_deletion;
 
         self.show_details = config.display.show_details;
 
@@ -826,20 +871,23 @@ impl App {
                         .clone()
                         .or_else(|| self.selected_entry().map(|entry| entry.path.clone()));
 
-                    match self.search_mode {
-                        SearchMode::Fuzzy => {
-                            /*
-                             * The scanner has finished building the compact index.
-                             * Launch the same bounded fuzzy worker used by List mode.
-                             */
-                            self.start_current_fuzzy_filter();
-                        }
+                    let text_filter_active = !self.query.is_empty() && self.query != ".";
 
-                        SearchMode::Exact => {
-                            self.rebuild_recursive_search_tree(selected_path);
+                    if self.search_mode == SearchMode::Fuzzy && text_filter_active {
+                        /*
+                         * A genuine fuzzy text query consumes the completed compact index.
+                         */
+                        self.start_current_fuzzy_filter();
+                    } else {
+                        /*
+                         * An empty query is ordinary recursive Tree browsing.
+                         *
+                         * SearchMode::Fuzzy changes how typed text is interpreted; it must not
+                         * erase the unfiltered recursive tree when no text search exists.
+                         */
+                        self.rebuild_recursive_search_tree(selected_path);
 
-                            self.restore_pending_selection_if_available();
-                        }
+                        self.restore_pending_selection_if_available();
                     }
                 }
             } else if self.search_mode == SearchMode::Fuzzy && self.recursive_search_active() {
@@ -1661,7 +1709,7 @@ impl App {
         }
 
         /*
-         * Tree mode owns Left/Escape/right-click navigation even while a search
+         * Tree mode owns Left/Escape/middle-click navigation even while a search
          * query is active.
          *
          * Otherwise the query-root navigation route intercepts Left before the
@@ -2520,6 +2568,364 @@ impl App {
                 self.error_message = Some(error);
             }
         }
+    }
+
+    pub fn deletion_visible(&self) -> bool {
+        self.deletion.is_some()
+    }
+
+    pub fn begin_deletion_confirmation(&mut self) {
+        /*
+         * Deletion is a deliberately opt-in local feature.
+         *
+         * When disabled, the command must behave as though it does not exist.
+         */
+        if !self.enable_deletion {
+            return;
+        }
+
+        /*
+         * The first implementation is local-only.
+         *
+         * Remote deletion requires a separate FileSource operation and must not
+         * accidentally act on Scry's downloaded cache copy.
+         */
+        if self.source.is_remote() {
+            self.error_message =
+                Some("Deletion is not available while browsing through SSH".to_string());
+
+            return;
+        }
+
+        /*
+         * Never begin another modal operation while a transfer or connection is
+         * active.
+         */
+        if self.transfer.is_some() || self.connection_in_progress {
+            return;
+        }
+
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+
+        let path = entry.path.clone();
+
+        /*
+         * Every deletable target must be an absolute entry beneath the current
+         * browsing root.
+         *
+         * FileEntry paths originate from the filesystem scanner, but validating
+         * them again here keeps the destructive boundary self-contained.
+         */
+        if !path.is_absolute() {
+            self.error_message = Some(format!(
+                "Refusing to delete a non-absolute path: {}",
+                path.display(),
+            ));
+
+            return;
+        }
+
+        if path == Path::new("/") {
+            self.error_message = Some("Refusing to delete the filesystem root".to_string());
+
+            return;
+        }
+
+        if path == self.current_directory {
+            self.error_message =
+                Some("Refusing to delete Scry's current browsing root".to_string());
+
+            return;
+        }
+
+        if !path.starts_with(&self.current_directory) {
+            self.error_message = Some(format!(
+                "Refusing to delete a path outside the current browsing root: {}",
+                path.display(),
+            ));
+
+            return;
+        }
+
+        if path.file_name().is_none() {
+            self.error_message = Some(format!(
+                "Refusing to delete a path without a filename: {}",
+                path.display(),
+            ));
+
+            return;
+        }
+
+        /*
+         * symlink_metadata() inspects the selected link itself rather than
+         * following it to some other filesystem object.
+         */
+        if let Err(error) = std::fs::symlink_metadata(&path) {
+            self.error_message = Some(format!(
+                "Unable to validate {} for deletion: {}",
+                path.display(),
+                error,
+            ));
+
+            return;
+        }
+
+        let directory_has_content =
+            entry.is_directory && !entry.is_symlink && self.directory_has_content(&path);
+
+        self.error_message = None;
+
+        self.deletion = Some(DeletionState {
+            path,
+
+            name: entry.name,
+
+            is_directory: entry.is_directory,
+
+            is_symlink: entry.is_symlink,
+
+            directory_has_content,
+
+            /*
+             * Cancel receives the initial focus.
+             *
+             * Merely pressing Delete followed by Enter must never destroy the
+             * selected entry.
+             */
+            choice: DeletionChoice::Cancel,
+        });
+    }
+
+    pub fn cancel_deletion(&mut self) {
+        self.deletion = None;
+    }
+
+    pub fn toggle_deletion_choice(&mut self) {
+        let Some(deletion) = self.deletion.as_mut() else {
+            return;
+        };
+
+        deletion.choice = match deletion.choice {
+            DeletionChoice::Delete => DeletionChoice::Cancel,
+
+            DeletionChoice::Cancel => DeletionChoice::Delete,
+        };
+    }
+
+    pub fn confirm_deletion(&mut self) {
+        let Some(deletion) = self.deletion.take() else {
+            return;
+        };
+
+        /*
+         * Enter on the default Cancel choice is always harmless.
+         */
+        if deletion.choice != DeletionChoice::Delete {
+            return;
+        }
+
+        /*
+         * Repeat the destructive-boundary checks immediately before removal.
+         *
+         * The confirmation state may have remained open while the filesystem
+         * changed outside Scry.
+         */
+        if !self.enable_deletion {
+            return;
+        }
+
+        if self.source.is_remote() {
+            self.error_message =
+                Some("Deletion is not available while browsing through SSH".to_string());
+
+            return;
+        }
+
+        let path = deletion.path;
+
+        if !path.is_absolute() {
+            self.error_message = Some(format!(
+                "Refusing to delete a non-absolute path: {}",
+                path.display(),
+            ));
+
+            return;
+        }
+
+        if path == Path::new("/") {
+            self.error_message = Some("Refusing to delete the filesystem root".to_string());
+
+            return;
+        }
+
+        if path == self.current_directory {
+            self.error_message =
+                Some("Refusing to delete Scry's current browsing root".to_string());
+
+            return;
+        }
+
+        if !path.starts_with(&self.current_directory) {
+            self.error_message = Some(format!(
+                "Refusing to delete a path outside the current browsing root: {}",
+                path.display(),
+            ));
+
+            return;
+        }
+
+        if path.file_name().is_none() {
+            self.error_message = Some(format!(
+                "Refusing to delete a path without a filename: {}",
+                path.display(),
+            ));
+
+            return;
+        }
+
+        /*
+         * symlink_metadata() examines the link itself.
+         *
+         * A symlink pointing to a directory must be removed with remove_file(),
+         * never followed into its target with remove_dir_all().
+         */
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+
+            Err(error) => {
+                self.error_message = Some(format!(
+                    "Unable to validate {} for deletion: {}",
+                    path.display(),
+                    error,
+                ));
+
+                return;
+            }
+        };
+
+        let file_type = metadata.file_type();
+
+        let deletion_result = if file_type.is_symlink() {
+            std::fs::remove_file(&path)
+        } else if file_type.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+
+        if let Err(error) = deletion_result {
+            self.error_message = Some(format!("Unable to delete {}: {}", path.display(), error,));
+
+            return;
+        }
+
+        /*
+         * Remember the current visible position rather than a path.
+         *
+         * The deleted path no longer exists, so selection should naturally land
+         * on the next entry occupying that position, or the previous final entry
+         * when the deleted item was last.
+         */
+        let previous_selected = self.selected;
+
+        let previous_offset = self.list_offset;
+
+        let previous_view_mode = self.view_mode;
+
+        let entries = match self.source.read_directory(
+            &self.current_directory,
+            self.sort_mode,
+            self.sort_descending,
+        ) {
+            Ok(entries) => entries,
+
+            Err(error) => {
+                self.error_message = Some(format!(
+                    "{} was deleted, but Scry could not refresh {}: {}",
+                    path.display(),
+                    self.current_directory.display(),
+                    error,
+                ));
+
+                return;
+            }
+        };
+
+        self.entries = entries;
+
+        /*
+         * Every cached representation may still contain the removed path or one
+         * of its descendants.
+         */
+        self.invalidate_recursive_cache();
+
+        self.directory_has_content_cache.clear();
+
+        self.classification_inspection_cache
+            .retain(|cached_path, _| cached_path != &path && !cached_path.starts_with(&path));
+
+        self.tree_rows.clear();
+
+        self.filtered_tree_indices.clear();
+
+        self.tree_children.clear();
+
+        self.search_tree_children.clear();
+
+        self.expanded_directories
+            .retain(|expanded_path| expanded_path != &path && !expanded_path.starts_with(&path));
+
+        self.search_collapsed_directories
+            .retain(|collapsed_path| collapsed_path != &path && !collapsed_path.starts_with(&path));
+
+        self.recursive_expanded_directories
+            .retain(|expanded_path| expanded_path != &path && !expanded_path.starts_with(&path));
+
+        self.search_return_state = None;
+
+        self.pending_selection_path = None;
+
+        self.error_message = None;
+
+        self.selected = previous_selected;
+
+        self.list_offset = previous_offset;
+
+        match previous_view_mode {
+            ViewMode::List => {
+                if self.recursive_search_active() {
+                    self.ensure_recursive_scan();
+                }
+
+                self.refresh_filter();
+            }
+
+            ViewMode::Tree => {
+                if self.recursive_search_active() {
+                    self.ensure_recursive_scan();
+
+                    /*
+                     * The recursive tree is rebuilt when the new scan finishes.
+                     *
+                     * During that brief interval, keep the visible tree empty
+                     * rather than displaying stale rows containing the deleted path.
+                     */
+                    if !self.scan_in_progress {
+                        self.rebuild_recursive_search_tree(None);
+                    }
+                } else {
+                    self.reset_tree();
+                }
+            }
+        }
+
+        self.selected = self
+            .selected
+            .min(self.current_visible_entry_count().saturating_sub(1));
+
+        self.ensure_selection_visible(self.viewport_rows);
     }
 
     pub fn activate_selected(&mut self) {

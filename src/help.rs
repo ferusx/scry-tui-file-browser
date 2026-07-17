@@ -160,10 +160,20 @@ pub const KEY_BINDINGS: &[KeyBindingHelp] = &[
         description: "Activate the selected entry",
     },
     KeyBindingHelp {
-        keys: "Right-click",
+        keys: "Middle-click",
         description: "Collapse or move to the parent",
     },
 ];
+
+pub const DELETION_KEY_BINDING: KeyBindingHelp = KeyBindingHelp {
+    keys: "Delete",
+    description: "Delete the selected local file or directory",
+};
+
+pub const DISABLED_DELETION_KEY_BINDING: KeyBindingHelp = KeyBindingHelp {
+    keys: "Delete",
+    description: "Delete sel. entry (enable via scry.toml)",
+};
 
 pub const EXAMPLES: &[HelpExample] = &[
     HelpExample {
@@ -284,7 +294,7 @@ impl Palette {
     }
 }
 
-pub fn print_help() -> io::Result<()> {
+pub fn print_help(enable_deletion: bool) -> io::Result<()> {
     let palette = Palette::new();
 
     let options_widths = option_column_widths();
@@ -361,7 +371,7 @@ pub fn print_help() -> io::Result<()> {
 
     println!("{}", palette.section("Keyboard and mouse:"),);
 
-    print_key_table(palette);
+    print_key_table(palette, enable_deletion);
 
     println!();
 
@@ -499,15 +509,27 @@ fn print_three_column_row(
     );
 }
 
-fn print_key_table(palette: Palette) {
-    let key_width = KEY_BINDINGS
+fn print_key_table(palette: Palette, enable_deletion: bool) {
+    let deletion_binding = if enable_deletion {
+        DELETION_KEY_BINDING
+    } else {
+        DISABLED_DELETION_KEY_BINDING
+    };
+
+    let bindings = KEY_BINDINGS
+        .iter()
+        .copied()
+        .chain(std::iter::once(deletion_binding))
+        .collect::<Vec<_>>();
+
+    let key_width = bindings
         .iter()
         .map(|binding| binding.keys.chars().count())
         .chain(std::iter::once("keys".len()))
         .max()
         .unwrap_or(4);
 
-    let description_width = KEY_BINDINGS
+    let description_width = bindings
         .iter()
         .map(|binding| binding.description.chars().count())
         .chain(std::iter::once("description".len()))
@@ -520,8 +542,8 @@ fn print_key_table(palette: Palette) {
             '┌',
             '┬',
             '┐',
-            &[key_width, description_width,],
-        ),),
+            &[key_width, description_width],
+        )),
     );
 
     print_two_column_row(
@@ -539,11 +561,11 @@ fn print_key_table(palette: Palette) {
             '├',
             '┼',
             '┤',
-            &[key_width, description_width,],
-        ),),
+            &[key_width, description_width],
+        )),
     );
 
-    for binding in KEY_BINDINGS {
+    for binding in bindings {
         print_two_column_row(
             palette,
             binding.keys,
@@ -560,8 +582,8 @@ fn print_key_table(palette: Palette) {
             '└',
             '┴',
             '┘',
-            &[key_width, description_width,],
-        ),),
+            &[key_width, description_width],
+        )),
     );
 }
 

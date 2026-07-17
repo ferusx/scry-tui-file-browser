@@ -13,9 +13,10 @@ mod scan;
 mod search_index;
 mod source;
 mod ssh;
+mod themes;
 mod ui;
 
-use app::{App, ViewMode};
+use app::{App, DeletionChoice, ViewMode};
 use args::Cli;
 use clap::Parser;
 use connection::ConnectionField;
@@ -39,7 +40,7 @@ fn main() -> io::Result<()> {
     let config = config::ScryConfig::load();
 
     if cli.help {
-        help::print_help()?;
+        help::print_help(config.features.enable_deletion)?;
 
         return Ok(());
     }
@@ -269,6 +270,51 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
 }
 
 fn handle_key_event(app: &mut App, key_event: KeyEvent) {
+    if app.deletion_visible() {
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::Esc, _) => {
+                app.cancel_deletion();
+            }
+
+            (KeyCode::Left, _)
+            | (KeyCode::Right, _)
+            | (KeyCode::Tab, _)
+            | (KeyCode::BackTab, _) => {
+                app.toggle_deletion_choice();
+            }
+
+            (KeyCode::Enter, _) => {
+                let choice = app.deletion.as_ref().map(|deletion| deletion.choice);
+
+                match choice {
+                    Some(DeletionChoice::Cancel) => {
+                        app.cancel_deletion();
+                    }
+
+                    /*
+                     * Actual filesystem removal is connected in the next stage.
+                     *
+                     * For now, Enter deliberately leaves the confirmation window
+                     * open when Delete is selected.
+                     */
+                    Some(DeletionChoice::Delete) => {
+                        app.confirm_deletion();
+                    }
+
+                    None => {}
+                }
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
     if app.transfer_visible() {
         match (key_event.code, key_event.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -531,6 +577,10 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
             app.enter_selected_directory();
         }
 
+        (KeyCode::Delete, _) => {
+            app.begin_deletion_confirmation();
+        }
+
         (KeyCode::Enter, KeyModifiers::NONE) => {
             app.activate_selected();
         }
@@ -558,6 +608,23 @@ fn handle_mouse_event(
     scrollbar_drag: &mut Option<ScrollbarDragState>,
     help_scrollbar_drag: &mut bool,
 ) {
+    if app.deletion_visible() {
+        *scrollbar_drag = None;
+
+        *help_scrollbar_drag = false;
+
+        *last_left_click = None;
+
+        /*
+         * Deletion confirmation is modal.
+         *
+         * Mouse events must not select or activate entries behind the popup.
+         * Button hit testing will be added separately after keyboard behavior has
+         * been verified.
+         */
+        return;
+    }
+
     if app.transfer_visible() {
         *scrollbar_drag = None;
 
@@ -653,6 +720,13 @@ fn handle_mouse_event(
 
     let area = regions.entries;
 
+    let parent_button = regions.parent_button;
+
+    let on_parent_button = event.column >= parent_button.x
+        && event.column < parent_button.x.saturating_add(parent_button.width)
+        && event.row >= parent_button.y
+        && event.row < parent_button.y.saturating_add(parent_button.height);
+
     let right_edge = area.x.saturating_add(area.width).saturating_sub(1);
 
     let inside_entries_panel = event.column >= area.x
@@ -667,25 +741,20 @@ fn handle_mouse_event(
     let on_scrollbar = inside_entry_rows && event.column == right_edge;
 
     match event.kind {
+        MouseEventKind::Down(MouseButton::Left) if on_parent_button => {
+            *scrollbar_drag = None;
+
+            *last_left_click = None;
+
+            app.enter_parent_directory();
+        }
+
         MouseEventKind::ScrollUp => {
             app.scroll_selection(-WHEEL_STEP);
         }
 
         MouseEventKind::ScrollDown => {
             app.scroll_selection(WHEEL_STEP);
-        }
-
-        /*
-         * Right-click behaves like Left Arrow / Escape:
-         *
-         * - List mode: enter the parent directory.
-         * - Tree mode: collapse the selected directory or select its parent.
-         */
-        MouseEventKind::Down(MouseButton::Right) => {
-            *scrollbar_drag = None;
-            *last_left_click = None;
-
-            app.enter_parent_directory();
         }
 
         /*

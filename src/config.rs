@@ -34,6 +34,9 @@ recursive = false
 sort = "name"
 reverse = false
 
+[features]
+enable_deletion = false
+
 [ssh]
 connect_timeout_seconds = 10
 server_alive_interval_seconds = 15
@@ -53,6 +56,8 @@ pub struct ScryConfig {
 
     pub browser: BrowserConfig,
 
+    pub features: FeatureConfig,
+
     pub ssh: SshConfig,
 }
 
@@ -64,6 +69,8 @@ impl Default for ScryConfig {
             display: DisplayConfig::default(),
 
             browser: BrowserConfig::default(),
+
+            features: FeatureConfig::default(),
 
             ssh: SshConfig::default(),
         }
@@ -134,6 +141,26 @@ impl Default for BrowserConfig {
             sort: "name".to_string(),
 
             reverse: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct FeatureConfig {
+    /*
+     * Permit deletion of selected local filesystem entries.
+     *
+     * This feature is deliberately disabled by default. When disabled,
+     * deletion controls remain absent from Scry's interface.
+     */
+    pub enable_deletion: bool,
+}
+
+impl Default for FeatureConfig {
+    fn default() -> Self {
+        Self {
+            enable_deletion: false,
         }
     }
 }

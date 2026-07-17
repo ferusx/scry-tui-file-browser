@@ -48,7 +48,7 @@
 ### SSH browsing
 
 <p align="center">
-  <img src="screenshots/scry4.png" alt="Scry SSH connection manager" width="95%">
+  <img src="screenshots/scry4_.png" alt="Scry SSH connection manager" width="95%">
 </p>
 
 <p align="center">
@@ -60,6 +60,19 @@
 <p align="center">
   <img src="screenshots/scry6.png" alt="Scry shortcuts window" width="49%">
   <img src="screenshots/scry7.png" alt="About Scry window" width="49%">
+</p>
+
+### Scry themed up
+
+<p align="center">
+  <img src="screenshots/scry8.png" alt="Fuzzy search mode" width="49%">
+  <img src="screenshots/scry9.png" alt="Fuzzy search over SSH" width="49%">
+</p>
+
+### Deletion support
+
+<p align="center">
+  <img src="screenshots/scry10.png" alt="Delete dialog" width="95%">
 </p>
 
 ## Building

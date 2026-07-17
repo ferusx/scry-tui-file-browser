@@ -266,9 +266,9 @@ fn maximum_typo_distance(query_length: usize) -> usize {
     match query_length {
         0..=2 => 0,
 
-        3..=4 => 1,
+        3 => 1,
 
-        5..=8 => 2,
+        4..=8 => 2,
 
         _ => 3,
     }
