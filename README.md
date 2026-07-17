@@ -35,14 +35,14 @@
 ### Local browsing
 
 <p align="center">
-  <img src="screenshots/scry1.png" alt="Scry local browser with Details visible and metadata hidden" width="49%">
+  <img src="screenshots/scry1_.png" alt="Scry local browser with Details visible and metadata hidden" width="49%">
   <img src="screenshots/scry2.png" alt="Scry local browser with metadata and Selection visible" width="49%">
 </p>
 
 ### Tree view
 
 <p align="center">
-  <img src="screenshots/scry3.png" alt="Scry Tree view with metadata and Details pane" width="95%">
+  <img src="screenshots/scry3_.png" alt="Scry Tree view with metadata and Details pane" width="95%">
 </p>
 
 ### SSH browsing
@@ -52,7 +52,7 @@
 </p>
 
 <p align="center">
-  <img src="screenshots/scry5.png" alt="Scry browsing a remote filesystem over SSH" width="95%">
+  <img src="screenshots/scry5_.png" alt="Scry browsing a remote filesystem over SSH" width="95%">
 </p>
 
 ### Shortcuts and About
