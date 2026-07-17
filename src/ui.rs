@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use crate::app::{App, TreeRow, ViewMode};
-use crate::connection::ConnectionField;
-use crate::scan::FileEntry;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -14,6 +11,11 @@ use ratatui::{
     },
 };
 use std::time::{Duration, SystemTime};
+
+use crate::app::{App, SearchMode, TreeRow, ViewMode};
+use crate::connection::ConnectionField;
+use crate::fuzzy::fuzzy_highlight_positions;
+use crate::scan::FileEntry;
 
 // SCROLLBAR CONSTANTS
 const COLOR_SCROLLBAR_THUMB: Color = COLOR_FRAME;
@@ -71,16 +73,56 @@ const COLOR_PERMISSION_MISSING: Color = COLOR_MUTED;
 
 const COLOR_PERMISSION_SPECIAL: Color = COLOR_CLASSIFICATION;
 
-// WIDTH CONSTANTS
+/*
+ * Permissions and modification dates use fixed-width formats:
+ *
+ *     .rwxr-xr-x
+ *     2026-07-16 10:42
+ */
 const PERMISSIONS_COLUMN_WIDTH: u16 = 10;
-
-const SIZE_COLUMN_WIDTH: u16 = 10;
 
 const DATE_COLUMN_WIDTH: u16 = 16;
 
-const USER_COLUMN_WIDTH: u16 = 12;
+/*
+ * Size and owner widths adapt to the current result set.
+ *
+ * The limits prevent unusually long values from consuming the filesystem
+ * panel.
+ */
+const SIZE_COLUMN_MIN_WIDTH: u16 = 4;
+
+const SIZE_COLUMN_MAX_WIDTH: u16 = 10;
+
+const USER_COLUMN_MIN_WIDTH: u16 = 4;
+
+const USER_COLUMN_MAX_WIDTH: u16 = 16;
 
 const METADATA_COLUMN_GAP: u16 = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct MetadataWidths {
+    permissions: u16,
+
+    size: u16,
+
+    date: u16,
+
+    user: u16,
+}
+
+impl Default for MetadataWidths {
+    fn default() -> Self {
+        Self {
+            permissions: PERMISSIONS_COLUMN_WIDTH,
+
+            size: SIZE_COLUMN_MIN_WIDTH,
+
+            date: DATE_COLUMN_WIDTH,
+
+            user: USER_COLUMN_MIN_WIDTH,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TransferUiRegions {
@@ -249,11 +291,50 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         app.current_directory.display(),
     );
 
+    let mode_label = match (app.search_mode, app.recursive_mode) {
+        (SearchMode::Exact, false) => "Exact",
+
+        (SearchMode::Fuzzy, false) => "Fuzzy",
+
+        (SearchMode::Exact, true) => "Recursive",
+
+        (SearchMode::Fuzzy, true) => "Fuzzy+Recursive",
+    };
+
+    let placeholder = match (app.search_mode, app.recursive_mode) {
+        (SearchMode::Exact, false) => r#"type to filter — e.g. "hello", "world", "/etc""#,
+
+        (SearchMode::Fuzzy, false) => r#"type to search fuzzily — e.g. "help", "hlep", "hlp""#,
+
+        (SearchMode::Exact, true) => r#"type to filter recursively — e.g. "config", ".rs", "/etc""#,
+
+        (SearchMode::Fuzzy, true) => r#"type to search recursively — e.g. "help", "hlep", "hlp""#,
+    };
+
+    let emphasized_mode = app.search_mode == SearchMode::Fuzzy || app.recursive_mode;
+
+    let mode_color = if emphasized_mode {
+        COLOR_QUERY
+    } else {
+        COLOR_MUTED
+    };
+
     let search = Paragraph::new(Line::from(vec![
-        Span::styled("Search: ", Style::default().fg(COLOR_MUTED)),
+        Span::styled("Search [", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            mode_label,
+            Style::default()
+                .fg(mode_color)
+                .add_modifier(if emphasized_mode {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        Span::styled("]: ", Style::default().fg(COLOR_MUTED)),
         Span::styled(
             if app.query.is_empty() {
-                "type to filter"
+                placeholder
             } else {
                 &app.query
             },
@@ -343,7 +424,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(rows[0]);
 
-    render_detail_value(frame, first_row[0], "Name", entry.name.clone(), name_color);
+    render_detail_name(frame, first_row[0], &entry, app.show_icons, name_color);
 
     render_detail_value(
         frame,
@@ -402,6 +483,30 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+fn render_detail_name(
+    frame: &mut Frame,
+    area: Rect,
+    entry: &FileEntry,
+    show_icons: bool,
+    name_color: Color,
+) {
+    let mut spans = vec![Span::styled(" Name: ", Style::default().fg(COLOR_MUTED))];
+
+    if show_icons {
+        spans.push(Span::styled(
+            format!("{} ", file_icon(entry)),
+            Style::default().fg(file_icon_color(entry)),
+        ));
+    }
+
+    spans.push(Span::styled(
+        entry.name.clone(),
+        Style::default().fg(name_color),
+    ));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render_detail_value(
     frame: &mut Frame,
     area: Rect,
@@ -449,7 +554,7 @@ fn format_past_age(age: Duration) -> String {
     if age.as_secs() < 5 {
         "just now".to_string()
     } else {
-        format!("{} ago", format_age_duration(age,),)
+        format!("{}", format_age_duration(age,),)
     }
 }
 
@@ -523,15 +628,21 @@ fn format_age_duration(duration: Duration) -> String {
 
 fn render_entries(frame: &mut Frame, app: &mut App, area: Rect) -> Rect {
     if metadata_visible(app) {
+        /*
+         * Calculate the widths once and pass the same values to the panel,
+         * heading, and rows.
+         */
+        let widths = metadata_widths(app);
+
         let areas = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(metadata_panel_width(app)),
+                Constraint::Length(metadata_panel_width(app, widths)),
                 Constraint::Min(20),
             ])
             .split(area);
 
-        render_metadata(frame, app, areas[0]);
+        render_metadata(frame, app, areas[0], widths);
 
         render_filesystem_entries(frame, app, areas[1]);
 
@@ -547,27 +658,103 @@ fn metadata_visible(app: &App) -> bool {
     app.show_columns && (app.show_permissions || app.show_size || app.show_date || app.show_user)
 }
 
-fn metadata_content_width(app: &App) -> u16 {
+fn metadata_widths(app: &mut App) -> MetadataWidths {
+    let mut widths = MetadataWidths::default();
+
+    /*
+     * Collect the small pieces needed for width calculation first.
+     *
+     * owner_name() mutably accesses Scry's UID cache, so we cannot retain an
+     * immutable entry borrow while resolving the displayed owner.
+     */
+    let metadata: Vec<(u64, bool, u32)> = match app.view_mode {
+        ViewMode::List => (0..app.filtered_indices.len())
+            .filter_map(|position| {
+                app.entry_at_filtered_position(position)
+                    .map(|entry| (entry.size_bytes, entry.is_directory, entry.owner_id))
+            })
+            .collect(),
+
+        ViewMode::Tree => (0..app.filtered_tree_indices.len())
+            .filter_map(|position| {
+                app.tree_row_at_filtered_position(position).map(|row| {
+                    (
+                        row.entry.size_bytes,
+                        row.entry.is_directory,
+                        row.entry.owner_id,
+                    )
+                })
+            })
+            .collect(),
+    };
+
+    if app.show_size {
+        for (size_bytes, is_directory, _) in &metadata {
+            let displayed_size = if *is_directory {
+                "—".to_string()
+            } else {
+                format_file_size(*size_bytes)
+            };
+
+            widths.size = widths.size.max(displayed_size.chars().count() as u16);
+        }
+
+        widths.size = widths
+            .size
+            .clamp(SIZE_COLUMN_MIN_WIDTH, SIZE_COLUMN_MAX_WIDTH);
+    }
+
+    if app.show_user {
+        /*
+         * Avoid repeatedly resolving the same owner when a directory contains
+         * many entries owned by one account.
+         */
+        let mut owner_ids: Vec<u32> = metadata.iter().map(|(_, _, owner_id)| *owner_id).collect();
+
+        owner_ids.sort_unstable();
+
+        owner_ids.dedup();
+
+        for owner_id in owner_ids {
+            let owner = app.owner_name(owner_id);
+
+            widths.user = widths.user.max(owner.chars().count() as u16);
+        }
+
+        widths.user = widths
+            .user
+            .clamp(USER_COLUMN_MIN_WIDTH, USER_COLUMN_MAX_WIDTH);
+    }
+
+    widths
+}
+
+fn metadata_content_width(app: &App, widths: MetadataWidths) -> u16 {
     let mut width = 0;
+
     let mut column_count = 0;
 
     if app.show_permissions {
-        width += PERMISSIONS_COLUMN_WIDTH;
+        width += widths.permissions;
+
         column_count += 1;
     }
 
     if app.show_size {
-        width += SIZE_COLUMN_WIDTH;
+        width += widths.size;
+
         column_count += 1;
     }
 
     if app.show_date {
-        width += DATE_COLUMN_WIDTH;
+        width += widths.date;
+
         column_count += 1;
     }
 
     if app.show_user {
-        width += USER_COLUMN_WIDTH;
+        width += widths.user;
+
         column_count += 1;
     }
 
@@ -578,11 +765,11 @@ fn metadata_content_width(app: &App) -> u16 {
     width
 }
 
-fn metadata_panel_width(app: &App) -> u16 {
+fn metadata_panel_width(app: &App, widths: MetadataWidths) -> u16 {
     /*
      * Two border cells plus one padding cell on each side.
      */
-    metadata_content_width(app) + 4
+    metadata_content_width(app, widths) + 4
 }
 
 fn render_filesystem_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
@@ -597,7 +784,12 @@ fn render_filesystem_entries(frame: &mut Frame, app: &mut App, area: ratatui::la
     }
 }
 
-fn render_metadata(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+fn render_metadata(
+    frame: &mut Frame,
+    app: &mut App,
+    area: ratatui::layout::Rect,
+    widths: MetadataWidths,
+) {
     let visible_rows = area.height.saturating_sub(2) as usize;
 
     app.ensure_selection_visible(visible_rows);
@@ -659,10 +851,11 @@ fn render_metadata(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
             is_directory,
             &modified,
             owner.as_deref(),
+            widths,
         ));
     }
 
-    let title = metadata_title(app);
+    let title = metadata_title(app, widths);
 
     let list = List::new(items)
         .block(
@@ -686,39 +879,27 @@ fn render_metadata(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn metadata_title(app: &App) -> String {
+fn metadata_title(app: &App, widths: MetadataWidths) -> String {
     let mut columns = Vec::new();
 
     if app.show_permissions {
         columns.push(format!(
             "{:<width$}",
             "Permissions",
-            width = PERMISSIONS_COLUMN_WIDTH as usize,
+            width = widths.permissions as usize,
         ));
     }
 
     if app.show_size {
-        columns.push(format!(
-            "{:>width$}",
-            "Size",
-            width = SIZE_COLUMN_WIDTH as usize,
-        ));
+        columns.push(format!("{:>width$}", "Size", width = widths.size as usize,));
     }
 
     if app.show_date {
-        columns.push(format!(
-            "{:<width$}",
-            "Date",
-            width = DATE_COLUMN_WIDTH as usize,
-        ));
+        columns.push(format!("{:<width$}", "Date", width = widths.date as usize,));
     }
 
     if app.show_user {
-        columns.push(format!(
-            "{:<width$}",
-            "User",
-            width = USER_COLUMN_WIDTH as usize,
-        ));
+        columns.push(format!("{:<width$}", "User", width = widths.user as usize,));
     }
 
     format!(" {} ", columns.join("  "),)
@@ -731,6 +912,7 @@ fn metadata_list_item(
     is_directory: bool,
     modified: &str,
     owner: Option<&str>,
+    widths: MetadataWidths,
 ) -> ListItem<'static> {
     let mut spans = vec![Span::raw(" ")];
 
@@ -741,7 +923,7 @@ fn metadata_list_item(
 
         let permission_length = permissions.chars().count();
 
-        let permission_width = PERMISSIONS_COLUMN_WIDTH as usize;
+        let permission_width = widths.permissions as usize;
 
         if permission_length < permission_width {
             spans.push(Span::raw(" ".repeat(permission_width - permission_length)));
@@ -752,7 +934,7 @@ fn metadata_list_item(
 
     if app.show_size {
         if needs_gap {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" ".repeat(METADATA_COLUMN_GAP as usize)));
         }
 
         let size = if is_directory {
@@ -762,7 +944,7 @@ fn metadata_list_item(
         };
 
         spans.push(Span::styled(
-            format!("{:>width$}", size, width = SIZE_COLUMN_WIDTH as usize,),
+            format!("{:>width$}", size, width = widths.size as usize,),
             Style::default().fg(if is_directory {
                 COLOR_MUTED
             } else {
@@ -775,11 +957,11 @@ fn metadata_list_item(
 
     if app.show_date {
         if needs_gap {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" ".repeat(METADATA_COLUMN_GAP as usize)));
         }
 
         spans.push(Span::styled(
-            format!("{:<width$}", modified, width = DATE_COLUMN_WIDTH as usize,),
+            format!("{:<width$}", modified, width = widths.date as usize,),
             Style::default().fg(COLOR_DATE),
         ));
 
@@ -788,13 +970,13 @@ fn metadata_list_item(
 
     if app.show_user {
         if needs_gap {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" ".repeat(METADATA_COLUMN_GAP as usize)));
         }
 
         let owner = owner.unwrap_or("—");
 
         spans.push(Span::styled(
-            truncate_and_pad(owner, USER_COLUMN_WIDTH as usize),
+            truncate_and_pad(owner, widths.user as usize),
             Style::default().fg(COLOR_USER),
         ));
     }
@@ -892,19 +1074,57 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         app.query.clone()
     };
 
-    let items: Vec<ListItem> = (window_start..window_end)
-        .filter_map(|position| app.entry_at_filtered_position(position))
-        .map(|entry| entry_list_item(entry, &highlight_query))
-        .collect();
+    let search_mode = app.search_mode;
 
-    let heading = if app.recursive_search_active() {
+    let mut items: Vec<ListItem> = Vec::new();
+
+    for position in window_start..window_end {
+        /*
+         * Clone the entry before asking App whether the directory has content.
+         *
+         * directory_has_content() mutably accesses Scry's cache, so the immutable
+         * entry borrow must end first.
+         */
+        let Some(entry) = app.entry_at_filtered_position(position).cloned() else {
+            continue;
+        };
+
+        let has_content = entry.is_directory && app.directory_has_content(&entry.path);
+
+        items.push(entry_list_item(
+            &entry,
+            &highlight_query,
+            search_mode,
+            has_content,
+            app.show_icons,
+        ));
+    }
+
+    let heading = if app.search_mode == SearchMode::Fuzzy && app.fuzzy_filter_in_progress {
+        format!(
+            "Fuzzy results — updating… — best {}",
+            app.filtered_indices.len(),
+        )
+    } else if app.recursive_search_active() {
         if app.scan_in_progress {
-            "Recursive results — scanning…"
+            format!(
+                "Recursive results — scanning {} entries…",
+                app.active_entry_count(),
+            )
+        } else if app.search_mode == SearchMode::Fuzzy {
+            if app.recursive_scan_partial {
+                format!(
+                    "Fuzzy results — best {} — partial index",
+                    app.filtered_indices.len(),
+                )
+            } else {
+                format!("Fuzzy results — best {}", app.filtered_indices.len(),)
+            }
         } else {
-            "Recursive results"
+            "Recursive results".to_string()
         }
     } else {
-        "Entries"
+        "Entries".to_string()
     };
 
     let sort_arrow = if app.sort_descending { "↓" } else { "↑" };
@@ -1017,7 +1237,12 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
         let has_content = row.entry.is_directory && app.directory_has_content(&row.entry.path);
 
-        items.push(tree_list_item(&row, &highlight_query, has_content));
+        items.push(tree_list_item(
+            &row,
+            &highlight_query,
+            has_content,
+            app.show_icons,
+        ));
     }
 
     let sort_arrow = if app.sort_descending { "↓" } else { "↑" };
@@ -1030,8 +1255,15 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             sort_arrow,
         )
     } else {
+        let tree_kind = if app.recursive_search_active() && app.recursive_scan_partial {
+            "Tree — partial index"
+        } else {
+            "Tree"
+        };
+
         format!(
-            " Tree — {} shown / {} expanded nodes — {} {} ",
+            " {} — {} shown / {} expanded nodes — {} {} ",
+            tree_kind,
             app.filtered_tree_indices.len(),
             app.tree_rows.len(),
             app.sort_mode.label(),
@@ -1071,7 +1303,12 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
     );
 }
 
-fn tree_list_item(row: &TreeRow, query: &str, has_content: bool) -> ListItem<'static> {
+fn tree_list_item(
+    row: &TreeRow,
+    query: &str,
+    has_content: bool,
+    show_icons: bool,
+) -> ListItem<'static> {
     let mut spans = Vec::new();
 
     for ancestor_has_more in &row.ancestor_has_more {
@@ -1104,6 +1341,13 @@ fn tree_list_item(row: &TreeRow, query: &str, has_content: bool) -> ListItem<'st
 
     spans.push(Span::styled(marker.to_string(), Style::default().fg(color)));
 
+    if show_icons {
+        spans.push(Span::styled(
+            format!("{} ", file_icon(&row.entry)),
+            Style::default().fg(file_icon_color(&row.entry)),
+        ));
+    }
+
     spans.extend(highlighted_name_spans(&row.entry.name, query, color));
 
     if !suffix.is_empty() {
@@ -1113,9 +1357,117 @@ fn tree_list_item(row: &TreeRow, query: &str, has_content: bool) -> ListItem<'st
     ListItem::new(Line::from(spans))
 }
 
-fn entry_list_item(entry: &FileEntry, query: &str) -> ListItem<'static> {
+fn file_icon(entry: &FileEntry) -> &'static str {
+    if entry.is_symlink {
+        return "";
+    }
+
+    if entry.is_directory {
+        return "󰉋";
+    }
+
+    let extension = entry
+        .path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    match extension.as_deref() {
+        Some("rs") => "",
+        Some("py") => "",
+        Some("sh") | Some("bash") | Some("zsh") | Some("fish") => "",
+        Some("md") | Some("txt") | Some("rst") => "󰈙",
+        Some("json") | Some("yaml") | Some("yml") | Some("toml") | Some("ini") | Some("conf")
+        | Some("config") => "",
+        Some("zip") | Some("tar") | Some("gz") | Some("xz") | Some("bz2") | Some("7z")
+        | Some("rar") => "",
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("svg")
+        | Some("bmp") => "󰈟",
+        Some("mp3") | Some("flac") | Some("wav") | Some("ogg") | Some("m4a") => "󰎈",
+        Some("mp4") | Some("mkv") | Some("avi") | Some("mov") | Some("webm") => "󰈫",
+        Some("pdf") => "",
+        Some("c") | Some("h") | Some("cpp") | Some("hpp") | Some("cc") => "",
+        Some("js") | Some("ts") => "󰌞",
+        Some("html") | Some("htm") | Some("css") => "󰌝",
+        _ => "󰈔",
+    }
+}
+
+fn file_icon_color(entry: &FileEntry) -> Color {
+    use crate::classify::FileClass;
+
+    if entry.is_directory {
+        return COLOR_DIRECTORY;
+    }
+
+    if entry.is_symlink {
+        return COLOR_SYMLINK;
+    }
+
+    match entry.class {
+        FileClass::Rust => Color::Rgb(230, 125, 70),
+
+        FileClass::Python => Color::Rgb(80, 170, 235),
+
+        FileClass::ShellScript | FileClass::Executable => Color::Rgb(90, 200, 125),
+
+        FileClass::C | FileClass::Cpp | FileClass::SourceCode => Color::Rgb(105, 145, 225),
+
+        FileClass::Java | FileClass::Kotlin => Color::Rgb(220, 105, 85),
+
+        FileClass::JavaScript | FileClass::TypeScript => Color::Rgb(235, 205, 65),
+
+        FileClass::Web => Color::Rgb(210, 100, 190),
+
+        FileClass::Config | FileClass::StructuredData | FileClass::Build => {
+            Color::Rgb(80, 185, 205)
+        }
+
+        FileClass::Archive | FileClass::Package => Color::Rgb(215, 135, 80),
+
+        FileClass::Document | FileClass::Text => Color::Rgb(195, 205, 220),
+
+        FileClass::Spreadsheet => Color::Rgb(70, 195, 115),
+
+        FileClass::Presentation => Color::Rgb(230, 135, 70),
+
+        FileClass::Image | FileClass::VectorImage => Color::Rgb(215, 105, 220),
+
+        FileClass::Audio => Color::Rgb(105, 165, 225),
+
+        FileClass::Video => Color::Rgb(195, 100, 220),
+
+        FileClass::Font => Color::Rgb(195, 145, 225),
+
+        FileClass::Database => Color::Rgb(70, 190, 205),
+
+        FileClass::Log => Color::Rgb(155, 165, 180),
+
+        FileClass::Backup => Color::Rgb(175, 125, 195),
+
+        FileClass::Certificate => Color::Rgb(225, 190, 75),
+
+        FileClass::DiskImage => Color::Rgb(125, 155, 215),
+
+        FileClass::Torrent => Color::Rgb(80, 190, 145),
+
+        FileClass::DesktopEntry | FileClass::Plugin => Color::Rgb(155, 130, 220),
+
+        FileClass::Binary | FileClass::Unknown => COLOR_FILE,
+
+        FileClass::Directory | FileClass::Symlink => COLOR_FILE,
+    }
+}
+
+fn entry_list_item(
+    entry: &FileEntry,
+    query: &str,
+    search_mode: SearchMode,
+    has_content: bool,
+    show_icons: bool,
+) -> ListItem<'static> {
     let (prefix, color, suffix) = if entry.is_directory {
-        ("▸ ", COLOR_DIRECTORY, "/")
+        ("▸ ", COLOR_DIRECTORY, if has_content { " →" } else { "/" })
     } else if entry.is_symlink {
         ("↪ ", COLOR_SYMLINK, "@")
     } else {
@@ -1124,15 +1476,86 @@ fn entry_list_item(entry: &FileEntry, query: &str) -> ListItem<'static> {
 
     let mut spans = vec![Span::styled(prefix.to_string(), Style::default().fg(color))];
 
+    if show_icons {
+        spans.push(Span::styled(
+            format!("{} ", file_icon(entry)),
+            Style::default().fg(file_icon_color(entry)),
+        ));
+    }
+
     let display_path = entry.relative_path.to_string_lossy().into_owned();
 
-    spans.extend(highlighted_name_spans(&display_path, query, color));
+    match search_mode {
+        SearchMode::Exact => {
+            spans.extend(highlighted_name_spans(&display_path, query, color));
+        }
+
+        SearchMode::Fuzzy => {
+            let positions = fuzzy_highlight_positions(&display_path, query);
+
+            spans.extend(highlighted_position_spans(&display_path, &positions, color));
+        }
+    }
 
     if !suffix.is_empty() {
         spans.push(Span::styled(suffix.to_string(), Style::default().fg(color)));
     }
 
     ListItem::new(Line::from(spans))
+}
+
+fn highlighted_position_spans(
+    text: &str,
+    highlighted_positions: &[usize],
+    normal_color: Color,
+) -> Vec<Span<'static>> {
+    if highlighted_positions.is_empty() {
+        return vec![Span::styled(
+            text.to_string(),
+            Style::default().fg(normal_color),
+        )];
+    }
+
+    let highlighted: std::collections::HashSet<usize> =
+        highlighted_positions.iter().copied().collect();
+
+    let mut spans = Vec::new();
+
+    let mut current_text = String::new();
+
+    let mut current_is_highlighted = None;
+
+    for (position, character) in text.chars().enumerate() {
+        let is_highlighted = highlighted.contains(&position);
+
+        if current_is_highlighted.is_some_and(|current| current != is_highlighted) {
+            spans.push(Span::styled(
+                std::mem::take(&mut current_text),
+                Style::default().fg(if current_is_highlighted == Some(true) {
+                    COLOR_MATCH
+                } else {
+                    normal_color
+                }),
+            ));
+        }
+
+        current_is_highlighted = Some(is_highlighted);
+
+        current_text.push(character);
+    }
+
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            Style::default().fg(if current_is_highlighted == Some(true) {
+                COLOR_MATCH
+            } else {
+                normal_color
+            }),
+        ));
+    }
+
+    spans
 }
 
 fn highlighted_name_spans(name: &str, query: &str, normal_color: Color) -> Vec<Span<'static>> {
@@ -1404,7 +1827,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
         connection_help_line("Enter", "Advance or activate the selected button"),
         connection_help_line("Backspace", "Delete from the focused field"),
         connection_help_line("Ctrl+U", "Clear the focused field"),
-        connection_help_line("Ctrl+N / Esc", "Close the connection window"),
+        connection_help_line("F4 / Esc", "Close the connection window"),
         Line::raw(""),
         if let Some(message) = &app.connection_dialog.error_message {
             Line::styled(
@@ -1933,7 +2356,7 @@ fn render_about_overlay(frame: &mut Frame, area: Rect) {
         about_information_line("License", "BSD 3-Clause"),
         about_information_line("SPDX", "BSD-3-Clause"),
         about_information_line("E-mail", "hedningakjetil@gmail.com"),
-        about_information_line("Repository", "github.com/ferusx/scry-file-browser"),
+        about_information_line("Repository", "github.com/ferusx/scry-tui-file-browser"),
         Line::raw(""),
         Line::styled(
             "Alt+A / Esc / Enter to close",
@@ -2003,16 +2426,17 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
             ("← / Esc", "Enter the parent directory"),
             ("→", "Open the selected directory"),
             ("Enter", "Open or activate the selection"),
-            ("Ctrl+T", "Switch between List and Tree"),
-            ("Ctrl+H", "Show or hide hidden entries"),
+            ("Ctrl+T", "Enter Tree mode"),
+            ("Alt+H", "Show or hide hidden entries"),
             ("Ctrl+O", "Cycle through sort modes"),
+            ("Alt+R", "Toggle recursive mode"),
             ("Ctrl+R", "Reverse the sort direction"),
             ("Ctrl+D", "Show or hide Details"),
             ("Ctrl+S", "Show or hide Selection"),
             ("Alt+M", "Show or hide metadata"),
-            ("Alt+A", "Open the About window"),
-            ("Ctrl+N", "Open SSH connections"),
+            ("F4", "Open SSH connections manager"),
             ("?", "Open or close this window"),
+            ("Alt+A", "Open the About window"),
             ("Ctrl+C", "Exit Scry"),
         ],
     );
@@ -2028,15 +2452,16 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
             ("← / Esc", "Collapse or select the parent"),
             ("Enter", "Make directory the new root"),
             ("Ctrl+T", "Return to List mode"),
-            ("Ctrl+H", "Show or hide hidden entries"),
+            ("Alt+H", "Show or hide hidden entries"),
             ("Ctrl+O", "Cycle through sort modes"),
+            ("Alt+R", "Toggle recursive mode"),
             ("Ctrl+R", "Reverse the sort direction"),
             ("Ctrl+D", "Show or hide Details"),
             ("Ctrl+S", "Show or hide Selection"),
             ("Alt+M", "Show or hide metadata"),
-            ("Alt+A", "Open the About window"),
-            ("Ctrl+N", "Open SSH connections"),
+            ("F4", "Open SSH connections manager"),
             ("?", "Open or close this window"),
+            ("Alt+A", "Open the About window"),
             ("Ctrl+C", "Exit Scry"),
         ],
     );
@@ -2051,15 +2476,18 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
             ("Home / End", "Select first or last result"),
             ("Backspace", "Delete one search character"),
             ("Ctrl+H", "Delete one character"),
+            ("Alt+H", "Show or hide hidden entries"),
             ("Ctrl+U", "Clear the complete search"),
             ("Enter", "Open or locate the result"),
             ("← / Esc", "Enter the parent directory"),
+            ("Alt+R", "Toggle recursive mode"),
+            ("Ctrl+R", "Reverse the sort direction"),
             ("Ctrl+D", "Show or hide Details"),
             ("Ctrl+S", "Show or hide Selection"),
             ("Alt+M", "Show or hide metadata"),
-            ("Alt+A", "Open the About window"),
-            ("Ctrl+N", "Open SSH connections"),
+            ("F4", "Open SSH connections manager"),
             ("?", "Open or close this window"),
+            ("Alt+A", "Open the About window"),
             ("Ctrl+C", "Exit Scry"),
         ],
     );
@@ -2180,9 +2608,7 @@ fn shortcut_help_line(shortcut: &str, description: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("  {:<width$}", shortcut, width = SHORTCUT_WIDTH,),
-            Style::default()
-                .fg(COLOR_QUERY)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(COLOR_QUERY),
         ),
         Span::styled(description.to_string(), Style::default().fg(COLOR_MUTED)),
     ])
@@ -2234,23 +2660,29 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         "Meta:empty"
     };
 
+    let recursive_state = if app.recursive_mode {
+        "recursive:on"
+    } else {
+        "recursive:off"
+    };
+
     let footer = if app.view_mode == ViewMode::Tree {
         // Tree View Help Text
         format!(
-            " ^? Help  ↑/↓ move  ← parent  → open directory  Enter open/select  ^N SSH  ^C Exit ",
-            // None for now
+            " ^? More  F4 SSH  ↑/↓ Move  ← Collapse  → Expand  Enter Select/open  Alt+H {}  ^C Exit ",
+            hidden_state,
         )
     } else if app.query.is_empty() {
         // Normal View Help Text
         format!(
-            " ^? Help  Enter open/select  ^H {}  ^D {} ^S {}  Alt+M {}  ^N SSH  ^C Exit ",
+            " ^? More  F4 SSH  Enter Select/open  Alt+H {}  ^D {} ^S {}  Alt+M {}  ^C Exit ",
             hidden_state, details_state, selection_state, columns_state,
         )
     } else {
         // Active Search Help Text
         format!(
-            " ^? Help  Backspace edit   ^U clear   Enter open/select  ^C Exit  ",
-            // None for now
+            " ^? More  ↑/↓ Move  PgUp ↑  PgDn ↓  Enter Select/open  Alt+R {}  ^U Clear  ^C Exit ",
+            recursive_state,
         )
     };
 

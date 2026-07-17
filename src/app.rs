@@ -14,8 +14,14 @@ use std::time::{Duration, Instant};
 use users::get_user_by_uid;
 
 use crate::classify::{FileClass, inspect_file};
+use crate::config::{ScryConfig, SshConfig};
 use crate::connection::{ConnectionDialogState, ConnectionStore};
-use crate::scan::{FileEntry, ScanMessage, SortMode, sort_entries, start_recursive_scan};
+use crate::fuzzy::{FuzzyWorkerResult, start_fuzzy_worker};
+
+use crate::scan::{
+    FileEntry, RecursiveScanMode, ScanMessage, SortMode, sort_entries, start_recursive_scan,
+};
+use crate::search_index::SearchIndex;
 use crate::source::{FileSource, LocalSource, TransferControl, TransferProgress};
 use crate::ssh::{SftpSource, SshTarget};
 
@@ -31,6 +37,8 @@ struct LocalSessionState {
 
     view_mode: ViewMode,
 
+    search_mode: SearchMode,
+
     recursive_mode: bool,
 }
 
@@ -40,10 +48,36 @@ struct NavigationState {
     list_offset: usize,
 }
 
+#[derive(Debug, Clone)]
+struct SearchReturnState {
+    root_directory: PathBuf,
+
+    landed_directory: PathBuf,
+
+    query: String,
+
+    search_mode: SearchMode,
+
+    selected_path: Option<PathBuf>,
+
+    list_offset: usize,
+
+    view_mode: ViewMode,
+
+    recursive_mode: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     List,
     Tree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Exact,
+
+    Fuzzy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,11 +240,27 @@ pub struct App {
 
     pub recursive_entries: Vec<FileEntry>,
 
+    /*
+     * Stable lookup from a scanned path to its current position in
+     * recursive_entries.
+     *
+     * Fuzzy Tree results use this to retrieve only their required ancestors
+     * without rebuilding a path map across the complete recursive corpus after
+     * every worker update.
+     */
+    recursive_path_indices: HashMap<PathBuf, usize>,
+
+    search_index: Arc<SearchIndex>,
+
     pub filtered_indices: Vec<usize>,
 
     pub query: String,
 
+    pub search_mode: SearchMode,
+
     pub show_hidden: bool,
+
+    pub show_icons: bool,
 
     pub show_permissions: bool,
 
@@ -248,6 +298,8 @@ pub struct App {
 
     pub scan_in_progress: bool,
 
+    pub recursive_scan_partial: bool,
+
     pub recursive_mode: bool,
 
     pub view_mode: ViewMode,
@@ -259,6 +311,8 @@ pub struct App {
     pub connection_dialog: ConnectionDialogState,
 
     pub connection_in_progress: bool,
+
+    pub ssh_config: SshConfig,
 
     connection_receiver: Option<Receiver<ConnectionWorkerResult>>,
 
@@ -298,7 +352,23 @@ pub struct App {
 
     scan_receiver: Option<Receiver<ScanMessage>>,
 
+    fuzzy_generation: u64,
+
+    fuzzy_receiver: Option<Receiver<FuzzyWorkerResult>>,
+
+    fuzzy_cancel_signal: Option<Arc<AtomicBool>>,
+
+    pub fuzzy_filter_in_progress: bool,
+
+    pub fuzzy_examined: usize,
+
+    pub fuzzy_total: usize,
+
     navigation_states: HashMap<PathBuf, NavigationState>,
+
+    search_return_state: Option<SearchReturnState>,
+
+    pub search_navigation_active: bool,
 }
 
 impl App {
@@ -330,11 +400,19 @@ impl App {
 
             recursive_entries: Vec::new(),
 
+            recursive_path_indices: HashMap::new(),
+
+            search_index: Arc::new(SearchIndex::new()),
+
             filtered_indices: Vec::new(),
 
             query: String::new(),
 
+            search_mode: SearchMode::Exact,
+
             show_hidden: false,
+
+            show_icons: true,
 
             show_permissions: false,
 
@@ -372,6 +450,8 @@ impl App {
 
             scan_in_progress: false,
 
+            recursive_scan_partial: false,
+
             recursive_mode: false,
 
             view_mode: ViewMode::List,
@@ -381,6 +461,8 @@ impl App {
             connection_store,
 
             connection_dialog,
+
+            ssh_config: SshConfig::default(),
 
             connection_in_progress: false,
 
@@ -422,12 +504,91 @@ impl App {
 
             scan_receiver: None,
 
+            fuzzy_generation: 0,
+
+            fuzzy_receiver: None,
+
+            fuzzy_cancel_signal: None,
+
+            fuzzy_filter_in_progress: false,
+
+            fuzzy_examined: 0,
+
+            fuzzy_total: 0,
+
             navigation_states: HashMap::new(),
+
+            search_return_state: None,
+
+            search_navigation_active: false,
         };
 
         app.refresh_filter();
 
         Ok(app)
+    }
+
+    pub fn apply_startup_config(&mut self, config: &ScryConfig) {
+        /*
+         * Display panels can be assigned directly because the application has
+         * only just been constructed and has not yet entered its event loop.
+         */
+        self.ssh_config = config.ssh;
+
+        self.show_details = config.display.show_details;
+
+        self.show_selection = config.display.show_selection;
+
+        self.show_columns = config.display.show_columns;
+
+        self.show_permissions = config.display.show_permissions;
+
+        self.show_size = config.display.show_size;
+
+        self.show_date = config.display.show_date;
+
+        self.show_user = config.display.show_user;
+
+        /*
+         * Hidden entries require the normal application operation rather than a
+         * raw field assignment because toggling hidden files also refreshes the
+         * current view and invalidates recursive scan state.
+         */
+        if config.display.show_hidden && !self.show_hidden {
+            self.toggle_hidden();
+        }
+
+        /*
+         * Apply the configured sort before starting recursive mode or building a
+         * Tree view. This ensures that every initial listing begins in the correct
+         * order.
+         */
+        self.sort_mode = match config.browser.sort.as_str() {
+            "size" => SortMode::Size,
+
+            "date" => SortMode::Modified,
+
+            "type" => SortMode::Type,
+
+            _ => SortMode::Name,
+        };
+
+        self.sort_descending = config.browser.reverse;
+
+        self.apply_sort();
+
+        /*
+         * Recursive mode must be established before Tree mode. That allows
+         * toggle_tree_mode() to choose the recursive-tree startup route when both
+         * settings are enabled.
+         */
+        if config.browser.recursive && !self.recursive_mode {
+            self.enable_recursive_mode();
+        }
+
+        if config.browser.view == "tree" && self.view_mode != ViewMode::Tree {
+            self.toggle_tree_mode();
+        }
     }
 
     pub fn recursive_search_active(&self) -> bool {
@@ -561,33 +722,63 @@ impl App {
                         continue;
                     }
 
+                    let base_entry_index = self.recursive_entries.len();
+
+                    /*
+                     * Index the batch before moving its entries into recursive_entries.
+                     */
+                    Arc::make_mut(&mut self.search_index)
+                        .extend_from_entries(&entries, base_entry_index);
+
+                    /*
+                     * Record each path's future position in recursive_entries.
+                     *
+                     * The batch is appended unchanged immediately below, so
+                     * base_entry_index + offset is the exact resulting vector index.
+                     */
+                    self.recursive_path_indices.extend(
+                        entries
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, entry)| (entry.path.clone(), base_entry_index + offset)),
+                    );
+
                     self.recursive_entries.append(&mut entries);
 
                     changed = true;
                 }
 
-                ScanMessage::Finished { generation } => {
+                ScanMessage::Finished {
+                    generation,
+                    partial,
+                } => {
                     if generation != self.scan_generation {
                         continue;
                     }
 
                     /*
-                     * Flat List mode consumes recursive_entries directly and therefore needs
-                     * the complete result vector sorted.
+                     * Exact recursive List mode consumes recursive_entries in display order,
+                     * so its complete backing vector must remain sorted.
                      *
-                     * Recursive Tree mode groups entries by parent afterward and sorts each
-                     * sibling list independently, so sorting the complete multi-million-entry
-                     * vector first would only duplicate expensive work.
+                     * Fuzzy mode ranks only its bounded result set. Sorting millions of backing
+                     * entries here would freeze the UI and provide no benefit.
                      */
-                    if self.view_mode == ViewMode::List {
+                    if self.view_mode == ViewMode::List && self.search_mode == SearchMode::Exact {
                         sort_entries(
                             &mut self.recursive_entries,
                             self.sort_mode,
                             self.sort_descending,
                         );
+
+                        self.rebuild_recursive_path_indices();
+
+                        Arc::make_mut(&mut self.search_index)
+                            .rebuild_from_entries(&self.recursive_entries);
                     }
 
                     self.scan_in_progress = false;
+
+                    self.recursive_scan_partial = partial;
 
                     self.recursive_cache_complete = true;
 
@@ -635,14 +826,35 @@ impl App {
                         .clone()
                         .or_else(|| self.selected_entry().map(|entry| entry.path.clone()));
 
-                    self.rebuild_recursive_search_tree(selected_path);
+                    match self.search_mode {
+                        SearchMode::Fuzzy => {
+                            /*
+                             * The scanner has finished building the compact index.
+                             * Launch the same bounded fuzzy worker used by List mode.
+                             */
+                            self.start_current_fuzzy_filter();
+                        }
 
-                    self.restore_pending_selection_if_available();
+                        SearchMode::Exact => {
+                            self.rebuild_recursive_search_tree(selected_path);
+
+                            self.restore_pending_selection_if_available();
+                        }
+                    }
+                }
+            } else if self.search_mode == SearchMode::Fuzzy && self.recursive_search_active() {
+                /*
+                 * Recursive Fuzzy mode waits for the complete scanner result.
+                 *
+                 * Running and sorting fuzzy matches after every 256-entry batch caused the
+                 * severe UI stalls observed with large directory trees.
+                 */
+                if scan_finished {
+                    self.refresh_filter();
                 }
             } else {
                 /*
-                 * Flat List mode remains incremental, so newly received batches
-                 * continue appearing while the recursive scan is running.
+                 * Exact List mode remains incremental.
                  */
                 self.refresh_filter();
 
@@ -654,6 +866,16 @@ impl App {
     }
 
     pub fn push_query_character(&mut self, character: char) {
+        self.search_navigation_active = false;
+
+        /*
+         * A newly edited query is a new search session.
+         *
+         * Do not allow a return state from an older root or older query to survive and
+         * later redirect navigation unexpectedly.
+         */
+        self.search_return_state = None;
+
         if self.view_mode == ViewMode::Tree {
             let search_was_active = self.recursive_search_active();
 
@@ -675,11 +897,22 @@ impl App {
 
             if self.recursive_search_active() {
                 /*
-                 * While the scanner is still running, defer the expensive hierarchy
-                 * construction until ScanMessage::Finished arrives.
+                 * Fuzzy Tree mode shares the same bounded background worker as List.
+                 *
+                 * Exact Tree mode retains its existing synchronous hierarchy builder for
+                 * now. While the recursive scanner is running, both routes wait until its
+                 * current index is ready.
                  */
                 if !self.scan_in_progress {
-                    self.rebuild_recursive_search_tree(selected_path);
+                    match self.search_mode {
+                        SearchMode::Fuzzy => {
+                            self.start_current_fuzzy_filter();
+                        }
+
+                        SearchMode::Exact => {
+                            self.rebuild_recursive_search_tree(selected_path);
+                        }
+                    }
                 }
             } else {
                 self.refresh_tree_filter();
@@ -704,6 +937,16 @@ impl App {
     }
 
     pub fn pop_query_character(&mut self) {
+        self.search_navigation_active = false;
+
+        /*
+         * A newly edited query is a new search session.
+         *
+         * Do not allow a return state from an older root or older query to survive and
+         * later redirect navigation unexpectedly.
+         */
+        self.search_return_state = None;
+
         if self.view_mode == ViewMode::Tree {
             let search_was_active = self.recursive_search_active();
 
@@ -721,7 +964,15 @@ impl App {
                 self.ensure_recursive_scan();
 
                 if !self.scan_in_progress {
-                    self.rebuild_recursive_search_tree(selected_path);
+                    match self.search_mode {
+                        SearchMode::Fuzzy => {
+                            self.start_current_fuzzy_filter();
+                        }
+
+                        SearchMode::Exact => {
+                            self.rebuild_recursive_search_tree(selected_path);
+                        }
+                    }
                 }
             } else {
                 self.refresh_tree_filter();
@@ -744,6 +995,10 @@ impl App {
     }
 
     pub fn clear_query(&mut self) {
+        self.search_navigation_active = false;
+
+        self.search_return_state = None;
+
         if self.view_mode == ViewMode::Tree {
             let search_was_active = self.recursive_search_active();
 
@@ -771,10 +1026,15 @@ impl App {
         self.show_details = !self.show_details;
     }
 
+    pub fn toggle_icons(&mut self) {
+        self.show_icons = !self.show_icons;
+    }
+
     pub fn toggle_selection_panel(&mut self) {
         self.show_selection = !self.show_selection;
     }
 
+    #[allow(dead_code)]
     pub fn toggle_columns_panel(&mut self) {
         self.show_columns = !self.show_columns;
     }
@@ -811,16 +1071,97 @@ impl App {
         self.refresh_filter();
     }
 
+    pub fn toggle_search_mode(&mut self) {
+        /*
+         * Changing the search interpretation creates a new active search state.
+         * An older suspended-search bookmark must not later overwrite it.
+         */
+        self.search_return_state = None;
+
+        self.search_navigation_active = false;
+
+        /*
+         * Preserve the selected path while the result set is rebuilt.
+         */
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+
+        self.pending_selection_path = selected_path.clone();
+
+        self.search_mode = match self.search_mode {
+            SearchMode::Exact => SearchMode::Fuzzy,
+
+            SearchMode::Fuzzy => SearchMode::Exact,
+        };
+
+        /*
+         * Fuzzy recursive mode deliberately leaves recursive_entries in scanner
+         * arrival order because ranking its bounded result set does not require the
+         * enormous backing vector to be sorted.
+         *
+         * When switching back to Exact mode, however, that backing vector becomes
+         * the displayed result order. Sort it once here and rebuild the compact index
+         * so every SearchRecord continues to point at the correct FileEntry.
+         */
+        if self.search_mode == SearchMode::Exact && self.recursive_search_active() {
+            sort_entries(
+                &mut self.recursive_entries,
+                self.sort_mode,
+                self.sort_descending,
+            );
+
+            self.rebuild_recursive_path_indices();
+
+            Arc::make_mut(&mut self.search_index).rebuild_from_entries(&self.recursive_entries);
+        }
+
+        match self.view_mode {
+            ViewMode::List => {
+                self.refresh_filter();
+
+                self.restore_pending_selection_if_available();
+            }
+
+            ViewMode::Tree => {
+                if self.recursive_search_active() {
+                    match self.search_mode {
+                        SearchMode::Fuzzy => {
+                            self.start_current_fuzzy_filter();
+                        }
+
+                        SearchMode::Exact => {
+                            self.rebuild_recursive_search_tree(selected_path.clone());
+
+                            self.restore_pending_selection_if_available();
+                        }
+                    }
+                } else {
+                    self.refresh_tree_filter();
+
+                    if let Some(path) = selected_path {
+                        self.select_visible_path(&path);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn enable_recursive_mode(&mut self) {
         if self.recursive_mode {
             return;
         }
 
+        /*
+         * Changing recursive scope must not throw away the user's position.
+         */
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+
+        self.pending_selection_path = selected_path.clone();
+
+        self.search_return_state = None;
+
+        self.search_navigation_active = false;
+
         self.recursive_mode = true;
-
-        self.selected = 0;
-
-        self.list_offset = 0;
 
         self.error_message = None;
 
@@ -828,13 +1169,134 @@ impl App {
 
         match self.view_mode {
             ViewMode::List => {
+                /*
+                 * With an empty query, active_entries() still refers to the current
+                 * directory. With search text, the recursive result set becomes
+                 * authoritative once scanning and filtering complete.
+                 */
                 self.refresh_filter();
+
+                self.restore_pending_selection_if_available();
             }
 
             ViewMode::Tree => {
-                self.rebuild_recursive_search_tree(None);
+                if self.search_mode == SearchMode::Fuzzy
+                    && !self.query.is_empty()
+                    && self.query != "."
+                {
+                    if !self.scan_in_progress {
+                        self.start_current_fuzzy_filter();
+                    }
+                } else {
+                    self.rebuild_recursive_search_tree(selected_path.clone());
+
+                    self.restore_pending_selection_if_available();
+                }
             }
         }
+    }
+
+    pub fn toggle_recursive_mode(&mut self) {
+        /*
+         * Remote SFTP currently supports directory-by-directory browsing but not
+         * Scry's background recursive scanner.
+         */
+        if !self.source.supports_recursive_scan() {
+            /*
+             * A source that cannot scan recursively must never remain in recursive
+             * mode. Normally connection installation already enforces this, but this
+             * recovery keeps startup flags and future source transitions safe.
+             */
+            if self.recursive_mode {
+                self.recursive_mode = false;
+
+                self.invalidate_recursive_cache();
+
+                self.selected = 0;
+
+                self.list_offset = 0;
+
+                match self.view_mode {
+                    ViewMode::List => {
+                        self.refresh_filter();
+                    }
+
+                    ViewMode::Tree => {
+                        self.reset_tree();
+                    }
+                }
+            }
+
+            self.error_message =
+                Some("Recursive mode is not available for the current source".to_string());
+
+            return;
+        }
+
+        if !self.recursive_mode {
+            self.enable_recursive_mode();
+
+            return;
+        }
+
+        /*
+         * Disable the persistent recursive listing.
+         *
+         * A non-empty query may still keep recursive search active. That is
+         * intentional: Alt+R controls recursive browsing, while typing performs
+         * an on-demand recursive search.
+         *
+         * Preserve the selected path while the visible result source is rebuilt.
+         */
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+
+        self.pending_selection_path = selected_path.clone();
+
+        self.search_return_state = None;
+
+        self.search_navigation_active = false;
+
+        self.recursive_mode = false;
+
+        self.error_message = None;
+
+        if self.query.is_empty() || self.query == "." {
+            /*
+             * No text search remains active, so stop and discard the recursive
+             * scan state and return to the immediate directory listing.
+             */
+            self.invalidate_recursive_cache();
+
+            match self.view_mode {
+                ViewMode::List => {
+                    self.refresh_filter();
+                }
+
+                ViewMode::Tree => {
+                    self.reset_tree();
+                }
+            }
+        } else {
+            /*
+             * A text query still requests recursive search. Keep or restart the
+             * recursive cache and rebuild the current search view accordingly.
+             */
+            self.ensure_recursive_scan();
+
+            match self.view_mode {
+                ViewMode::List => {
+                    self.refresh_filter();
+                }
+
+                ViewMode::Tree => {
+                    self.rebuild_recursive_search_tree(None);
+                }
+            }
+        }
+
+        self.restore_pending_selection_if_available();
+
+        self.ensure_selection_visible(self.viewport_rows);
     }
 
     pub fn toggle_tree_mode(&mut self) {
@@ -872,12 +1334,17 @@ impl App {
 
                 self.list_offset = 0;
 
-                if self.recursive_search_active() {
+                if self.recursive_search_active() && self.search_mode == SearchMode::Exact {
                     sort_entries(
                         &mut self.recursive_entries,
                         self.sort_mode,
                         self.sort_descending,
                     );
+
+                    self.rebuild_recursive_path_indices();
+
+                    Arc::make_mut(&mut self.search_index)
+                        .rebuild_from_entries(&self.recursive_entries);
                 }
 
                 self.refresh_filter();
@@ -909,15 +1376,23 @@ impl App {
         match self.view_mode {
             ViewMode::List => {
                 /*
-                 * Flat recursive List mode reads recursive_entries directly, so
-                 * the complete vector must be sorted here.
+                 * Exact recursive List mode displays the backing entries in the selected
+                 * sort order.
+                 *
+                 * Fuzzy mode owns its relevance ordering and must never sort millions of
+                 * backing records merely because a display sort command was issued.
                  */
-                if self.recursive_search_active() {
+                if self.recursive_search_active() && self.search_mode == SearchMode::Exact {
                     sort_entries(
                         &mut self.recursive_entries,
                         self.sort_mode,
                         self.sort_descending,
                     );
+
+                    self.rebuild_recursive_path_indices();
+
+                    Arc::make_mut(&mut self.search_index)
+                        .rebuild_from_entries(&self.recursive_entries);
                 }
 
                 self.refresh_filter();
@@ -1112,6 +1587,17 @@ impl App {
 
         let target = entry.path.clone();
 
+        /*
+         * Right Arrow enters a List search result without passing through
+         * activate_selected(). Save the same return state that Enter saves.
+         *
+         * Replacing any older state prevents a previous search rooted at "/" from
+         * unexpectedly being restored later.
+         */
+        if self.recursive_search_active() && !self.query.is_empty() && self.query != "." {
+            self.save_search_return_state(target.clone());
+        }
+
         self.change_directory(target, None);
     }
 
@@ -1170,8 +1656,41 @@ impl App {
     }
 
     pub fn enter_parent_directory(&mut self) {
+        if self.restore_search_return_state() {
+            return;
+        }
+
+        /*
+         * Tree mode owns Left/Escape/right-click navigation even while a search
+         * query is active.
+         *
+         * Otherwise the query-root navigation route intercepts Left before the
+         * selected branch can be collapsed.
+         */
         if self.view_mode == ViewMode::Tree {
             self.collapse_selected_tree_directory_or_select_parent();
+
+            return;
+        }
+
+        /*
+         * List-mode search navigation may move the active search root upward while
+         * retaining the query.
+         */
+        if !self.query.is_empty() && self.query != "." {
+            let previous_root = self.current_directory.clone();
+
+            let Some(parent) = previous_root.parent() else {
+                return;
+            };
+
+            let parent = parent.to_path_buf();
+
+            if parent == previous_root {
+                return;
+            }
+
+            self.change_search_root(parent, Some(previous_root));
 
             return;
         }
@@ -1189,6 +1708,110 @@ impl App {
         }
 
         self.change_directory(parent, Some(child_directory));
+    }
+
+    fn restore_search_return_state(&mut self) -> bool {
+        let Some(state) = self.search_return_state.clone() else {
+            return false;
+        };
+
+        /*
+         * The saved search is restored only when backing directly out of the
+         * directory into which that search result originally landed.
+         *
+         * If the user navigates deeper, ordinary parent navigation remains intact.
+         */
+        if self.current_directory != state.landed_directory {
+            return false;
+        }
+
+        let entries = match self.source.read_directory(
+            &state.root_directory,
+            self.sort_mode,
+            self.sort_descending,
+        ) {
+            Ok(entries) => entries,
+
+            Err(error) => {
+                self.error_message = Some(format!(
+                    "Unable to restore search root {}: {}",
+                    state.root_directory.display(),
+                    error,
+                ));
+
+                return true;
+            }
+        };
+
+        self.invalidate_recursive_cache();
+
+        self.current_directory = state.root_directory;
+
+        self.entries = entries;
+
+        self.query = state.query;
+
+        self.search_mode = state.search_mode;
+
+        self.recursive_mode = state.recursive_mode;
+
+        self.view_mode = ViewMode::List;
+
+        self.selected = 0;
+
+        self.list_offset = 0;
+
+        self.pending_selection_path = state.selected_path.clone();
+
+        self.error_message = None;
+
+        self.tree_rows.clear();
+
+        self.filtered_tree_indices.clear();
+
+        self.tree_children.clear();
+
+        self.search_tree_children.clear();
+
+        self.expanded_directories.clear();
+
+        self.search_collapsed_directories.clear();
+
+        self.recursive_expanded_directories.clear();
+
+        self.directory_has_content_cache.clear();
+
+        self.ensure_recursive_scan();
+
+        match state.view_mode {
+            ViewMode::List => {
+                self.refresh_filter();
+
+                self.restore_pending_selection_if_available();
+            }
+
+            ViewMode::Tree => {
+                self.view_mode = ViewMode::Tree;
+
+                /*
+                 * The recursive tree is rebuilt once the restored scan completes.
+                 * If a complete result is already available, this builds it now.
+                 */
+                if !self.scan_in_progress {
+                    self.rebuild_recursive_search_tree(state.selected_path.clone());
+                }
+            }
+        }
+
+        self.list_offset = state.list_offset;
+
+        self.ensure_selection_visible(self.viewport_rows);
+
+        self.search_return_state = None;
+
+        self.search_navigation_active = true;
+
+        true
     }
 
     fn reset_tree(&mut self) {
@@ -1407,13 +2030,47 @@ impl App {
 
         let path = row.entry.path.clone();
 
-        let has_children = self
+        /*
+         * A bounded fuzzy-result tree initially contains only:
+         *
+         * - the best matching entries;
+         * - the ancestors required to connect them.
+         *
+         * A directory may therefore have real filesystem content without yet having
+         * contextual children in search_tree_children. When the user explicitly
+         * presses Right, lazily load that directory's immediate children instead of
+         * pretending that the branch cannot expand.
+         */
+        if !self
             .search_tree_children
             .get(&path)
-            .is_some_and(|children| !children.is_empty());
+            .is_some_and(|children| !children.is_empty())
+        {
+            let children =
+                match self
+                    .source
+                    .read_directory(&path, self.sort_mode, self.sort_descending)
+                {
+                    Ok(children) => children
+                        .into_iter()
+                        .filter(|entry| self.show_hidden || !entry.name.starts_with('.'))
+                        .collect::<Vec<_>>(),
 
-        if !has_children {
-            return;
+                    Err(error) => {
+                        self.error_message =
+                            Some(format!("Unable to expand {}: {}", path.display(), error,));
+
+                        return;
+                    }
+                };
+
+            if children.is_empty() {
+                return;
+            }
+
+            self.search_tree_children.insert(path.clone(), children);
+
+            self.error_message = None;
         }
 
         self.recursive_expanded_directories.insert(path.clone());
@@ -1882,6 +2539,33 @@ impl App {
         let is_directory = self.path_is_directory(&path, entry_is_directory);
 
         /*
+         * Remember the complete search before leaving its root.
+         *
+         * Directory results land in that directory. File results land in their
+         * containing directory.
+         */
+        if self.recursive_search_active() && !self.query.is_empty() && self.query != "." {
+            let landed_directory = if is_directory {
+                path.clone()
+            } else {
+                match path.parent() {
+                    Some(parent) => parent.to_path_buf(),
+
+                    None => {
+                        self.error_message = Some(format!(
+                            "Unable to determine the containing directory of {}",
+                            path.display(),
+                        ));
+
+                        return;
+                    }
+                }
+            };
+
+            self.save_search_return_state(landed_directory);
+        }
+
+        /*
          * Enter on a directory:
          *
          * Works as → (right) and will enter the directory inside Wraith.
@@ -1904,7 +2588,7 @@ impl App {
          *
          * A second Enter then opens the now-local file normally.
          */
-        if self.recursive_search_active() {
+        if self.recursive_search_active() && !self.query.is_empty() && self.query != "." {
             let Some(parent) = path.parent() else {
                 self.error_message = Some(format!(
                     "Unable to determine the containing directory of {}",
@@ -2060,6 +2744,7 @@ impl App {
         self.connection_dialog.push_character(character);
     }
 
+    #[allow(dead_code)]
     pub fn connection_pop_character(&mut self) {
         self.connection_dialog.pop_character();
     }
@@ -2143,11 +2828,18 @@ impl App {
 
         let sort_descending = self.sort_descending;
 
+        let ssh_config: SshConfig = self.ssh_config;
+
         let (sender, receiver) = mpsc::channel();
 
         thread::spawn(move || {
-            let result =
-                connect_profile_worker(target, start_directory, sort_mode, sort_descending);
+            let result = connect_profile_worker(
+                target,
+                start_directory,
+                sort_mode,
+                sort_descending,
+                ssh_config,
+            );
 
             let _ = sender.send(ConnectionWorkerResult { result });
         });
@@ -2216,6 +2908,8 @@ impl App {
     }
 
     fn install_connected_source(&mut self, success: ConnectionWorkerSuccess) {
+        self.search_return_state = None;
+
         /*
          * Preserve the local browser position only when leaving a local source.
          *
@@ -2235,6 +2929,8 @@ impl App {
                 view_mode: self.view_mode,
 
                 recursive_mode: self.recursive_mode,
+
+                search_mode: self.search_mode,
             });
         }
 
@@ -2242,11 +2938,37 @@ impl App {
 
         self.source = success.source;
 
+        /*
+         * Remote SFTP currently supports directory-by-directory browsing but not
+         * recursive scanning.
+         *
+         * Never carry a local recursive state into the connected source. Doing so
+         * makes active_entries() select the empty recursive corpus and leaves the
+         * user unable to disable the mode because the source rejects recursive
+         * operations.
+         *
+         * The original local recursive preference is already preserved inside
+         * saved_local_session and will return on Disconnect.
+         */
+        if !self.source.supports_recursive_scan() {
+            self.recursive_mode = false;
+        }
+
         self.current_directory = success.directory;
 
         self.entries = success.entries;
 
         self.query.clear();
+
+        /*
+         * Remote browsing currently supports ordinary current-directory filtering,
+         * but not the complete recursive search engine.
+         *
+         * Begin in Exact mode for a predictable, fully supported remote experience.
+         * Once every search mode is implemented remotely, this forced fallback can be
+         * removed so the user's active mode carries across unchanged.
+         */
+        self.search_mode = SearchMode::Exact;
 
         self.error_message = None;
 
@@ -2280,6 +3002,8 @@ impl App {
     }
 
     pub fn disconnect_remote(&mut self) {
+        self.search_return_state = None;
+
         if !self.source.is_remote() || self.transfer_visible() || self.connection_in_progress {
             return;
         }
@@ -2309,6 +3033,8 @@ impl App {
             query: String::new(),
 
             view_mode: ViewMode::List,
+
+            search_mode: SearchMode::Exact,
 
             recursive_mode: false,
         });
@@ -2349,6 +3075,8 @@ impl App {
         self.entries = entries;
 
         self.query = session.query;
+
+        self.search_mode = session.search_mode;
 
         self.error_message = None;
 
@@ -2501,7 +3229,16 @@ impl App {
     }
 
     fn active_entries(&self) -> &[FileEntry] {
-        if self.recursive_search_active() {
+        /*
+         * An empty query is ordinary filesystem browsing.
+         *
+         * Recursive mode may scan and cache descendants in the background, but the
+         * flat List must continue to display only the current directory until the
+         * user enters actual search text.
+         */
+        let text_filter_active = !self.query.is_empty() && self.query != ".";
+
+        if text_filter_active && self.recursive_search_active() {
             &self.recursive_entries
         } else {
             &self.entries
@@ -2514,6 +3251,8 @@ impl App {
 
             self.scan_in_progress = false;
 
+            self.recursive_scan_partial = false;
+
             return;
         }
 
@@ -2525,6 +3264,8 @@ impl App {
 
         self.recursive_entries.clear();
 
+        Arc::make_mut(&mut self.search_index).clear();
+
         self.scan_in_progress = true;
 
         self.error_message = None;
@@ -2533,6 +3274,7 @@ impl App {
             self.current_directory.clone(),
             self.show_hidden,
             self.scan_generation,
+            RecursiveScanMode::Fast,
         ));
     }
 
@@ -2541,6 +3283,8 @@ impl App {
          * Dropping the receiver causes the old scanner to stop the next time
          * it attempts to send a batch.
          */
+        self.cancel_fuzzy_filter();
+
         self.scan_receiver = None;
 
         self.scan_generation = self.scan_generation.wrapping_add(1);
@@ -2549,11 +3293,28 @@ impl App {
 
         self.recursive_cache_complete = false;
 
+        self.recursive_scan_partial = false;
+
         self.recursive_entries.clear();
+
+        self.recursive_path_indices.clear();
+
+        Arc::make_mut(&mut self.search_index).clear();
 
         self.search_tree_children.clear();
 
         self.recursive_expanded_directories.clear();
+    }
+
+    fn rebuild_recursive_path_indices(&mut self) {
+        self.recursive_path_indices.clear();
+
+        self.recursive_path_indices.extend(
+            self.recursive_entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.path.clone(), index)),
+        );
     }
 
     pub fn current_visible_entry_count(&self) -> usize {
@@ -2575,6 +3336,122 @@ impl App {
                 list_offset: self.list_offset,
             },
         );
+    }
+
+    fn save_search_return_state(&mut self, landed_directory: PathBuf) {
+        /*
+         * Only typed searches need a return state.
+         *
+         * Persistent recursive browsing with an empty query is ordinary navigation,
+         * not a search that should be restored after backing out.
+         */
+        if self.query.is_empty() || self.query == "." {
+            return;
+        }
+
+        self.search_return_state = Some(SearchReturnState {
+            root_directory: self.current_directory.clone(),
+
+            landed_directory,
+
+            query: self.query.clone(),
+
+            search_mode: self.search_mode,
+
+            selected_path: self.selected_entry().map(|entry| entry.path.clone()),
+
+            list_offset: self.list_offset,
+
+            view_mode: self.view_mode,
+
+            recursive_mode: self.recursive_mode,
+        });
+    }
+
+    fn change_search_root(&mut self, target: PathBuf, fallback_selection: Option<PathBuf>) -> bool {
+        let entries =
+            match self
+                .source
+                .read_directory(&target, self.sort_mode, self.sort_descending)
+            {
+                Ok(entries) => entries,
+
+                Err(error) => {
+                    self.error_message =
+                        Some(format!("Unable to open {}: {}", target.display(), error));
+
+                    return false;
+                }
+            };
+
+        /*
+         * Preserve the active search while changing only its filesystem root.
+         */
+        let query = self.query.clone();
+
+        let view_mode = self.view_mode;
+
+        self.save_current_navigation_state();
+
+        self.invalidate_recursive_cache();
+
+        self.tree_rows.clear();
+
+        self.filtered_tree_indices.clear();
+
+        self.tree_children.clear();
+
+        self.search_tree_children.clear();
+
+        self.directory_has_content_cache.clear();
+
+        self.expanded_directories.clear();
+
+        self.search_collapsed_directories.clear();
+
+        self.recursive_expanded_directories.clear();
+
+        self.current_directory = target;
+
+        self.entries = entries;
+
+        self.query = query;
+
+        self.search_navigation_active = true;
+
+        self.error_message = None;
+
+        self.selected = 0;
+
+        self.list_offset = 0;
+
+        self.pending_selection_path = fallback_selection.clone();
+
+        self.ensure_recursive_scan();
+
+        match view_mode {
+            ViewMode::List => {
+                self.view_mode = ViewMode::List;
+
+                self.refresh_filter();
+
+                self.restore_pending_selection_if_available();
+            }
+
+            ViewMode::Tree => {
+                self.view_mode = ViewMode::Tree;
+
+                /*
+                 * The hierarchy will be completed when the recursive scanner
+                 * finishes. If the cache is already complete, build immediately.
+                 */
+                if !self.scan_in_progress {
+                    self.rebuild_recursive_search_tree(fallback_selection);
+                }
+            }
+        }
+
+        true
     }
 
     fn change_directory(&mut self, target: PathBuf, fallback_selection: Option<PathBuf>) -> bool {
@@ -2719,22 +3596,270 @@ impl App {
         if let Some(position) = position {
             self.selected = position;
 
-            self.pending_selection_path = None;
+            /*
+             * Exact recursive scans and fuzzy workers both rebuild their result sets
+             * asynchronously.
+             *
+             * Keep the intended path pinned until neither operation is still capable of
+             * moving entries around beneath the numeric selection row.
+             */
+            if !self.scan_in_progress && !self.fuzzy_filter_in_progress {
+                self.pending_selection_path = None;
+            }
 
             self.ensure_selection_visible(self.viewport_rows);
         }
     }
 
-    fn refresh_filter(&mut self) {
+    fn cancel_fuzzy_filter(&mut self) {
+        if let Some(signal) = self.fuzzy_cancel_signal.take() {
+            signal.store(true, Ordering::Relaxed);
+        }
+
+        self.fuzzy_receiver = None;
+
+        self.fuzzy_filter_in_progress = false;
+
+        self.fuzzy_examined = 0;
+
+        self.fuzzy_total = 0;
+
+        self.fuzzy_generation = self.fuzzy_generation.wrapping_add(1);
+    }
+
+    fn start_current_fuzzy_filter(&mut self) {
         let text_filter_active = !self.query.is_empty() && self.query != ".";
 
-        let query = self.query.to_lowercase();
+        if !text_filter_active {
+            self.cancel_fuzzy_filter();
+
+            self.fuzzy_examined = 0;
+
+            self.fuzzy_total = 0;
+
+            self.filtered_indices = self
+                .active_entries()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    if !self.show_hidden && entry.name.starts_with('.') {
+                        None
+                    } else {
+                        Some(index)
+                    }
+                })
+                .collect();
+
+            self.normalize_filtered_selection();
+
+            return;
+        }
+
+        /*
+         * The recursive index is still being constructed.
+         *
+         * We will add live scan-index searching later. For this pass, wait until
+         * the index is stable rather than launching workers against incomplete
+         * snapshots after every scanner batch.
+         */
+        if self.recursive_search_active() && self.scan_in_progress {
+            self.cancel_fuzzy_filter();
+
+            self.fuzzy_examined = 0;
+
+            self.fuzzy_total = self.search_index.len();
+
+            self.filtered_indices.clear();
+
+            self.selected = 0;
+
+            self.list_offset = 0;
+
+            return;
+        }
+
+        if let Some(signal) = self.fuzzy_cancel_signal.take() {
+            signal.store(true, Ordering::Relaxed);
+        }
+
+        self.fuzzy_receiver = None;
+
+        self.fuzzy_generation = self.fuzzy_generation.wrapping_add(1);
+
+        let generation = self.fuzzy_generation;
+
+        /*
+         * Recursive local search reuses the incrementally built index.
+         *
+         * Non-recursive sources such as SSH normally contain only one directory,
+         * so constructing that small temporary index is inexpensive.
+         */
+        let index = if self.recursive_search_active() {
+            Arc::clone(&self.search_index)
+        } else {
+            Arc::new(SearchIndex::from_entries(self.active_entries()))
+        };
+
+        self.fuzzy_examined = 0;
+
+        self.fuzzy_total = index.len();
+
+        let cancel_signal = Arc::new(AtomicBool::new(false));
+
+        self.fuzzy_receiver = Some(start_fuzzy_worker(
+            index,
+            self.query.clone(),
+            generation,
+            self.show_hidden,
+            Arc::clone(&cancel_signal),
+        ));
+
+        self.fuzzy_cancel_signal = Some(cancel_signal);
+
+        self.fuzzy_filter_in_progress = true;
+
+        /*
+         * Deliberately do not clear filtered_indices here.
+         *
+         * Results from the previous query remain visible until the first progressive
+         * snapshot for this generation arrives.
+         */
+    }
+
+    pub fn process_fuzzy_messages(&mut self) -> bool {
+        let mut changed = false;
+
+        loop {
+            let message = match self.fuzzy_receiver.as_ref() {
+                Some(receiver) => match receiver.try_recv() {
+                    Ok(message) => message,
+
+                    Err(TryRecvError::Empty) => {
+                        break;
+                    }
+
+                    Err(TryRecvError::Disconnected) => {
+                        self.fuzzy_receiver = None;
+
+                        self.fuzzy_cancel_signal = None;
+
+                        self.fuzzy_filter_in_progress = false;
+
+                        return true;
+                    }
+                },
+
+                None => {
+                    break;
+                }
+            };
+
+            if message.generation != self.fuzzy_generation {
+                continue;
+            }
+
+            if message.cancelled {
+                if message.finished {
+                    self.fuzzy_receiver = None;
+
+                    self.fuzzy_cancel_signal = None;
+
+                    self.fuzzy_filter_in_progress = false;
+                }
+
+                continue;
+            }
+
+            let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+
+            self.fuzzy_examined = message.examined;
+
+            self.fuzzy_total = message.total;
+
+            match self.view_mode {
+                ViewMode::List => {
+                    self.filtered_indices = message.indices;
+
+                    if let Some(path) = selected_path {
+                        self.select_visible_path(&path);
+                    } else {
+                        self.normalize_filtered_selection();
+                    }
+
+                    self.restore_pending_selection_if_available();
+                }
+
+                ViewMode::Tree => {
+                    /*
+                     * Tree consumes the same bounded, ranked worker result as List mode.
+                     *
+                     * rebuild_fuzzy_search_tree_from_indices() adds only the best matches
+                     * and the ancestors required to connect them to the current root.
+                     */
+                    self.rebuild_fuzzy_search_tree_from_indices(&message.indices, selected_path);
+
+                    self.restore_pending_selection_if_available();
+                }
+            }
+
+            changed = true;
+
+            if message.finished {
+                self.fuzzy_receiver = None;
+
+                self.fuzzy_cancel_signal = None;
+
+                self.fuzzy_filter_in_progress = false;
+
+                /*
+                 * The final ranked result is now stable. Release any selection path that
+                 * was pinned across the progressive fuzzy snapshots.
+                 */
+                self.pending_selection_path = None;
+
+                break;
+            }
+        }
+
+        changed
+    }
+
+    fn normalize_filtered_selection(&mut self) {
+        if self.filtered_indices.is_empty() {
+            self.selected = 0;
+
+            self.list_offset = 0;
+        } else {
+            self.selected = self
+                .selected
+                .min(self.filtered_indices.len().saturating_sub(1));
+
+            self.list_offset = self
+                .list_offset
+                .min(self.filtered_indices.len().saturating_sub(1));
+        }
+    }
+
+    fn refresh_filter(&mut self) {
+        if self.search_mode == SearchMode::Fuzzy {
+            self.start_current_fuzzy_filter();
+
+            return;
+        }
+
+        /*
+         * Exact search remains synchronous and otherwise unchanged.
+         */
+        self.cancel_fuzzy_filter();
+
+        let text_filter_active = !self.query.is_empty() && self.query != ".";
 
         let show_hidden = self.show_hidden;
 
-        let entries = self.active_entries();
+        let query = self.query.to_lowercase();
 
-        self.filtered_indices = entries
+        self.filtered_indices = self
+            .active_entries()
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
@@ -2750,19 +3875,81 @@ impl App {
             })
             .collect();
 
-        if self.filtered_indices.is_empty() {
-            self.selected = 0;
+        self.normalize_filtered_selection();
+    }
 
-            self.list_offset = 0;
-        } else {
-            self.selected = self
-                .selected
-                .min(self.filtered_indices.len().saturating_sub(1));
+    fn rebuild_fuzzy_search_tree_from_indices(
+        &mut self,
+        matched_indices: &[usize],
+        preferred_selection: Option<PathBuf>,
+    ) {
+        self.search_tree_children.clear();
 
-            self.list_offset = self
-                .list_offset
-                .min(self.filtered_indices.len().saturating_sub(1));
+        /*
+         * The fuzzy worker has already searched and ranked the complete compact
+         * index. Its result contains at most the best 500 recursive-entry indices.
+         *
+         * Tree construction must therefore touch only:
+         *
+         * - those ranked matches;
+         * - the ancestors needed to connect them to the current root.
+         *
+         * It must never search the complete recursive corpus again.
+         */
+        let mut included_indices: HashSet<usize> = HashSet::new();
+
+        for &matched_index in matched_indices {
+            let Some(matched_entry) = self.recursive_entries.get(matched_index) else {
+                continue;
+            };
+
+            included_indices.insert(matched_index);
+
+            let mut ancestor = matched_entry.path.parent();
+
+            while let Some(path) = ancestor {
+                if path == self.current_directory {
+                    break;
+                }
+
+                if let Some(&ancestor_index) = self.recursive_path_indices.get(path) {
+                    included_indices.insert(ancestor_index);
+                }
+
+                ancestor = path.parent();
+            }
         }
+
+        /*
+         * Convert the bounded path set into the same parent → children structure
+         * already consumed by Scry's proven Tree-row renderer and navigation code.
+         */
+        for entry_index in included_indices {
+            let Some(entry) = self.recursive_entries.get(entry_index).cloned() else {
+                continue;
+            };
+
+            let Some(parent) = entry.path.parent() else {
+                continue;
+            };
+
+            self.search_tree_children
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(entry);
+        }
+
+        /*
+         * Preserve Scry's established sibling ordering and directory-first rule.
+         *
+         * Only small sibling groups belonging to the bounded contextual tree are
+         * sorted here—not the complete recursive population.
+         */
+        for children in self.search_tree_children.values_mut() {
+            sort_entries(children, self.sort_mode, self.sort_descending);
+        }
+
+        self.rebuild_recursive_search_rows(preferred_selection);
     }
 
     fn rebuild_recursive_search_tree(&mut self, preferred_selection: Option<PathBuf>) {
@@ -3124,9 +4311,10 @@ fn connect_profile_worker(
     start_directory: String,
     sort_mode: SortMode,
     sort_descending: bool,
+    ssh_config: SshConfig,
 ) -> Result<ConnectionWorkerSuccess, String> {
     let (remote_home, mut source) =
-        SftpSource::connect(&target).map_err(|error| error.to_string())?;
+        SftpSource::connect(&target, &ssh_config).map_err(|error| error.to_string())?;
 
     let directory = resolve_remote_start_directory(&remote_home, &start_directory);
 

@@ -365,6 +365,8 @@ fn classify_special_filename(filename: &str) -> Option<FileClass> {
         | ".gitattributes" | ".gitmodules" | ".npmrc" | ".yarnrc" | ".yarnrc.yml"
         | ".clang-format" | ".clang-tidy" | ".dockerignore" => FileClass::Config,
 
+        ".bash_history" | ".zsh_history" | ".history" | ".sh_history" => FileClass::Log,
+
         "dockerfile" | "containerfile" | "vagrantfile" | "procfile" => FileClass::Build,
 
         "readme" | "readme.txt" | "readme.md" | "license" | "license.txt" | "licence"

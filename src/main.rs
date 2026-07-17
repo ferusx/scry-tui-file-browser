@@ -3,16 +3,19 @@
 mod app;
 mod args;
 mod classify;
+mod config;
 mod connection;
 mod entry;
+mod fuzzy;
 mod help;
 mod open;
 mod scan;
+mod search_index;
 mod source;
 mod ssh;
 mod ui;
 
-use app::App;
+use app::{App, ViewMode};
 use args::Cli;
 use clap::Parser;
 use connection::ConnectionField;
@@ -24,13 +27,16 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
 };
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
+
+    let config = config::ScryConfig::load();
 
     if cli.help {
         help::print_help()?;
@@ -54,7 +60,7 @@ fn main() -> io::Result<()> {
             target.openssh_destination(),
         );
 
-        let (remote_home, source) = match SftpSource::connect(&target) {
+        let (remote_home, source) = match SftpSource::connect(&target, &config.ssh) {
             Ok(connection) => connection,
 
             Err(error) => {
@@ -85,31 +91,51 @@ fn main() -> io::Result<()> {
         }
     };
 
-    if cli.all {
+    app.apply_startup_config(&config);
+
+    /*
+     * Command-line switches override configuration values.
+     *
+     * Existing positive Boolean switches can force a feature on, but must never
+     * toggle an already-enabled configuration value back off.
+     */
+    if cli.all && !app.show_hidden {
         app.toggle_hidden();
     }
 
-    if cli.tree {
-        app.toggle_tree_mode();
-    }
-
-    if cli.recursive {
+    if cli.recursive && !app.recursive_mode {
         app.enable_recursive_mode();
     }
 
-    app.show_permissions = cli.permissions;
+    if cli.tree && app.view_mode != ViewMode::Tree {
+        app.toggle_tree_mode();
+    }
 
-    app.show_date = cli.date;
+    if cli.permissions {
+        app.show_permissions = true;
+    }
 
-    app.show_size = cli.size;
+    if cli.date {
+        app.show_date = true;
+    }
 
-    app.show_user = cli.user;
+    if cli.size {
+        app.show_size = true;
+    }
 
-    execute!(stdout(), EnableMouseCapture,)?;
+    if cli.user {
+        app.show_user = true;
+    }
+
+    execute!(
+        stdout(),
+        EnableMouseCapture,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+    )?;
 
     let run_result = ratatui::run(|mut terminal| run_app(&mut terminal, &mut app));
 
-    let disable_result = execute!(stdout(), DisableMouseCapture,);
+    let disable_result = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture,);
 
     run_result?;
 
@@ -154,6 +180,10 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
 
     while !app.should_quit {
         let mut needs_redraw = app.process_scan_messages();
+
+        if app.process_fuzzy_messages() {
+            needs_redraw = true;
+        }
 
         if app.process_transfer_messages() {
             needs_redraw = true;
@@ -209,6 +239,10 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
         }
 
         if app.process_scan_messages() {
+            needs_redraw = true;
+        }
+
+        if app.process_fuzzy_messages() {
             needs_redraw = true;
         }
 
@@ -308,13 +342,6 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
                 app.connection_focus_next();
             }
 
-            (KeyCode::Backspace, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-                /*
-                 * Some terminals encode Backspace as Ctrl+H.
-                 */
-                app.connection_pop_character();
-            }
-
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 app.connection_clear_field();
             }
@@ -393,29 +420,16 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
             app.quit();
         }
 
-        /*      (KeyCode::F(4), _) => {
-                    app.toggle_connection_dialog();
-                }
-        */
-        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-            app.toggle_connection_dialog();
-        }
-        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-            app.clear_query();
+        (KeyCode::F(3), _) => {
+            app.toggle_icons();
         }
 
-        (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-            /*
-             * Some terminals encode Backspace as Ctrl+H.
-             *
-             * While a search query is active, treat that sequence as Backspace.
-             * With an empty query, preserve Scry's Ctrl+H hidden-file shortcut.
-             */
-            if app.query.is_empty() {
-                app.toggle_hidden();
-            } else {
-                app.pop_query_character();
-            }
+        (KeyCode::F(4), _) => {
+            app.toggle_connection_dialog();
+        }
+
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            app.clear_query();
         }
 
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
@@ -424,6 +438,33 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
 
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
             app.toggle_selection_panel();
+        }
+
+        /*
+         * Backspace may be reported either as KeyCode::Backspace or as Ctrl+H,
+         * depending on the terminal and keyboard-enhancement support.
+         */
+        (KeyCode::Backspace, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+            if app.query.is_empty() {
+                app.enter_parent_directory();
+            } else {
+                app.pop_query_character();
+            }
+        }
+
+        /*
+         * Ctrl+M is the carriage-return control code and may be reported as Enter by
+         * the terminal. Never allow it to activate a directory or file.
+         */
+        (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {}
+
+        /*
+         * Ctrl+M must never activate anything.
+         */
+        (KeyCode::Char('m'), KeyModifiers::CONTROL) => {}
+
+        (KeyCode::Char('h'), KeyModifiers::ALT) => {
+            app.toggle_hidden();
         }
 
         (KeyCode::Char('m'), KeyModifiers::ALT) => {
@@ -438,8 +479,16 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
             app.toggle_tree_mode();
         }
 
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+            app.toggle_search_mode();
+        }
+
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             app.cycle_sort_mode();
+        }
+
+        (KeyCode::Char('r'), KeyModifiers::ALT) => {
+            app.toggle_recursive_mode();
         }
 
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
@@ -482,16 +531,8 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
             app.enter_selected_directory();
         }
 
-        (KeyCode::Enter, _) => {
+        (KeyCode::Enter, KeyModifiers::NONE) => {
             app.activate_selected();
-        }
-
-        (KeyCode::Backspace, _) => {
-            if app.query.is_empty() {
-                app.enter_parent_directory();
-            } else {
-                app.pop_query_character();
-            }
         }
 
         (KeyCode::Char('?'), _) => {

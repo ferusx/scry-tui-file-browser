@@ -124,16 +124,20 @@ pub const KEY_BINDINGS: &[KeyBindingHelp] = &[
         description: "Show or hide the Selection panel",
     },
     KeyBindingHelp {
-        keys: "Ctrl+M",
+        keys: "Alt+M",
         description: "Show or hide the metadata columns",
     },
     KeyBindingHelp {
-        keys: "Ctrl+H",
+        keys: "Alt+H",
         description: "Show or hide hidden entries",
     },
     KeyBindingHelp {
         keys: "Ctrl+O",
         description: "Cycle through the sort modes",
+    },
+    KeyBindingHelp {
+        keys: "Alt+R",
+        description: "Toggle recursive mode",
     },
     KeyBindingHelp {
         keys: "Ctrl+R",
@@ -327,7 +331,7 @@ pub fn print_help() -> io::Result<()> {
     println!(
         "{}{}",
         palette.bold_text("Scry"),
-        palette.text(" at GitHub: https://github.com/ferusx/scry-file-browser",),
+        palette.text(" at GitHub: https://github.com/ferusx/scry-tui-file-browser",),
     );
 
     println!();

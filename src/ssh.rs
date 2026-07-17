@@ -4,6 +4,7 @@ use std::{
     env, fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +25,7 @@ use tokio::{io::AsyncReadExt, runtime::Runtime};
 
 use crate::{
     classify::classify,
+    config::SshConfig,
     entry::{EntryKind, EntryMetadata},
     scan::{FileEntry, SortMode, sort_entries},
     source::{FileSource, TransferControl, TransferProgress},
@@ -221,19 +223,29 @@ impl fmt::Display for SftpSourceError {
 impl std::error::Error for SftpSourceError {}
 
 impl SftpSource {
-    pub fn connect(target: &SshTarget) -> Result<(PathBuf, Self), SftpSourceError> {
+    pub fn connect(
+        target: &SshTarget,
+        config: &SshConfig,
+    ) -> Result<(PathBuf, Self), SftpSourceError> {
         let runtime =
             Runtime::new().map_err(|error| SftpSourceError::RuntimeCreation(error.to_string()))?;
 
         let destination = target.openssh_destination();
+
+        let connect_timeout = Duration::from_secs(config.connect_timeout_seconds);
+
+        let server_alive_interval = Duration::from_secs(config.server_alive_interval_seconds);
 
         let (home_directory, sftp) = runtime.block_on(async {
             let mut builder = SessionBuilder::default();
 
             builder
                 .known_hosts_check(KnownHosts::Strict)
-                .connect_timeout(Duration::from_secs(10))
-                .server_alive_interval(Duration::from_secs(15));
+                .connect_timeout(connect_timeout);
+
+            if !server_alive_interval.is_zero() {
+                builder.server_alive_interval(server_alive_interval);
+            }
 
             if let Some(identity_file) = &target.identity_file {
                 builder.keyfile(identity_file);
@@ -705,7 +717,9 @@ fn remote_file_entry(directory: &Path, entry: DirEntry) -> Option<FileEntry> {
 
     let relative_path = PathBuf::from(&name);
 
-    let searchable_path = name.to_lowercase();
+    let searchable_path: Arc<str> = Arc::from(name.to_lowercase());
+
+    let searchable_name = Arc::clone(&searchable_path);
 
     Some(FileEntry {
         path,
@@ -713,6 +727,8 @@ fn remote_file_entry(directory: &Path, entry: DirEntry) -> Option<FileEntry> {
         relative_path,
 
         searchable_path,
+
+        searchable_name,
 
         name,
 

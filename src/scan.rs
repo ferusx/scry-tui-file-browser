@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use chrono::{DateTime, Local};
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver, Sender},
+};
 use std::thread;
 use std::time::SystemTime;
 
@@ -12,6 +16,18 @@ use crate::classify::{FileClass, classify};
 use crate::entry::{EntryKind, EntryMetadata};
 
 const SCAN_BATCH_SIZE: usize = 256;
+
+const FAST_SCAN_ENTRY_LIMIT: usize = 250_000;
+
+const ROOT_SKIPPED_DIRECTORIES: &[&str] = &["proc", "sys", "dev", "run"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecursiveScanMode {
+    Fast,
+
+    #[allow(dead_code)]
+    Total,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
@@ -47,7 +63,14 @@ pub struct FileEntry {
 
     pub relative_path: PathBuf,
 
-    pub searchable_path: String,
+    /*
+     * Lowercase strings shared cheaply with background search workers.
+     *
+     * Cloning an Arc does not duplicate the underlying filename or path.
+     */
+    pub searchable_path: Arc<str>,
+
+    pub searchable_name: Arc<str>,
 
     pub name: String,
 
@@ -77,6 +100,8 @@ pub enum ScanMessage {
 
     Finished {
         generation: u64,
+
+        partial: bool,
     },
 
     Failed {
@@ -121,11 +146,12 @@ pub fn start_recursive_scan(
     root: PathBuf,
     show_hidden: bool,
     generation: u64,
+    mode: RecursiveScanMode,
 ) -> Receiver<ScanMessage> {
     let (sender, receiver) = mpsc::channel();
 
     thread::spawn(move || {
-        scan_directory_tree(root, show_hidden, generation, sender);
+        scan_directory_tree(root, show_hidden, generation, mode, sender);
     });
 
     receiver
@@ -184,13 +210,16 @@ fn scan_directory_tree(
     root: PathBuf,
     show_hidden: bool,
     generation: u64,
+    mode: RecursiveScanMode,
     sender: Sender<ScanMessage>,
 ) {
-    let mut pending_directories = vec![root.clone()];
+    let mut pending_directories = VecDeque::from([root.clone()]);
+
+    let mut scanned_entries = 0_usize;
 
     let mut batch = Vec::with_capacity(SCAN_BATCH_SIZE);
 
-    while let Some(directory) = pending_directories.pop() {
+    while let Some(directory) = pending_directories.pop_front() {
         let directory_entries = match fs::read_dir(&directory) {
             Ok(directory_entries) => directory_entries,
 
@@ -226,6 +255,10 @@ fn scan_directory_tree(
 
             let path = dir_entry.path();
 
+            if should_skip_directory(&root, &path, &name) {
+                continue;
+            }
+
             let Some(entry) = make_file_entry(path.clone(), &root, name) else {
                 continue;
             };
@@ -237,10 +270,26 @@ fn scan_directory_tree(
              * traversed, preventing recursive symlink loops.
              */
             if entry.is_directory && !entry.is_symlink {
-                pending_directories.push(path);
+                pending_directories.push_back(path);
             }
 
             batch.push(entry);
+
+            scanned_entries = scanned_entries.saturating_add(1);
+
+            if mode == RecursiveScanMode::Fast && scanned_entries >= FAST_SCAN_ENTRY_LIMIT {
+                if !batch.is_empty() && send_batch(&sender, generation, &mut batch).is_err() {
+                    return;
+                }
+
+                let _ = sender.send(ScanMessage::Finished {
+                    generation,
+
+                    partial: true,
+                });
+
+                return;
+            }
 
             if batch.len() >= SCAN_BATCH_SIZE {
                 if send_batch(&sender, generation, &mut batch).is_err() {
@@ -258,7 +307,23 @@ fn scan_directory_tree(
         return;
     }
 
-    let _ = sender.send(ScanMessage::Finished { generation });
+    let _ = sender.send(ScanMessage::Finished {
+        generation,
+
+        partial: false,
+    });
+}
+
+fn should_skip_directory(root: &Path, path: &Path, name: &str) -> bool {
+    if root != Path::new("/") {
+        return false;
+    }
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    parent == root && ROOT_SKIPPED_DIRECTORIES.contains(&name)
 }
 
 fn send_batch(
@@ -382,7 +447,9 @@ fn make_file_entry(path: PathBuf, root: &Path, name: String) -> Option<FileEntry
 
     let relative_path = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
 
-    let searchable_path = relative_path.to_string_lossy().to_lowercase();
+    let searchable_path: Arc<str> = Arc::from(relative_path.to_string_lossy().to_lowercase());
+
+    let searchable_name: Arc<str> = Arc::from(name.to_lowercase());
 
     Some(FileEntry {
         path,
@@ -390,6 +457,8 @@ fn make_file_entry(path: PathBuf, root: &Path, name: String) -> Option<FileEntry
         relative_path,
 
         searchable_path,
+
+        searchable_name,
 
         name,
 

@@ -414,6 +414,7 @@ impl ConnectionDialogState {
         self.error_message = None;
     }
 
+    #[allow(dead_code)]
     pub fn pop_character(&mut self) {
         match self.focus {
             ConnectionField::Name => {
