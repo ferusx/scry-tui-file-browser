@@ -17,10 +17,11 @@ use crate::classify::{FileClass, inspect_file};
 use crate::config::{ScryConfig, SshConfig};
 use crate::connection::{ConnectionDialogState, ConnectionStore};
 use crate::fuzzy::{FuzzyWorkerResult, start_fuzzy_worker};
-
-use crate::scan::{
-    FileEntry, RecursiveScanMode, ScanMessage, SortMode, sort_entries, start_recursive_scan,
+use crate::query::{entry_matches_query, has_pending_trailing_modifier, parse_query};
+use crate::remote_index::{
+    LoadedRemoteIndex, RemoteIndexBuildMessage, RemoteIndexIdentity, load_remote_index,
 };
+use crate::scan::{FileEntry, RecursiveScanMode, ScanMessage, SortMode, sort_entries};
 use crate::search_index::SearchIndex;
 use crate::source::{FileSource, LocalSource, TransferControl, TransferProgress};
 use crate::ssh::{SftpSource, SshTarget};
@@ -68,6 +69,25 @@ struct SearchReturnState {
     recursive_mode: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FuzzyRequestIdentity {
+    query: String,
+
+    scope_directory: PathBuf,
+
+    recursive_mode: bool,
+
+    show_hidden: bool,
+
+    /*
+     * A recursive SearchIndex remains Arc-backed and resident.
+     *
+     * Its address distinguishes the currently installed corpus from an older
+     * index that happened to contain the same number of records.
+     */
+    recursive_index_identity: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     List,
@@ -82,14 +102,78 @@ pub enum SearchMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteIndexDialogPurpose {
+    InitialSetup,
+
+    Rebuild,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteIndexDialogFocus {
+    Policy,
+
+    Ok,
+
+    Cancel,
+}
+
+impl RemoteIndexDialogFocus {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Policy => Self::Ok,
+
+            Self::Ok => Self::Cancel,
+
+            Self::Cancel => Self::Policy,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Policy => Self::Cancel,
+
+            Self::Ok => Self::Policy,
+
+            Self::Cancel => Self::Ok,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteIndexSetupState {
+    pub identity: crate::remote_index::RemoteIndexIdentity,
+
+    #[allow(dead_code)]
+    pub purpose: RemoteIndexDialogPurpose,
+
+    pub includes_hidden: bool,
+
+    pub focus: RemoteIndexDialogFocus,
+
+    /*
+     * Present when an existing cache was found but failed validation.
+     */
+    pub invalid_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct RemoteIndexLoadResult {
+    result: Result<LoadedRemoteIndex, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     None,
 
     Help,
 
+    Legend,
+
     About,
 
     Connection,
+
+    RemoteIndexSetup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +363,13 @@ pub struct App {
 
     pub query: String,
 
+    /*
+     * UTF-8 byte position of the insertion caret inside `query`.
+     *
+     * The value is always kept on a valid character boundary.
+     */
+    pub query_cursor: usize,
+
     pub search_mode: SearchMode,
 
     pub theme: Theme,
@@ -323,6 +414,13 @@ pub struct App {
 
     pub error_message: Option<String>,
 
+    /*
+     * Non-error operational information shown in amber.
+     *
+     * Examples include remote-index loading, building, and successful completion.
+     */
+    pub status_message: Option<String>,
+
     pub should_quit: bool,
 
     pub scan_in_progress: bool,
@@ -334,6 +432,30 @@ pub struct App {
     pub view_mode: ViewMode,
 
     pub overlay: Overlay,
+
+    pub remote_index_setup: Option<RemoteIndexSetupState>,
+
+    /*
+     * Set after the setup window is confirmed.
+     *
+     * The next worker-integration stage consumes this value and starts the
+     * independent full-filesystem index build from "/".
+     */
+    pending_remote_index_hidden_policy: Option<bool>,
+
+    remote_index_build_receiver: Option<Receiver<RemoteIndexBuildMessage>>,
+
+    pub remote_index_build_in_progress: bool,
+
+    pub remote_index_entries_written: u64,
+
+    remote_index_load_receiver: Option<Receiver<RemoteIndexLoadResult>>,
+
+    pub remote_index_load_in_progress: bool,
+
+    remote_index_loaded: bool,
+
+    remote_index_includes_hidden: bool,
 
     pub connection_store: ConnectionStore,
 
@@ -387,6 +509,8 @@ pub struct App {
 
     fuzzy_cancel_signal: Option<Arc<AtomicBool>>,
 
+    active_fuzzy_request: Option<FuzzyRequestIdentity>,
+
     pub fuzzy_filter_in_progress: bool,
 
     pub fuzzy_examined: usize,
@@ -437,6 +561,8 @@ impl App {
 
             query: String::new(),
 
+            query_cursor: 0,
+
             search_mode: SearchMode::Exact,
 
             theme: Theme::default(),
@@ -481,6 +607,8 @@ impl App {
 
             error_message: None,
 
+            status_message: None,
+
             should_quit: false,
 
             scan_in_progress: false,
@@ -492,6 +620,24 @@ impl App {
             view_mode: ViewMode::List,
 
             overlay: Overlay::None,
+
+            remote_index_setup: None,
+
+            pending_remote_index_hidden_policy: None,
+
+            remote_index_build_receiver: None,
+
+            remote_index_build_in_progress: false,
+
+            remote_index_entries_written: 0,
+
+            remote_index_load_receiver: None,
+
+            remote_index_load_in_progress: false,
+
+            remote_index_loaded: false,
+
+            remote_index_includes_hidden: false,
 
             connection_store,
 
@@ -544,6 +690,8 @@ impl App {
             fuzzy_receiver: None,
 
             fuzzy_cancel_signal: None,
+
+            active_fuzzy_request: None,
 
             fuzzy_filter_in_progress: false,
 
@@ -638,9 +786,6 @@ impl App {
 
     pub fn recursive_search_active(&self) -> bool {
         self.recursive_mode
-            || (self.source.supports_recursive_scan()
-                && !self.query.is_empty()
-                && self.query != ".")
     }
 
     pub fn active_entry_count(&self) -> usize {
@@ -653,6 +798,29 @@ impl App {
 
     pub fn source_is_remote(&self) -> bool {
         self.source.is_remote()
+    }
+
+    fn persistent_remote_index_available(&self) -> bool {
+        self.source.is_remote()
+            && self.remote_index_loaded
+            && self.recursive_cache_complete
+            && !self.recursive_entries.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub fn remote_index_identity(&self) -> Option<crate::remote_index::RemoteIndexIdentity> {
+        self.source.remote_index_identity()
+    }
+
+    #[allow(dead_code)]
+    pub fn remote_index_status(
+        &self,
+    ) -> io::Result<Option<crate::remote_index::RemoteIndexStatus>> {
+        let Some(identity) = self.source.remote_index_identity() else {
+            return Ok(None);
+        };
+
+        Ok(Some(identity.inspect()?))
     }
 
     pub fn selected_entry(&self) -> Option<&FileEntry> {
@@ -730,6 +898,193 @@ impl App {
         let maximum_offset = entry_count.saturating_sub(visible_rows);
 
         self.list_offset = self.list_offset.min(maximum_offset);
+    }
+
+    pub fn process_remote_index_load_messages(&mut self) -> bool {
+        let message = match self.remote_index_load_receiver.as_ref() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(message) => message,
+
+                Err(TryRecvError::Empty) => {
+                    return false;
+                }
+
+                Err(TryRecvError::Disconnected) => {
+                    self.remote_index_load_receiver = None;
+
+                    self.remote_index_load_in_progress = false;
+
+                    self.error_message =
+                        Some("Remote index loader stopped unexpectedly".to_string());
+
+                    return true;
+                }
+            },
+
+            None => {
+                return false;
+            }
+        };
+
+        self.remote_index_load_receiver = None;
+
+        self.remote_index_load_in_progress = false;
+
+        match message.result {
+            Ok(mut loaded) => {
+                /*
+                 * Exact mode displays the backing corpus directly.
+                 *
+                 * Preserve normal Scry sorting. Fuzzy mode deliberately keeps
+                 * scanner/cache order because relevance owns its result order.
+                 */
+                if self.search_mode == SearchMode::Exact {
+                    sort_entries(&mut loaded.entries, self.sort_mode, self.sort_descending);
+                }
+
+                self.cancel_fuzzy_filter();
+
+                self.recursive_entries = loaded.entries;
+
+                self.rebuild_recursive_path_indices();
+
+                self.search_index = Arc::new(SearchIndex::from_entries(&self.recursive_entries));
+
+                self.recursive_cache_complete = true;
+
+                self.recursive_scan_partial = loaded.info.partial;
+
+                self.scan_in_progress = false;
+
+                self.remote_index_loaded = true;
+
+                self.remote_index_includes_hidden = loaded.info.includes_hidden;
+
+                self.recursive_mode = true;
+
+                self.selected = 0;
+
+                self.list_offset = 0;
+
+                self.error_message = None;
+
+                self.error_message = Some(format!(
+                    "Remote index loaded — {} entries",
+                    loaded.info.entry_count,
+                ));
+
+                match self.view_mode {
+                    ViewMode::List => {
+                        self.refresh_filter();
+
+                        self.restore_pending_selection_if_available();
+                    }
+
+                    ViewMode::Tree => {
+                        let selected_path = self.pending_selection_path.clone();
+
+                        self.rebuild_recursive_search_tree(selected_path);
+
+                        self.restore_pending_selection_if_available();
+                    }
+                }
+            }
+
+            Err(message) => {
+                self.remote_index_loaded = false;
+
+                self.error_message = Some(format!("Unable to load remote index: {}", message,));
+            }
+        }
+
+        true
+    }
+
+    pub fn process_remote_index_messages(&mut self) -> bool {
+        let mut changed = false;
+
+        loop {
+            let message = match self.remote_index_build_receiver.as_ref() {
+                Some(receiver) => match receiver.try_recv() {
+                    Ok(message) => message,
+
+                    Err(TryRecvError::Empty) => {
+                        break;
+                    }
+
+                    Err(TryRecvError::Disconnected) => {
+                        self.remote_index_build_receiver = None;
+
+                        if self.remote_index_build_in_progress {
+                            self.remote_index_build_in_progress = false;
+
+                            self.error_message =
+                                Some("Remote index worker stopped unexpectedly".to_string());
+
+                            changed = true;
+                        }
+
+                        break;
+                    }
+                },
+
+                None => {
+                    break;
+                }
+            };
+
+            match message {
+                RemoteIndexBuildMessage::Progress { entries_written } => {
+                    self.remote_index_entries_written = entries_written;
+
+                    self.error_message = None;
+
+                    self.error_message = Some(format!(
+                        "Building remote index from / — {} entries written…",
+                        entries_written,
+                    ));
+
+                    changed = true;
+                }
+
+                RemoteIndexBuildMessage::Finished(info) => {
+                    self.remote_index_entries_written = info.entry_count;
+
+                    self.remote_index_build_in_progress = false;
+
+                    self.remote_index_build_receiver = None;
+
+                    self.pending_remote_index_hidden_policy = None;
+
+                    self.error_message = None;
+
+                    self.error_message = Some(format!(
+                        "Remote index ready — {} entries saved",
+                        info.entry_count,
+                    ));
+
+                    changed = true;
+
+                    break;
+                }
+
+                RemoteIndexBuildMessage::Failed { message } => {
+                    self.remote_index_build_in_progress = false;
+
+                    self.remote_index_build_receiver = None;
+
+                    self.pending_remote_index_hidden_policy = None;
+
+                    self.error_message = Some(message);
+
+                    changed = true;
+
+                    break;
+                }
+            }
+        }
+
+        changed
     }
 
     pub fn process_scan_messages(&mut self) -> bool {
@@ -858,59 +1213,175 @@ impl App {
         }
 
         if changed {
+            let text_filter_active = !self.query.is_empty() && self.query != ".";
+
             if self.view_mode == ViewMode::Tree && self.recursive_search_active() {
                 /*
-                push_query_character                * every incoming scan batch.
-                                *
-                                * Accumulate entries while scanning and construct the tree once when
-                                * the scan has finished.
-                                */
+                 * Recursive Tree construction is intentionally deferred until the
+                 * scanner has finished.
+                 *
+                 * Rebuilding the hierarchy for every incoming batch would repeatedly
+                 * disturb selection and would become prohibitively expensive on large
+                 * filesystems.
+                 */
                 if scan_finished {
                     let selected_path = self
                         .pending_selection_path
                         .clone()
                         .or_else(|| self.selected_entry().map(|entry| entry.path.clone()));
 
-                    let text_filter_active = !self.query.is_empty() && self.query != ".";
-
                     if self.search_mode == SearchMode::Fuzzy && text_filter_active {
-                        /*
-                         * A genuine fuzzy text query consumes the completed compact index.
-                         */
                         self.start_current_fuzzy_filter();
                     } else {
-                        /*
-                         * An empty query is ordinary recursive Tree browsing.
-                         *
-                         * SearchMode::Fuzzy changes how typed text is interpreted; it must not
-                         * erase the unfiltered recursive tree when no text search exists.
-                         */
                         self.rebuild_recursive_search_tree(selected_path);
 
                         self.restore_pending_selection_if_available();
                     }
                 }
+            } else if !text_filter_active {
+                /*
+                 * An empty query is ordinary directory browsing.
+                 *
+                 * The recursive scanner is only building a background corpus. Incoming
+                 * batches must not refresh the visible directory list, alter its
+                 * selection, or move its viewport.
+                 *
+                 * A redraw is still requested through the returned `changed` value so
+                 * scan status may update without touching navigation state.
+                 */
             } else if self.search_mode == SearchMode::Fuzzy && self.recursive_search_active() {
                 /*
-                 * Recursive Fuzzy mode waits for the complete scanner result.
+                 * Recursive Fuzzy mode consumes only a complete stable index.
                  *
-                 * Running and sorting fuzzy matches after every 256-entry batch caused the
-                 * severe UI stalls observed with large directory trees.
+                 * Publishing fuzzy results for every scanner batch causes constant
+                 * reranking and severe UI churn.
                  */
                 if scan_finished {
                     self.refresh_filter();
                 }
             } else {
                 /*
-                 * Exact List mode remains incremental.
+                 * Exact recursive text search remains incremental.
+                 *
+                 * Preserve the selected path across each result-set update rather than
+                 * allowing a newly inserted batch to displace the current selection.
                  */
+                let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+
                 self.refresh_filter();
 
-                self.restore_pending_selection_if_available();
+                if let Some(path) = selected_path {
+                    self.select_visible_path(&path);
+                } else {
+                    self.restore_pending_selection_if_available();
+                }
             }
         }
 
         changed
+    }
+
+    pub fn move_query_cursor_left(&mut self) {
+        if self.query_cursor == 0 {
+            return;
+        }
+
+        self.query_cursor = self.query[..self.query_cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+    }
+
+    pub fn move_query_cursor_right(&mut self) {
+        if self.query_cursor >= self.query.len() {
+            self.query_cursor = self.query.len();
+
+            return;
+        }
+
+        let next_character_length = self.query[self.query_cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0);
+
+        self.query_cursor = self
+            .query_cursor
+            .saturating_add(next_character_length)
+            .min(self.query.len());
+    }
+
+    pub fn move_query_cursor_to_start(&mut self) {
+        self.query_cursor = 0;
+    }
+
+    pub fn move_query_cursor_to_end(&mut self) {
+        self.query_cursor = self.query.len();
+    }
+
+    fn insert_query_character_at_cursor(&mut self, character: char) {
+        /*
+         * Recover safely if an older restored state left the caret beyond
+         * the current query.
+         */
+        self.query_cursor = self.query_cursor.min(self.query.len());
+
+        while !self.query.is_char_boundary(self.query_cursor) {
+            self.query_cursor = self.query_cursor.saturating_sub(1);
+        }
+
+        self.query.insert(self.query_cursor, character);
+
+        self.query_cursor += character.len_utf8();
+    }
+
+    fn remove_query_character_before_cursor(&mut self) -> bool {
+        if self.query_cursor == 0 || self.query.is_empty() {
+            return false;
+        }
+
+        self.query_cursor = self.query_cursor.min(self.query.len());
+
+        while !self.query.is_char_boundary(self.query_cursor) {
+            self.query_cursor = self.query_cursor.saturating_sub(1);
+        }
+
+        let previous_character_start = self.query[..self.query_cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+
+        self.query
+            .drain(previous_character_start..self.query_cursor);
+
+        self.query_cursor = previous_character_start;
+
+        true
+    }
+
+    pub fn commit_pending_query_modifier(&mut self) -> bool {
+        /*
+         * Enter commits only a modifier being edited at the end.
+         *
+         * When the caret is in the middle of the query, Enter retains
+         * its ordinary activation behavior.
+         */
+        if self.query_cursor != self.query.len() || !has_pending_trailing_modifier(&self.query) {
+            return false;
+        }
+
+        /*
+         * A separating space is both visible and structurally useful:
+         *
+         * - it commits the current modifier;
+         * - it leaves the caret ready for another query term;
+         * - Backspace can naturally make the modifier pending again.
+         */
+        self.push_query_character(' ');
+
+        true
     }
 
     pub fn push_query_character(&mut self, character: char) {
@@ -937,7 +1408,7 @@ impl App {
                 self.search_collapsed_directories.clear();
             }
 
-            self.query.push(character);
+            self.insert_query_character_at_cursor(character);
 
             if !search_was_active && self.recursive_search_active() {
                 self.ensure_recursive_scan();
@@ -971,7 +1442,7 @@ impl App {
 
         let search_was_active = self.recursive_search_active();
 
-        self.query.push(character);
+        self.insert_query_character_at_cursor(character);
 
         if !search_was_active && self.recursive_search_active() {
             self.ensure_recursive_scan();
@@ -1000,7 +1471,7 @@ impl App {
 
             let selected_path = self.selected_entry().map(|entry| entry.path.clone());
 
-            self.query.pop();
+            self.remove_query_character_before_cursor();
 
             if search_was_active && !self.recursive_search_active() {
                 self.restore_manual_tree();
@@ -1029,7 +1500,7 @@ impl App {
             return;
         }
 
-        self.query.pop();
+        self.remove_query_character_before_cursor();
 
         if self.recursive_search_active() {
             self.ensure_recursive_scan();
@@ -1052,6 +1523,8 @@ impl App {
 
             self.query.clear();
 
+            self.query_cursor = 0;
+
             if search_was_active {
                 self.restore_manual_tree();
             } else {
@@ -1062,6 +1535,8 @@ impl App {
         }
 
         self.query.clear();
+
+        self.query_cursor = 0;
 
         self.selected = 0;
 
@@ -1087,6 +1562,22 @@ impl App {
         self.show_columns = !self.show_columns;
     }
 
+    pub fn toggle_permissions_column(&mut self) {
+        self.show_permissions = !self.show_permissions;
+    }
+
+    pub fn toggle_size_column(&mut self) {
+        self.show_size = !self.show_size;
+    }
+
+    pub fn toggle_date_column(&mut self) {
+        self.show_date = !self.show_date;
+    }
+
+    pub fn toggle_user_column(&mut self) {
+        self.show_user = !self.show_user;
+    }
+
     pub fn toggle_hidden(&mut self) {
         let selected_path = self.selected_entry().map(|entry| entry.path.clone());
 
@@ -1094,7 +1585,19 @@ impl App {
 
         self.directory_has_content_cache.clear();
 
-        self.invalidate_recursive_cache();
+        if self.source.is_remote() && self.remote_index_loaded {
+            self.cancel_fuzzy_filter();
+
+            if self.show_hidden && !self.remote_index_includes_hidden {
+                self.error_message = Some(
+                    "This remote index contains standard entries only; \
+                    rebuild it to include dot-entries"
+                        .to_string(),
+                );
+            }
+        } else {
+            self.invalidate_recursive_cache();
+        }
 
         if self.view_mode == ViewMode::Tree {
             if self.recursive_search_active() {
@@ -1244,10 +1747,172 @@ impl App {
         }
     }
 
+    fn prepare_remote_recursive_mode(&mut self) -> bool {
+        /*
+         * A running host-wide build is independent from recursive-mode display.
+         *
+         * Alt+R must not begin another build, toggle the current mode, or inspect
+         * a part file while the existing build is still active.
+         */
+        if self.remote_index_build_in_progress {
+            self.error_message = None;
+
+            self.error_message = Some(format!(
+                "Remote index is still building — {} entries written",
+                self.remote_index_entries_written,
+            ));
+
+            return false;
+        }
+
+        /*
+         * Loading is also a single background operation.
+         *
+         * Repeated Alt+R presses while loading must not start duplicate loaders.
+         */
+        self.error_message = None;
+
+        if self.remote_index_load_in_progress {
+            self.error_message = Some("Remote index is still loading…".to_string());
+
+            return false;
+        }
+
+        /*
+         * Once installed in memory, the host-wide corpus is immediately reusable.
+         *
+         * No disk inspection, SFTP scan, or second load is required.
+         */
+        if self.remote_index_loaded {
+            return true;
+        }
+
+        let Some(identity) = self.source.remote_index_identity() else {
+            return true;
+        };
+
+        let mut status = match identity.inspect() {
+            Ok(status) => status,
+
+            Err(error) => {
+                self.error_message = Some(format!(
+                    "Unable to inspect the remote index for {}: {}",
+                    identity.display_label(),
+                    error,
+                ));
+
+                return false;
+            }
+        };
+
+        /*
+         * Compatibility with indexes created through an OpenSSH alias where the
+         * username was omitted from Scry's command:
+         *
+         *     scry --ssh nosferatu
+         *
+         * OpenSSH may still resolve that alias to the same account as:
+         *
+         *     ferusx@nosferatu
+         *
+         * Older indexes therefore use the `default-user` identity. Prefer the exact
+         * explicit-user identity, but when it is missing, reuse a valid legacy index
+         * rather than prompting for an unnecessary rebuild.
+         */
+        if matches!(status, crate::remote_index::RemoteIndexStatus::Missing)
+            && identity.user.is_some()
+        {
+            let legacy_identity =
+                RemoteIndexIdentity::new(identity.host.clone(), None, identity.port);
+
+            match legacy_identity.inspect() {
+                Ok(crate::remote_index::RemoteIndexStatus::Valid(info)) => {
+                    status = crate::remote_index::RemoteIndexStatus::Valid(info);
+                }
+
+                Ok(_) => {}
+
+                Err(error) => {
+                    self.error_message = Some(format!(
+                        "Unable to inspect the compatible remote index for {}: {}",
+                        legacy_identity.display_label(),
+                        error,
+                    ));
+
+                    return false;
+                }
+            }
+        }
+
+        match status {
+            crate::remote_index::RemoteIndexStatus::Missing => {
+                self.remote_index_setup = Some(RemoteIndexSetupState {
+                    identity,
+
+                    purpose: RemoteIndexDialogPurpose::InitialSetup,
+
+                    includes_hidden: false,
+
+                    focus: RemoteIndexDialogFocus::Policy,
+
+                    invalid_reason: None,
+                });
+
+                self.overlay = Overlay::RemoteIndexSetup;
+
+                false
+            }
+
+            crate::remote_index::RemoteIndexStatus::Invalid { reason, .. } => {
+                self.remote_index_setup = Some(RemoteIndexSetupState {
+                    identity,
+
+                    purpose: RemoteIndexDialogPurpose::InitialSetup,
+
+                    includes_hidden: false,
+
+                    focus: RemoteIndexDialogFocus::Policy,
+
+                    invalid_reason: Some(reason),
+                });
+
+                self.overlay = Overlay::RemoteIndexSetup;
+
+                false
+            }
+
+            crate::remote_index::RemoteIndexStatus::Valid(info) => {
+                self.begin_remote_index_load(info.identity);
+
+                false
+            }
+        }
+    }
+
+    fn begin_remote_index_load(&mut self, identity: RemoteIndexIdentity) {
+        if self.remote_index_load_in_progress {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = load_remote_index(&identity).map_err(|error| error.to_string());
+
+            let _ = sender.send(RemoteIndexLoadResult { result });
+        });
+
+        self.remote_index_load_receiver = Some(receiver);
+
+        self.remote_index_load_in_progress = true;
+
+        self.error_message = Some("Loading persistent remote index, please wait...".to_string());
+    }
+
     pub fn toggle_recursive_mode(&mut self) {
         /*
-         * Remote SFTP currently supports directory-by-directory browsing but not
-         * Scry's background recursive scanner.
+         * Some future filesystem sources may support ordinary browsing without
+         * supporting recursive traversal.
          */
         if !self.source.supports_recursive_scan() {
             /*
@@ -1282,19 +1947,21 @@ impl App {
         }
 
         if !self.recursive_mode {
+            if self.source.is_remote() && !self.prepare_remote_recursive_mode() {
+                return;
+            }
+
             self.enable_recursive_mode();
 
             return;
         }
 
         /*
-         * Disable the persistent recursive listing.
+         * Disable recursive scope while preserving the query and search style.
          *
-         * A non-empty query may still keep recursive search active. That is
-         * intentional: Alt+R controls recursive browsing, while typing performs
-         * an on-demand recursive search.
-         *
-         * Preserve the selected path while the visible result source is rebuilt.
+         * Exact and Fuzzy searches immediately return to the entries loaded from the
+         * current directory. The completed recursive cache is retained so Alt+R can
+         * restore recursive results without rescanning the filesystem.
          */
         let selected_path = self.selected_entry().map(|entry| entry.path.clone());
 
@@ -1308,41 +1975,39 @@ impl App {
 
         self.error_message = None;
 
-        if self.query.is_empty() || self.query == "." {
-            /*
-             * No text search remains active, so stop and discard the recursive
-             * scan state and return to the immediate directory listing.
-             */
-            self.invalidate_recursive_cache();
+        self.cancel_fuzzy_filter();
 
-            match self.view_mode {
-                ViewMode::List => {
-                    self.refresh_filter();
-                }
+        match self.view_mode {
+            ViewMode::List => {
+                self.selected = 0;
 
-                ViewMode::Tree => {
-                    self.reset_tree();
-                }
+                self.list_offset = 0;
+
+                self.refresh_filter();
+
+                self.restore_pending_selection_if_available();
             }
-        } else {
-            /*
-             * A text query still requests recursive search. Keep or restart the
-             * recursive cache and rebuild the current search view accordingly.
-             */
-            self.ensure_recursive_scan();
 
-            match self.view_mode {
-                ViewMode::List => {
-                    self.refresh_filter();
-                }
+            ViewMode::Tree => {
+                /*
+                 * Recursive Tree rows belong to the complete descendant corpus.
+                 *
+                 * Rebuild the ordinary Tree from the current directory, then apply the
+                 * retained Exact or Fuzzy query to that local hierarchy.
+                 */
+                self.selected = 0;
 
-                ViewMode::Tree => {
-                    self.rebuild_recursive_search_tree(None);
+                self.list_offset = 0;
+
+                self.reset_tree();
+
+                self.refresh_tree_filter();
+
+                if let Some(path) = selected_path {
+                    self.select_visible_path(&path);
                 }
             }
         }
-
-        self.restore_pending_selection_if_available();
 
         self.ensure_selection_visible(self.viewport_rows);
     }
@@ -1490,6 +2155,8 @@ impl App {
         self.selected = position;
 
         self.error_message = None;
+
+        self.status_message = None;
     }
 
     pub fn scroll_selection(&mut self, amount: isize) {
@@ -1791,13 +2458,42 @@ impl App {
             }
         };
 
-        self.invalidate_recursive_cache();
+        if self.persistent_remote_index_available() {
+            /*
+             * Restoring a suspended remote search changes only the visible scope.
+             *
+             * Keep the complete host-wide corpus, path lookup, and SearchIndex
+             * resident. Only the active fuzzy worker and derived view state are
+             * disposable.
+             */
+            self.cancel_fuzzy_filter();
+
+            self.filtered_indices.clear();
+
+            self.tree_rows.clear();
+
+            self.filtered_tree_indices.clear();
+
+            self.tree_children.clear();
+
+            self.search_tree_children.clear();
+
+            self.expanded_directories.clear();
+
+            self.search_collapsed_directories.clear();
+
+            self.recursive_expanded_directories.clear();
+        } else {
+            self.invalidate_recursive_cache();
+        }
 
         self.current_directory = state.root_directory;
 
         self.entries = entries;
 
         self.query = state.query;
+
+        self.query_cursor = self.query.len();
 
         self.search_mode = state.search_mode;
 
@@ -3076,11 +3772,200 @@ impl App {
         self.should_quit = true;
     }
 
+    pub fn remote_index_setup_visible(&self) -> bool {
+        self.overlay == Overlay::RemoteIndexSetup && self.remote_index_setup.is_some()
+    }
+
+    pub fn remote_index_dialog_next_focus(&mut self) {
+        let Some(setup) = self.remote_index_setup.as_mut() else {
+            return;
+        };
+
+        setup.focus = setup.focus.next();
+    }
+
+    pub fn remote_index_dialog_previous_focus(&mut self) {
+        let Some(setup) = self.remote_index_setup.as_mut() else {
+            return;
+        };
+
+        setup.focus = setup.focus.previous();
+    }
+
+    pub fn select_remote_index_dialog_focus(&mut self, focus: RemoteIndexDialogFocus) {
+        let Some(setup) = self.remote_index_setup.as_mut() else {
+            return;
+        };
+
+        setup.focus = focus;
+    }
+
+    pub fn select_remote_index_policy(&mut self, includes_hidden: bool) {
+        let Some(setup) = self.remote_index_setup.as_mut() else {
+            return;
+        };
+
+        setup.includes_hidden = includes_hidden;
+    }
+
+    pub fn toggle_remote_index_policy(&mut self) {
+        let Some(setup) = self.remote_index_setup.as_mut() else {
+            return;
+        };
+
+        setup.includes_hidden = !setup.includes_hidden;
+
+        setup.focus = RemoteIndexDialogFocus::Policy;
+    }
+
+    fn begin_remote_index_build(&mut self, includes_hidden: bool) {
+        if self.remote_index_build_in_progress {
+            return;
+        }
+
+        let receiver = match self.source.start_remote_index_build(includes_hidden) {
+            Ok(receiver) => receiver,
+
+            Err(error) => {
+                self.pending_remote_index_hidden_policy = None;
+
+                self.error_message = Some(format!("Unable to start remote indexing: {}", error,));
+
+                return;
+            }
+        };
+
+        self.remote_index_entries_written = 0;
+
+        self.remote_index_build_in_progress = true;
+
+        self.remote_index_build_receiver = Some(receiver);
+
+        self.error_message = Some("Building remote index from /…".to_string());
+    }
+
+    pub fn open_remote_index_builder(&mut self) {
+        if !self.source.is_remote() {
+            self.error_message = None;
+
+            self.status_message =
+                Some("Remote indexes are available only for SSH connections".to_string());
+
+            return;
+        }
+
+        if self.remote_index_build_in_progress {
+            self.error_message = None;
+
+            self.status_message = Some(format!(
+                "Remote index is already building — {} entries written",
+                self.remote_index_entries_written,
+            ));
+
+            return;
+        }
+
+        if self.remote_index_load_in_progress {
+            self.error_message = None;
+
+            self.status_message =
+                Some("Wait for the current remote index to finish loading".to_string());
+
+            return;
+        }
+
+        let Some(identity) = self.source.remote_index_identity() else {
+            self.error_message = None;
+
+            self.error_message =
+                Some("The current SSH source has no remote-index identity".to_string());
+
+            return;
+        };
+
+        /*
+         * Begin with the policy of the currently loaded index where possible.
+         *
+         * Otherwise default to standard entries.
+         */
+        let includes_hidden = if self.remote_index_loaded {
+            self.remote_index_includes_hidden
+        } else {
+            match identity.inspect() {
+                Ok(crate::remote_index::RemoteIndexStatus::Valid(info)) => info.includes_hidden,
+
+                _ => false,
+            }
+        };
+
+        self.remote_index_setup = Some(RemoteIndexSetupState {
+            identity,
+
+            purpose: RemoteIndexDialogPurpose::Rebuild,
+
+            includes_hidden,
+
+            focus: RemoteIndexDialogFocus::Policy,
+
+            invalid_reason: None,
+        });
+
+        self.overlay = Overlay::RemoteIndexSetup;
+
+        self.error_message = None;
+
+        self.status_message = None;
+    }
+
+    pub fn close_remote_index_setup(&mut self) {
+        self.remote_index_setup = None;
+
+        self.overlay = Overlay::None;
+    }
+
+    pub fn confirm_remote_index_setup(&mut self) {
+        let Some((focus, includes_hidden)) = self
+            .remote_index_setup
+            .as_ref()
+            .map(|setup| (setup.focus, setup.includes_hidden))
+        else {
+            self.overlay = Overlay::None;
+
+            return;
+        };
+
+        match focus {
+            RemoteIndexDialogFocus::Policy => {
+                /*
+                 * Enter while the policy group has focus changes the selected
+                 * radio option but never begins the index build.
+                 */
+                self.toggle_remote_index_policy();
+            }
+
+            RemoteIndexDialogFocus::Ok => {
+                self.pending_remote_index_hidden_policy = Some(includes_hidden);
+
+                self.remote_index_setup = None;
+
+                self.overlay = Overlay::None;
+
+                self.begin_remote_index_build(includes_hidden);
+            }
+
+            RemoteIndexDialogFocus::Cancel => {
+                self.close_remote_index_setup();
+            }
+        }
+    }
+
     pub fn connection_visible(&self) -> bool {
         self.overlay == Overlay::Connection
     }
 
     pub fn toggle_connection_dialog(&mut self) {
+        self.remote_index_setup = None;
+
         if self.connection_visible() {
             self.close_connection_dialog();
 
@@ -3121,6 +4006,41 @@ impl App {
                 break;
             }
         }
+    }
+
+    pub fn connection_previous_profile(&mut self) {
+        let profile_count = self.connection_store.profiles().len();
+
+        if profile_count == 0 {
+            return;
+        }
+
+        self.connection_dialog.selected_profile = if self.connection_dialog.selected_profile == 0 {
+            profile_count - 1
+        } else {
+            self.connection_dialog.selected_profile - 1
+        };
+
+        self.connection_dialog
+            .load_selected_profile(&self.connection_store);
+
+        self.connection_dialog.focus = crate::connection::ConnectionField::Profiles;
+    }
+
+    pub fn connection_next_profile(&mut self) {
+        let profile_count = self.connection_store.profiles().len();
+
+        if profile_count == 0 {
+            return;
+        }
+
+        self.connection_dialog.selected_profile =
+            (self.connection_dialog.selected_profile + 1) % profile_count;
+
+        self.connection_dialog
+            .load_selected_profile(&self.connection_store);
+
+        self.connection_dialog.focus = crate::connection::ConnectionField::Profiles;
     }
 
     fn connection_focus_is_enabled(&self) -> bool {
@@ -3185,6 +4105,77 @@ impl App {
             Err(message) => {
                 self.connection_dialog.error_message =
                     Some(format!("Unable to save profile: {}", message,));
+            }
+        }
+    }
+
+    pub fn delete_connection_profile(&mut self) {
+        let profile_count = self.connection_store.profiles().len();
+
+        if profile_count == 0 {
+            self.connection_dialog.error_message =
+                Some("There is no saved profile to delete".to_string());
+
+            return;
+        }
+
+        let selected_profile = self
+            .connection_dialog
+            .selected_profile
+            .min(profile_count.saturating_sub(1));
+
+        let removed_name = self
+            .connection_store
+            .profile(selected_profile)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "profile".to_string());
+
+        match self.connection_store.remove_profile(selected_profile) {
+            Ok(Some(_)) => {
+                let remaining_profiles = self.connection_store.profiles().len();
+
+                if remaining_profiles == 0 {
+                    /*
+                     * load_selected_profile() resets the draft and moves focus to
+                     * Profile name when the final saved profile disappears.
+                     */
+                    self.connection_dialog.selected_profile = 0;
+
+                    self.connection_dialog
+                        .load_selected_profile(&self.connection_store);
+
+                    self.connection_dialog.error_message =
+                        Some(format!("Profile '{}' deleted", removed_name));
+                } else {
+                    /*
+                     * If the final item was removed, move to the new final index.
+                     * Otherwise retain the same position, which now points to the
+                     * profile that followed the deleted one.
+                     */
+                    self.connection_dialog.selected_profile =
+                        selected_profile.min(remaining_profiles.saturating_sub(1));
+
+                    self.connection_dialog
+                        .load_selected_profile(&self.connection_store);
+
+                    self.connection_dialog.focus = crate::connection::ConnectionField::Delete;
+
+                    self.connection_dialog.error_message =
+                        Some(format!("Profile '{}' deleted", removed_name));
+                }
+            }
+
+            Ok(None) => {
+                self.connection_dialog.error_message =
+                    Some("The selected profile no longer exists".to_string());
+
+                self.connection_dialog
+                    .load_selected_profile(&self.connection_store);
+            }
+
+            Err(error) => {
+                self.connection_dialog.error_message =
+                    Some(format!("Unable to delete profile: {}", error));
             }
         }
     }
@@ -3345,16 +4336,8 @@ impl App {
         self.source = success.source;
 
         /*
-         * Remote SFTP currently supports directory-by-directory browsing but not
-         * recursive scanning.
-         *
-         * Never carry a local recursive state into the connected source. Doing so
-         * makes active_entries() select the empty recursive corpus and leaves the
-         * user unable to disable the mode because the source rejects recursive
-         * operations.
-         *
-         * The original local recursive preference is already preserved inside
-         * saved_local_session and will return on Disconnect.
+         * A future filesystem source may support ordinary browsing without
+         * supporting recursive traversal.
          */
         if !self.source.supports_recursive_scan() {
             self.recursive_mode = false;
@@ -3366,14 +4349,6 @@ impl App {
 
         self.query.clear();
 
-        /*
-         * Remote browsing currently supports ordinary current-directory filtering,
-         * but not the complete recursive search engine.
-         *
-         * Begin in Exact mode for a predictable, fully supported remote experience.
-         * Once every search mode is implemented remotely, this forced fallback can be
-         * removed so the user's active mode carries across unchanged.
-         */
         self.search_mode = SearchMode::Exact;
 
         self.error_message = None;
@@ -3482,6 +4457,8 @@ impl App {
 
         self.query = session.query;
 
+        self.query_cursor = self.query.len();
+
         self.search_mode = session.search_mode;
 
         self.error_message = None;
@@ -3574,14 +4551,42 @@ impl App {
     }
 
     pub fn toggle_about(&mut self) {
+        self.remote_index_setup = None;
+
         self.overlay = match self.overlay {
             Overlay::About => Overlay::None,
 
-            Overlay::None | Overlay::Help | Overlay::Connection => Overlay::About,
+            Overlay::None
+            | Overlay::Help
+            | Overlay::Legend
+            | Overlay::Connection
+            | Overlay::RemoteIndexSetup => Overlay::About,
         };
     }
 
     pub fn close_about(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    pub fn legend_visible(&self) -> bool {
+        self.overlay == Overlay::Legend
+    }
+
+    pub fn toggle_legend(&mut self) {
+        if self.overlay == Overlay::Legend {
+            self.overlay = Overlay::None;
+
+            return;
+        }
+
+        self.help_scroll = 0;
+
+        self.help_max_scroll = 0;
+
+        self.overlay = Overlay::Legend;
+    }
+
+    pub fn close_legend(&mut self) {
         self.overlay = Overlay::None;
     }
 
@@ -3590,10 +4595,16 @@ impl App {
     }
 
     pub fn toggle_help(&mut self) {
+        self.remote_index_setup = None;
+
         self.overlay = match self.overlay {
             Overlay::Help => Overlay::None,
 
-            Overlay::None | Overlay::About | Overlay::Connection => {
+            Overlay::None
+            | Overlay::Legend
+            | Overlay::About
+            | Overlay::Connection
+            | Overlay::RemoteIndexSetup => {
                 self.help_scroll = 0;
 
                 self.help_max_scroll = 0;
@@ -3652,8 +4663,25 @@ impl App {
     }
 
     fn ensure_recursive_scan(&mut self) {
+        if self.persistent_remote_index_available() {
+            /*
+             * A loaded persistent remote index is the authoritative recursive
+             * corpus for this host.
+             *
+             * Navigation and search restoration may call this method, but they
+             * must never replace the host-wide corpus with the older directory-
+             * rooted Fast scanner.
+             */
+            self.scan_receiver = None;
+
+            self.scan_in_progress = false;
+
+            return;
+        }
+
         if !self.source.supports_recursive_scan() {
-            self.error_message = Some("Recursive remote scanning is not active yet".to_string());
+            self.error_message =
+                Some("Recursive scanning is not available for the current source".to_string());
 
             self.scan_in_progress = false;
 
@@ -3670,18 +4698,38 @@ impl App {
 
         self.recursive_entries.clear();
 
+        self.recursive_path_indices.clear();
+
         Arc::make_mut(&mut self.search_index).clear();
 
-        self.scan_in_progress = true;
-
-        self.error_message = None;
-
-        self.scan_receiver = Some(start_recursive_scan(
+        let receiver = match self.source.start_recursive_scan(
             self.current_directory.clone(),
             self.show_hidden,
             self.scan_generation,
             RecursiveScanMode::Fast,
-        ));
+        ) {
+            Ok(receiver) => receiver,
+
+            Err(error) => {
+                self.error_message = Some(format!(
+                    "Unable to start recursive scan of {}: {}",
+                    self.current_directory.display(),
+                    error,
+                ));
+
+                self.scan_in_progress = false;
+
+                self.recursive_scan_partial = false;
+
+                return;
+            }
+        };
+
+        self.scan_receiver = Some(receiver);
+
+        self.scan_in_progress = true;
+
+        self.error_message = None;
     }
 
     fn invalidate_recursive_cache(&mut self) {
@@ -3799,7 +4847,21 @@ impl App {
 
         self.save_current_navigation_state();
 
-        self.invalidate_recursive_cache();
+        if self.source.is_remote() && self.remote_index_loaded {
+            /*
+             * The persistent remote corpus covers the complete host.
+             *
+             * Directory navigation changes only the search scope. It must not discard
+             * or reload the host-wide index.
+             */
+            self.cancel_fuzzy_filter();
+
+            self.search_tree_children.clear();
+
+            self.recursive_expanded_directories.clear();
+        } else {
+            self.invalidate_recursive_cache();
+        }
 
         self.tree_rows.clear();
 
@@ -3822,6 +4884,8 @@ impl App {
         self.entries = entries;
 
         self.query = query;
+
+        self.query_cursor = self.query.len();
 
         self.search_navigation_active = true;
 
@@ -3878,7 +4942,21 @@ impl App {
 
         self.save_current_navigation_state();
 
-        self.invalidate_recursive_cache();
+        if self.source.is_remote() && self.remote_index_loaded {
+            /*
+             * The persistent remote corpus covers the complete host.
+             *
+             * Directory navigation changes only the search scope. It must not discard
+             * or reload the host-wide index.
+             */
+            self.cancel_fuzzy_filter();
+
+            self.search_tree_children.clear();
+
+            self.recursive_expanded_directories.clear();
+        } else {
+            self.invalidate_recursive_cache();
+        }
 
         self.tree_rows.clear();
 
@@ -4024,6 +5102,8 @@ impl App {
 
         self.fuzzy_receiver = None;
 
+        self.active_fuzzy_request = None;
+
         self.fuzzy_filter_in_progress = false;
 
         self.fuzzy_examined = 0;
@@ -4084,6 +5164,31 @@ impl App {
             return;
         }
 
+        let request = FuzzyRequestIdentity {
+            query: self.query.clone(),
+
+            scope_directory: self.current_directory.clone(),
+
+            recursive_mode: self.recursive_search_active(),
+
+            show_hidden: self.show_hidden,
+
+            recursive_index_identity: self
+                .recursive_search_active()
+                .then(|| Arc::as_ptr(&self.search_index) as usize),
+        };
+
+        /*
+         * Redraws, navigation restoration, and message processing can converge on
+         * this method more than once for the same user-visible search.
+         *
+         * Do not cancel and restart a worker that is already evaluating precisely
+         * the same request.
+         */
+        if self.fuzzy_filter_in_progress && self.active_fuzzy_request.as_ref() == Some(&request) {
+            return;
+        }
+
         if let Some(signal) = self.fuzzy_cancel_signal.take() {
             signal.store(true, Ordering::Relaxed);
         }
@@ -4112,15 +5217,30 @@ impl App {
 
         let cancel_signal = Arc::new(AtomicBool::new(false));
 
+        let scope_prefix = if self.source.is_remote() && self.recursive_search_active() {
+            Some(
+                self.current_directory
+                    .strip_prefix("/")
+                    .unwrap_or(&self.current_directory)
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
+        } else {
+            None
+        };
+
         self.fuzzy_receiver = Some(start_fuzzy_worker(
             index,
             self.query.clone(),
             generation,
             self.show_hidden,
+            scope_prefix,
             Arc::clone(&cancel_signal),
         ));
 
         self.fuzzy_cancel_signal = Some(cancel_signal);
+
+        self.active_fuzzy_request = Some(request);
 
         self.fuzzy_filter_in_progress = true;
 
@@ -4149,6 +5269,8 @@ impl App {
 
                         self.fuzzy_cancel_signal = None;
 
+                        self.active_fuzzy_request = None;
+
                         self.fuzzy_filter_in_progress = false;
 
                         return true;
@@ -4169,6 +5291,8 @@ impl App {
                     self.fuzzy_receiver = None;
 
                     self.fuzzy_cancel_signal = None;
+
+                    self.active_fuzzy_request = None;
 
                     self.fuzzy_filter_in_progress = false;
                 }
@@ -4253,16 +5377,11 @@ impl App {
             return;
         }
 
-        /*
-         * Exact search remains synchronous and otherwise unchanged.
-         */
         self.cancel_fuzzy_filter();
 
-        let text_filter_active = !self.query.is_empty() && self.query != ".";
+        let parsed_query = parse_query(&self.query);
 
         let show_hidden = self.show_hidden;
-
-        let query = self.query.to_lowercase();
 
         self.filtered_indices = self
             .active_entries()
@@ -4273,11 +5392,18 @@ impl App {
                     return None;
                 }
 
-                if !text_filter_active || entry.searchable_path.contains(&query) {
-                    Some(index)
-                } else {
-                    None
+                if self.source.is_remote()
+                    && self.recursive_search_active()
+                    && !entry.path.starts_with(&self.current_directory)
+                {
+                    return None;
                 }
+
+                if !entry_matches_query(entry, &parsed_query) {
+                    return None;
+                }
+
+                Some(index)
             })
             .collect();
 
@@ -4385,6 +5511,10 @@ impl App {
                     continue;
                 };
 
+                if self.source.is_remote() && !entry.path.starts_with(&self.current_directory) {
+                    continue;
+                }
+
                 self.search_tree_children
                     .entry(parent.to_path_buf())
                     .or_default()
@@ -4406,6 +5536,10 @@ impl App {
 
             for entry in &self.recursive_entries {
                 if !entry.searchable_path.contains(&query) {
+                    continue;
+                }
+
+                if self.source.is_remote() && !entry.path.starts_with(&self.current_directory) {
                     continue;
                 }
 

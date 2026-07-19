@@ -12,9 +12,10 @@ use ratatui::{
 };
 use std::time::{Duration, SystemTime};
 
-use crate::app::{App, DeletionChoice, SearchMode, TreeRow, ViewMode};
+use crate::app::{App, DeletionChoice, RemoteIndexDialogFocus, SearchMode, TreeRow, ViewMode};
 use crate::connection::ConnectionField;
 use crate::fuzzy::fuzzy_highlight_positions;
+use crate::help;
 use crate::scan::FileEntry;
 use crate::themes::Theme;
 
@@ -150,6 +151,19 @@ pub struct UiRegions {
     pub connection: Option<ConnectionUiRegions>,
 
     pub transfer: Option<TransferUiRegions>,
+
+    pub remote_index_setup: Option<RemoteIndexSetupUiRegions>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RemoteIndexSetupUiRegions {
+    pub standard: Rect,
+
+    pub include_hidden: Rect,
+
+    pub ok: Rect,
+
+    pub cancel: Rect,
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
@@ -158,6 +172,8 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
     let mut connection_regions = None;
 
     let mut transfer_regions = None;
+
+    let mut remote_index_setup_regions = None;
 
     let (search_area, details_area, entries_area, selection_area, footer_area) =
         match (app.show_details, app.show_selection) {
@@ -263,8 +279,17 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
         help_scrollbar_region = render_help_overlay(frame, app, frame.area());
     }
 
+    if app.legend_visible() {
+        help_scrollbar_region = render_legend_overlay(frame, app, frame.area());
+    }
+
     if app.about_visible() {
         render_about_overlay(frame, app, frame.area());
+    }
+
+    if app.remote_index_setup_visible() {
+        remote_index_setup_regions =
+            Some(render_remote_index_setup_overlay(frame, app, frame.area()));
     }
 
     if app.connection_visible() {
@@ -289,6 +314,8 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
         connection: connection_regions,
 
         transfer: transfer_regions,
+
+        remote_index_setup: remote_index_setup_regions,
     }
 }
 
@@ -359,6 +386,34 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 
     frame.render_widget(search, area);
+
+    if area.width > 2 && area.height > 2 {
+        let mode_prefix = format!("Search [{}]: ", mode_label);
+
+        let mut cursor = app.query_cursor.min(app.query.len());
+
+        while !app.query.is_char_boundary(cursor) {
+            cursor = cursor.saturating_sub(1);
+        }
+
+        let query_prefix = &app.query[..cursor];
+
+        let cursor_column = mode_prefix
+            .chars()
+            .count()
+            .saturating_add(query_prefix.chars().count());
+
+        let inner_width = area.width.saturating_sub(2) as usize;
+
+        if cursor_column < inner_width {
+            frame.set_cursor_position((
+                area.x
+                    .saturating_add(1)
+                    .saturating_add(cursor_column as u16),
+                area.y.saturating_add(1),
+            ));
+        }
+    }
 }
 
 fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -791,9 +846,15 @@ fn metadata_content_width(app: &App, widths: MetadataWidths) -> u16 {
 
 fn metadata_panel_width(app: &App, widths: MetadataWidths) -> u16 {
     /*
-     * Two border cells plus one padding cell on each side.
+     * The List reserves two cells for its selection symbol:
+     *
+     *     ▶
+     *
+     * Each metadata row also begins with one padding cell. Together with
+     * the two surrounding border cells, the panel therefore needs five
+     * cells beyond the calculated metadata content width.
      */
-    metadata_content_width(app, widths) + 4
+    metadata_content_width(app, widths) + 6
 }
 
 fn render_filesystem_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
@@ -928,7 +989,7 @@ fn metadata_title(app: &App, widths: MetadataWidths) -> String {
         columns.push(format!("{:<width$}", "User", width = widths.user as usize,));
     }
 
-    format!("   {} ", columns.join("  "),)
+    format!(" {} ", columns.join("  "),)
 }
 
 fn metadata_list_item(
@@ -1154,10 +1215,14 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         )
     } else if app.recursive_search_active() {
         if app.scan_in_progress {
-            format!(
-                "Recursive results — scanning {} entries…",
-                app.active_entry_count(),
-            )
+            match app.search_mode {
+                SearchMode::Exact => "Recursive results — updating…".to_string(),
+
+                SearchMode::Fuzzy => format!(
+                    "Fuzzy results — updating… — best {}",
+                    app.filtered_indices.len(),
+                ),
+            }
         } else if app.search_mode == SearchMode::Fuzzy {
             if app.recursive_scan_partial {
                 format!(
@@ -1176,14 +1241,24 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let sort_arrow = if app.sort_descending { "↓" } else { "↑" };
 
-    let title = format!(
-        " {} — {} shown / {} scanned — {} {} ",
-        heading,
-        app.filtered_indices.len(),
-        app.active_entry_count(),
-        app.sort_mode.label(),
-        sort_arrow,
-    );
+    let title = if app.scan_in_progress && app.recursive_search_active() {
+        format!(
+            " {} — {} shown — {} {} ",
+            heading,
+            app.filtered_indices.len(),
+            app.sort_mode.label(),
+            sort_arrow,
+        )
+    } else {
+        format!(
+            " {} — {} shown / {} scanned — {} {} ",
+            heading,
+            app.filtered_indices.len(),
+            app.active_entry_count(),
+            app.sort_mode.label(),
+            sort_arrow,
+        )
+    };
 
     let list = List::new(items)
         .block(
@@ -1463,7 +1538,35 @@ fn file_icon_color(entry: &FileEntry, theme: &Theme) -> Color {
 
         FileClass::ShellScript | FileClass::Executable => theme.icons.shell,
 
-        FileClass::C | FileClass::Cpp | FileClass::SourceCode => theme.icons.source,
+        FileClass::C
+        | FileClass::Cpp
+        | FileClass::Assembly
+        | FileClass::Lua
+        | FileClass::Ruby
+        | FileClass::Perl
+        | FileClass::Php
+        | FileClass::Go
+        | FileClass::Swift
+        | FileClass::Dart
+        | FileClass::CSharp
+        | FileClass::Scala
+        | FileClass::Groovy
+        | FileClass::R
+        | FileClass::Awk
+        | FileClass::Elixir
+        | FileClass::Erlang
+        | FileClass::FSharp
+        | FileClass::VisualBasic
+        | FileClass::Clojure
+        | FileClass::Zig
+        | FileClass::Nim
+        | FileClass::Crystal
+        | FileClass::Haskell
+        | FileClass::Ocaml
+        | FileClass::Pascal
+        | FileClass::Solidity
+        | FileClass::Vala
+        | FileClass::SourceCode => theme.icons.source,
 
         FileClass::Java | FileClass::Kotlin => theme.icons.java,
 
@@ -1707,8 +1810,23 @@ fn render_selection(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rec
 
     let selected_classification = app.selected_classification();
 
-    let content = if let Some(error) = &app.error_message {
-        Line::styled(error.clone(), Style::default().fg(theme.ui.error))
+    let content = if let Some(message) = &app.error_message {
+        let is_remote_index_status = message.starts_with("Building remote index")
+            || message.starts_with("Loading persistent remote index")
+            || message.starts_with("Remote index loaded")
+            || message.starts_with("Remote index ready")
+            || message.starts_with("Remote index is still building")
+            || message.starts_with("Remote index is still loading");
+
+        let color = if is_remote_index_status {
+            theme.ui.status
+        } else {
+            theme.ui.error
+        };
+
+        Line::styled(message.clone(), Style::default().fg(color))
+    } else if let Some(status) = &app.status_message {
+        Line::styled(status.clone(), Style::default().fg(theme.ui.status))
     } else if let Some(entry) = app.selected_entry() {
         Line::styled(
             entry.path.display().to_string(),
@@ -1752,6 +1870,254 @@ fn render_selection(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rec
     frame.render_widget(paragraph, area);
 }
 
+fn render_remote_index_setup_overlay(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+) -> RemoteIndexSetupUiRegions {
+    let Some(setup) = app.remote_index_setup.as_ref() else {
+        return RemoteIndexSetupUiRegions::default();
+    };
+
+    const POPUP_WIDTH: u16 = 76;
+
+    const NORMAL_HEIGHT: u16 = 17;
+
+    const INVALID_HEIGHT: u16 = 20;
+
+    let popup_height = if setup.invalid_reason.is_some() {
+        INVALID_HEIGHT
+    } else {
+        NORMAL_HEIGHT
+    };
+
+    let popup_area = centered_rect(POPUP_WIDTH, popup_height, area);
+
+    let theme = &app.theme;
+
+    let selected_style = Style::default()
+        .fg(theme.selection.text)
+        .bg(theme.selection.background)
+        .add_modifier(Modifier::BOLD);
+
+    let normal_style = Style::default().fg(theme.ui.file);
+
+    let button = |label: &str, focus: RemoteIndexDialogFocus| -> Span<'static> {
+        let style = if setup.focus == focus {
+            selected_style
+        } else {
+            normal_style
+        };
+
+        Span::styled(format!("  {}  ", label), style)
+    };
+
+    let policy_focused = setup.focus == RemoteIndexDialogFocus::Policy;
+
+    let policy_button = |label: &str, selected: bool| -> Span<'static> {
+        let marker = if selected { "(•)" } else { "( )" };
+
+        let style = if policy_focused && selected {
+            /*
+             * The selected policy also owns keyboard focus.
+             */
+            selected_style
+        } else if selected {
+            /*
+             * Focus has moved to OK or Cancel, but this policy remains
+             * visibly selected.
+             */
+            Style::default()
+                .fg(app.theme.ui.query)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            normal_style
+        };
+
+        Span::styled(format!(" {} {} ", marker, label), style)
+    };
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Remote computer: ", Style::default().fg(theme.ui.muted)),
+            Span::styled(
+                setup.identity.display_label(),
+                Style::default()
+                    .fg(theme.ui.query)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .alignment(Alignment::Center),
+        Line::raw(""),
+        Line::styled(
+            "Scry needs a reusable index for recursive remote searches.",
+            Style::default().fg(theme.ui.file),
+        )
+        .alignment(Alignment::Center),
+        Line::styled(
+            "The accessible remote filesystem will be indexed from /.",
+            Style::default().fg(theme.ui.muted),
+        )
+        .alignment(Alignment::Center),
+        Line::styled(
+            "/proc, /sys, /dev, and /run are skipped.",
+            Style::default().fg(theme.ui.muted),
+        )
+        .alignment(Alignment::Center),
+        Line::raw(""),
+    ];
+
+    if let Some(reason) = setup.invalid_reason.as_deref() {
+        lines.push(
+            Line::styled(
+                "The existing remote index is invalid:",
+                Style::default()
+                    .fg(theme.ui.error)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center),
+        );
+
+        lines.push(
+            Line::styled(reason.to_string(), Style::default().fg(theme.ui.error))
+                .alignment(Alignment::Center),
+        );
+
+        lines.push(Line::raw(""));
+    }
+
+    lines.extend([
+        Line::styled(
+            "Choose which entries the index should contain:",
+            Style::default().fg(theme.ui.file),
+        )
+        .alignment(Alignment::Center),
+        Line::raw(""),
+        Line::from(vec![
+            policy_button("Standard entries", !setup.includes_hidden),
+            Span::raw("   "),
+            policy_button("Include dot-entries", setup.includes_hidden),
+            Span::raw("   "),
+            button("OK", RemoteIndexDialogFocus::Ok),
+            Span::raw("   "),
+            button("Cancel", RemoteIndexDialogFocus::Cancel),
+        ])
+        .alignment(Alignment::Center),
+        Line::raw(""),
+        Line::styled(
+            "The choice can later be changed by rebuilding the index.",
+            Style::default().fg(theme.ui.muted),
+        )
+        .alignment(Alignment::Center),
+        Line::raw(""),
+        Line::styled(
+            "←/→ or Tab to choose   Enter to confirm   Esc to cancel",
+            Style::default().fg(theme.ui.muted),
+        )
+        .alignment(Alignment::Center),
+    ]);
+
+    /*
+     * The choices occupy one fixed line near the bottom of the popup.
+     *
+     * Their widths include the two padding cells rendered on each side by the
+     * button closure above.
+     */
+    const STANDARD_LABEL: &str = "Standard entries";
+    const HIDDEN_LABEL: &str = "Include dot-entries";
+    const OK_LABEL: &str = "OK";
+    const CANCEL_LABEL: &str = "Cancel";
+    const BUTTON_GAP: u16 = 3;
+
+    let standard_width = STANDARD_LABEL.chars().count() as u16 + 4;
+
+    let hidden_width = HIDDEN_LABEL.chars().count() as u16 + 4;
+
+    let ok_width = OK_LABEL.chars().count() as u16 + 4;
+
+    let cancel_width = CANCEL_LABEL.chars().count() as u16 + 4;
+
+    let total_button_width = standard_width
+        .saturating_add(hidden_width)
+        .saturating_add(ok_width)
+        .saturating_add(cancel_width)
+        .saturating_add(BUTTON_GAP.saturating_mul(3));
+
+    let button_start_x = popup_area
+        .x
+        .saturating_add(popup_area.width.saturating_sub(total_button_width) / 2);
+
+    let button_row = popup_area
+        .y
+        .saturating_add(if setup.invalid_reason.is_some() {
+            13
+        } else {
+            10
+        });
+
+    let standard_region = Rect {
+        x: button_start_x,
+        y: button_row,
+        width: standard_width,
+        height: 1,
+    };
+
+    let include_hidden_region = Rect {
+        x: standard_region
+            .x
+            .saturating_add(standard_region.width)
+            .saturating_add(BUTTON_GAP),
+        y: button_row,
+        width: hidden_width,
+        height: 1,
+    };
+
+    let ok_region = Rect {
+        x: include_hidden_region
+            .x
+            .saturating_add(include_hidden_region.width)
+            .saturating_add(BUTTON_GAP),
+        y: button_row,
+        width: ok_width,
+        height: 1,
+    };
+
+    let cancel_region = Rect {
+        x: ok_region
+            .x
+            .saturating_add(ok_region.width)
+            .saturating_add(BUTTON_GAP),
+        y: button_row,
+        width: cancel_width,
+        height: 1,
+    };
+
+    let popup = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Remote Index Setup ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.frames.popup)),
+        )
+        .style(Style::default().bg(app.theme.frames.popup_background))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+
+    frame.render_widget(Clear, popup_area);
+
+    frame.render_widget(popup, popup_area);
+
+    RemoteIndexSetupUiRegions {
+        standard: standard_region,
+
+        include_hidden: include_hidden_region,
+
+        ok: ok_region,
+
+        cancel: cancel_region,
+    }
+}
+
 fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> ConnectionUiRegions {
     const POPUP_WIDTH: u16 = 76;
 
@@ -1765,6 +2131,8 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
 
     let draft = &app.connection_dialog.draft;
 
+    let profile_focused = app.connection_dialog.focus == ConnectionField::Profiles;
+
     let profile_summary = if profiles.is_empty() {
         Line::styled("  No saved profiles", Style::default().fg(COLOR_MUTED))
     } else {
@@ -1773,21 +2141,52 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             .map(|profile| profile.name.as_str())
             .unwrap_or("—");
 
+        let normal_style = Style::default().fg(COLOR_MUTED);
+
+        let focused_style = Style::default()
+            .fg(app.theme.selection.text)
+            .bg(app.theme.selection.background)
+            .add_modifier(Modifier::BOLD);
+
+        let label_style = if profile_focused {
+            focused_style
+        } else {
+            normal_style
+        };
+
+        let value_style = if profile_focused {
+            focused_style
+        } else {
+            Style::default()
+                .fg(COLOR_QUERY)
+                .add_modifier(Modifier::BOLD)
+        };
+
         Line::from(vec![
-            Span::styled("  Saved profile: ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
-                profile_name.to_string(),
-                Style::default()
-                    .fg(COLOR_QUERY)
-                    .add_modifier(Modifier::BOLD),
+                if profile_focused {
+                    "  Saved profile: ◀ "
+                } else {
+                    "  Saved profile: "
+                },
+                label_style,
             ),
+            Span::styled(profile_name.to_string(), value_style),
             Span::styled(
-                format!(
-                    "  ({}/{})",
-                    selected_profile.saturating_add(1),
-                    profiles.len(),
-                ),
-                Style::default().fg(COLOR_MUTED),
+                if profile_focused {
+                    format!(
+                        " ▶  ({}/{})",
+                        selected_profile.saturating_add(1),
+                        profiles.len(),
+                    )
+                } else {
+                    format!(
+                        "  ({}/{})",
+                        selected_profile.saturating_add(1),
+                        profiles.len(),
+                    )
+                },
+                label_style,
             ),
         ])
     };
@@ -1918,11 +2317,11 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
     let popup = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" SSH Connections ")
+                .title(" Remote Index Setup ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.frames.popup)),
         )
-        .style(Style::default().bg(Color::Rgb(15, 16, 22)));
+        .wrap(ratatui::widgets::Wrap { trim: true });
 
     frame.render_widget(Clear, popup_area);
 
@@ -2611,7 +3010,7 @@ fn about_information_line(label: &str, value: &str) -> Line<'static> {
     .alignment(Alignment::Center)
 }
 
-fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
+fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
     const POPUP_MAX_WIDTH: u16 = 62;
 
     const HORIZONTAL_MARGIN: u16 = 4;
@@ -2655,7 +3054,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
         ("Ctrl+S", "Show or hide Selection"),
         ("Alt+M", "Show or hide metadata"),
         ("F4", "Open SSH connections manager"),
-        ("?", "Open or close this window"),
+        ("Ctrl+!", "Open or close this window"),
         ("Alt+A", "Open the About window"),
         ("Ctrl+C", "Exit Scry"),
     ];
@@ -2680,7 +3079,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
         ("Ctrl+S", "Show or hide Selection"),
         ("Alt+M", "Show or hide metadata"),
         ("F4", "Open SSH connections manager"),
-        ("?", "Open or close this window"),
+        ("Ctrl+!", "Open or close this window"),
         ("Alt+A", "Open the About window"),
         ("Ctrl+C", "Exit Scry"),
     ];
@@ -2706,7 +3105,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
         ("Ctrl+S", "Show or hide Selection"),
         ("Alt+M", "Show or hide metadata"),
         ("F4", "Open SSH connections manager"),
-        ("?", "Open or close this window"),
+        ("Ctrl+!", "Open or close this window"),
         ("Alt+A", "Open the About window"),
         ("Ctrl+C", "Exit Scry"),
     ];
@@ -2731,7 +3130,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
     lines.push(Line::raw(""));
 
     lines.push(Line::styled(
-        "  ↑/↓ scroll   PgUp/PgDn page   ?/Esc close",
+        "  ↑/↓ scroll   PgUp/PgDn page   Ctrl+!/Esc close",
         Style::default().fg(COLOR_MUTED),
     ));
 
@@ -2741,6 +3140,14 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
         .border_style(Style::default().fg(app.theme.frames.popup));
 
     let content_area = block.inner(popup_area);
+
+    /*
+     * Keep one free column beside the text so it does not collide with the
+     * scrollbar.
+     */
+    let text_width = content_area.width.saturating_sub(2) as usize;
+
+    let lines = help::content(&app.theme, text_width);
 
     let viewport_height = content_area.height as usize;
 
@@ -2771,13 +3178,6 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
         let scrollbar_position = if app.help_max_scroll == 0 {
             0
         } else {
-            /*
-             * Ratatui's scrollbar position spans the complete content length,
-             * whereas help_scroll spans only the valid viewport offsets.
-             *
-             * Scale between those two ranges so the thumb reaches the bottom
-             * exactly when the content reaches its final viewport.
-             */
             app.help_scroll as usize * content_height.saturating_sub(1)
                 / app.help_max_scroll as usize
         };
@@ -2812,7 +3212,7 @@ fn push_shortcut_section(lines: &mut Vec<Line<'static>>, title: &str, bindings: 
     }
 
     lines.push(Line::styled(
-        format!("  {}", title,),
+        format!("  {}", title),
         Style::default()
             .fg(COLOR_FRAME)
             .add_modifier(Modifier::BOLD),
@@ -2830,11 +3230,140 @@ fn shortcut_help_line(shortcut: &str, description: &str) -> Line<'static> {
 
     Line::from(vec![
         Span::styled(
-            format!("  {:<width$}", shortcut, width = SHORTCUT_WIDTH,),
+            format!("  {:<width$}", shortcut, width = SHORTCUT_WIDTH),
             Style::default().fg(COLOR_QUERY),
         ),
         Span::styled(description.to_string(), Style::default().fg(COLOR_MUTED)),
     ])
+}
+
+fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
+    const POPUP_MAX_WIDTH: u16 = 82;
+
+    const HORIZONTAL_MARGIN: u16 = 4;
+
+    const VERTICAL_MARGIN: u16 = 2;
+
+    let popup_width = area
+        .width
+        .saturating_sub(HORIZONTAL_MARGIN.saturating_mul(2))
+        .min(POPUP_MAX_WIDTH)
+        .max(34);
+
+    let popup_height = area
+        .height
+        .saturating_sub(VERTICAL_MARGIN.saturating_mul(2))
+        .max(12);
+
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    let block = Block::default()
+        .title(" Scry Help ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.frames.popup));
+
+    let content_area = block.inner(popup_area);
+
+    /*
+     * Give the document breathing room inside the popup.
+     *
+     * Two columns are reserved on the left and right, while one row is
+     * reserved above and below the document.
+     */
+    let padded_area = content_area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+
+    /*
+     * The scrollbar occupies the far-right side of content_area rather
+     * than the padded document area.
+     */
+    let document_area = Rect {
+        x: padded_area.x,
+
+        y: padded_area.y,
+
+        width: padded_area.width.saturating_sub(1),
+
+        height: padded_area.height,
+    };
+
+    let text_width = document_area.width as usize;
+
+    let lines = help::content(&app.theme, text_width);
+
+    let viewport_height = document_area.height as usize;
+
+    let content_height = lines.len();
+
+    app.help_max_scroll = content_height.saturating_sub(viewport_height) as u16;
+
+    app.help_scroll = app.help_scroll.min(app.help_max_scroll);
+
+    let background = Style::default().bg(Color::Rgb(15, 16, 22));
+
+    let paragraph = Paragraph::new(lines)
+        .scroll((app.help_scroll, 0))
+        .style(background);
+
+    frame.render_widget(Clear, popup_area);
+
+    /*
+     * Draw the popup background and border first.
+     */
+    frame.render_widget(block.style(background), popup_area);
+
+    /*
+     * Draw the scrollable document inside its padded rectangle.
+     */
+    frame.render_widget(paragraph, document_area);
+
+    if app.help_max_scroll > 0 && document_area.height > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .track_style(Style::default().fg(app.theme.scrollbar.track))
+            .thumb_style(Style::default().fg(app.theme.scrollbar.thumb));
+
+        let scrollbar_position = if app.help_max_scroll == 0 {
+            0
+        } else {
+            /*
+             * Ratatui's scrollbar position spans the complete content length,
+             * whereas help_scroll spans only the valid viewport offsets.
+             *
+             * Scale between those two ranges so the thumb reaches the bottom
+             * exactly when the content reaches its final viewport.
+             */
+            app.help_scroll as usize * content_height.saturating_sub(1)
+                / app.help_max_scroll as usize
+        };
+
+        let mut scrollbar_state = ScrollbarState::new(content_height)
+            .position(scrollbar_position)
+            .viewport_content_length(viewport_height);
+
+        frame.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
+    }
+
+    if app.help_max_scroll == 0 || document_area.height == 0 {
+        None
+    } else {
+        Some(Rect {
+            x: content_area
+                .x
+                .saturating_add(content_area.width.saturating_sub(1)),
+
+            y: content_area.y,
+
+            width: 1,
+
+            height: content_area.height,
+        })
+    }
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

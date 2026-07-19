@@ -43,6 +43,13 @@ pub struct UiTheme {
 
     pub error: Color,
 
+    /*
+     * Informational progress and successful-operation messages.
+     *
+     * Error red remains reserved for actual failures.
+     */
+    pub status: Color,
+
     pub query: Color,
 
     pub search_match: Color,
@@ -73,7 +80,15 @@ pub struct FrameTheme {
      *
      * Help, About, SSH Connections, Transfer, and Deletion.
      */
+    /*
+     * Shared border color for modal popups.
+     */
     pub popup: Color,
+
+    /*
+     * Shared interior background for modal popups.
+     */
+    pub popup_background: Color,
 
     pub parent_brackets: Color,
 
@@ -196,6 +211,8 @@ impl Default for Theme {
 
                 error: Color::Rgb(220, 55, 70),
 
+                status: Color::Rgb(225, 170, 70),
+
                 query,
 
                 search_match: Color::Rgb(166, 119, 199),
@@ -221,6 +238,8 @@ impl Default for Theme {
                 selection: frame,
 
                 popup: frame,
+
+                popup_background: Color::Rgb(15, 16, 22),
 
                 parent_brackets: frame,
 
@@ -493,6 +512,13 @@ impl Theme {
         );
 
         apply_optional_color(
+            &mut self.frames.popup_background,
+            file_theme.frames.popup_background,
+            path,
+            "frames.popup_background",
+        );
+
+        apply_optional_color(
             &mut self.frames.parent_brackets,
             file_theme.frames.parent_brackets,
             path,
@@ -518,6 +544,8 @@ impl Theme {
         apply_optional_color(&mut self.ui.muted, file_theme.ui.muted, path, "ui.muted");
 
         apply_optional_color(&mut self.ui.error, file_theme.ui.error, path, "ui.error");
+
+        apply_optional_color(&mut self.ui.status, file_theme.ui.status, path, "ui.status");
 
         apply_optional_color(&mut self.ui.query, file_theme.ui.query, path, "ui.query");
 
@@ -823,6 +851,8 @@ struct UiThemeFile {
 
     error: Option<String>,
 
+    status: Option<String>,
+
     query: Option<String>,
 
     search_match: Option<String>,
@@ -850,6 +880,8 @@ struct FrameThemeFile {
     selection: Option<String>,
 
     popup: Option<String>,
+
+    popup_background: Option<String>,
 
     parent_brackets: Option<String>,
 

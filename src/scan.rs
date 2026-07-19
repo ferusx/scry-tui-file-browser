@@ -15,9 +15,9 @@ use std::time::SystemTime;
 use crate::classify::{FileClass, classify};
 use crate::entry::{EntryKind, EntryMetadata};
 
-const SCAN_BATCH_SIZE: usize = 256;
+pub(crate) const SCAN_BATCH_SIZE: usize = 256;
 
-const FAST_SCAN_ENTRY_LIMIT: usize = 250_000;
+pub(crate) const FAST_SCAN_ENTRY_LIMIT: usize = 250_000;
 
 const ROOT_SKIPPED_DIRECTORIES: &[&str] = &["proc", "sys", "dev", "run"];
 
@@ -314,7 +314,7 @@ fn scan_directory_tree(
     });
 }
 
-fn should_skip_directory(root: &Path, path: &Path, name: &str) -> bool {
+pub(crate) fn should_skip_directory(root: &Path, path: &Path, name: &str) -> bool {
     if root != Path::new("/") {
         return false;
     }

@@ -8,7 +8,10 @@ mod connection;
 mod entry;
 mod fuzzy;
 mod help;
+mod legend;
 mod open;
+mod query;
+mod remote_index;
 mod scan;
 mod search_index;
 mod source;
@@ -16,7 +19,7 @@ mod ssh;
 mod themes;
 mod ui;
 
-use app::{App, DeletionChoice, ViewMode};
+use app::{App, DeletionChoice, RemoteIndexDialogFocus, ViewMode};
 use args::Cli;
 use clap::Parser;
 use connection::ConnectionField;
@@ -40,7 +43,7 @@ fn main() -> io::Result<()> {
     let config = config::ScryConfig::load();
 
     if cli.help {
-        help::print_help(config.features.enable_deletion)?;
+        legend::print_help(config.features.enable_deletion)?;
 
         return Ok(());
     }
@@ -71,17 +74,45 @@ fn main() -> io::Result<()> {
             }
         };
 
-        match App::with_source(remote_home, Box::new(source)) {
+        /*
+         * Remote startup rules:
+         *
+         *     no PATH    remote home directory
+         *     .          remote home directory
+         *     PATH       PATH exactly as supplied
+         */
+        let remote_start = match cli.path.as_deref() {
+            None => remote_home,
+
+            Some(path) if path == std::path::Path::new(".") => remote_home,
+
+            Some(path) => path.to_path_buf(),
+        };
+
+        match App::with_source(remote_start.clone(), Box::new(source)) {
             Ok(app) => app,
 
             Err(error) => {
-                eprintln!("scry: unable to open remote starting directory: {}", error,);
+                eprintln!(
+                    "scry: unable to open remote starting directory {}: {}",
+                    remote_start.display(),
+                    error,
+                );
 
                 std::process::exit(1);
             }
         }
     } else {
-        match App::new(cli.path.clone()) {
+        /*
+         * An omitted local PATH has the ordinary shell meaning: begin in the
+         * process's current directory.
+         */
+        let local_start = cli
+            .path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        match App::new(local_start) {
             Ok(app) => app,
 
             Err(error) => {
@@ -93,7 +124,6 @@ fn main() -> io::Result<()> {
     };
 
     app.apply_startup_config(&config);
-
     /*
      * Command-line switches override configuration values.
      *
@@ -182,6 +212,14 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
     while !app.should_quit {
         let mut needs_redraw = app.process_scan_messages();
 
+        if app.process_remote_index_load_messages() {
+            needs_redraw = true;
+        }
+
+        if app.process_remote_index_messages() {
+            needs_redraw = true;
+        }
+
         if app.process_fuzzy_messages() {
             needs_redraw = true;
         }
@@ -243,6 +281,14 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
             needs_redraw = true;
         }
 
+        if app.process_remote_index_load_messages() {
+            needs_redraw = true;
+        }
+
+        if app.process_remote_index_messages() {
+            needs_redraw = true;
+        }
+
         if app.process_fuzzy_messages() {
             needs_redraw = true;
         }
@@ -270,6 +316,69 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
 }
 
 fn handle_key_event(app: &mut App, key_event: KeyEvent) {
+    if app.remote_index_setup_visible() {
+        let focus = app.remote_index_setup.as_ref().map(|setup| setup.focus);
+
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::Esc, _) => {
+                app.close_remote_index_setup();
+            }
+
+            /*
+             * Tab changes between the policy group, OK, and Cancel.
+             */
+            (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                app.remote_index_dialog_previous_focus();
+            }
+
+            (KeyCode::Tab, _) => {
+                app.remote_index_dialog_next_focus();
+            }
+
+            /*
+             * Left and Right change the radio selection only while the policy
+             * group owns focus. The focus remains on the group.
+             */
+            (KeyCode::Left, _) if focus == Some(RemoteIndexDialogFocus::Policy) => {
+                app.select_remote_index_policy(false);
+            }
+
+            (KeyCode::Right, _) if focus == Some(RemoteIndexDialogFocus::Policy) => {
+                app.select_remote_index_policy(true);
+            }
+
+            /*
+             * Up and Down may also switch the two vertically displayed options.
+             */
+            (KeyCode::Up, _) if focus == Some(RemoteIndexDialogFocus::Policy) => {
+                app.select_remote_index_policy(false);
+            }
+
+            (KeyCode::Down, _) if focus == Some(RemoteIndexDialogFocus::Policy) => {
+                app.select_remote_index_policy(true);
+            }
+
+            /*
+             * Space changes the selected radio policy. It never confirms a build.
+             */
+            (KeyCode::Char(' '), _) if focus == Some(RemoteIndexDialogFocus::Policy) => {
+                app.toggle_remote_index_policy();
+            }
+
+            (KeyCode::Enter, _) => {
+                app.confirm_remote_index_setup();
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
     if app.deletion_visible() {
         match (key_event.code, key_event.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -349,6 +458,14 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
                 app.connection_focus_next();
             }
 
+            (KeyCode::Left, _) if app.connection_dialog.focus == ConnectionField::Profiles => {
+                app.connection_previous_profile();
+            }
+
+            (KeyCode::Right, _) if app.connection_dialog.focus == ConnectionField::Profiles => {
+                app.connection_next_profile();
+            }
+
             (KeyCode::Enter, _) => {
                 use crate::connection::ConnectionField;
 
@@ -369,7 +486,9 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
                      * Connect, Delete, and Disconnect receive their real actions in the
                      * upcoming connection-management stages.
                      */
-                    ConnectionField::Delete => {}
+                    ConnectionField::Delete => {
+                        app.delete_connection_profile();
+                    }
 
                     /*
                      * Enter inside an editable field advances to the next enabled control.
@@ -390,6 +509,14 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
 
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 app.connection_clear_field();
+            }
+
+            /*
+             * Backspace may arrive either as the dedicated key code or as Ctrl+H,
+             * depending on the terminal and keyboard-enhancement support.
+             */
+            (KeyCode::Backspace, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+                app.connection_pop_character();
             }
 
             (KeyCode::Char(character), modifiers)
@@ -413,6 +540,46 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
 
             (KeyCode::Char('a'), KeyModifiers::ALT) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
                 app.close_about();
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
+    if app.legend_visible() {
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                app.scroll_help_up();
+            }
+
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                app.scroll_help_down();
+            }
+
+            (KeyCode::PageUp, _) => {
+                app.page_help_up();
+            }
+
+            (KeyCode::PageDown, _) => {
+                app.page_help_down();
+            }
+
+            (KeyCode::Home, _) => {
+                app.help_scroll = 0;
+            }
+
+            (KeyCode::End, _) => {
+                app.help_scroll_to_end();
+            }
+
+            (KeyCode::Char('!'), _) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+                app.close_legend();
             }
 
             _ => {}
@@ -472,6 +639,26 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
 
         (KeyCode::F(4), _) => {
             app.toggle_connection_dialog();
+        }
+
+        (KeyCode::F(5), _) => {
+            app.open_remote_index_builder();
+        }
+
+        (KeyCode::F(7), _) => {
+            app.toggle_permissions_column();
+        }
+
+        (KeyCode::F(8), _) => {
+            app.toggle_size_column();
+        }
+
+        (KeyCode::F(9), _) => {
+            app.toggle_date_column();
+        }
+
+        (KeyCode::F(10), _) => {
+            app.toggle_user_column();
         }
 
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
@@ -541,6 +728,26 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
             app.toggle_sort_direction();
         }
 
+        /*
+         * Query-caret movement uses Ctrl so ordinary navigation keys
+         * remain available to the filesystem browser and Tree mode.
+         */
+        (KeyCode::Left, KeyModifiers::CONTROL) => {
+            app.move_query_cursor_left();
+        }
+
+        (KeyCode::Right, KeyModifiers::CONTROL) => {
+            app.move_query_cursor_right();
+        }
+
+        (KeyCode::Home, KeyModifiers::CONTROL) => {
+            app.move_query_cursor_to_start();
+        }
+
+        (KeyCode::End, KeyModifiers::CONTROL) => {
+            app.move_query_cursor_to_end();
+        }
+
         (KeyCode::Esc, _) => {
             app.enter_parent_directory();
         }
@@ -582,11 +789,17 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
         }
 
         (KeyCode::Enter, KeyModifiers::NONE) => {
-            app.activate_selected();
+            if !app.commit_pending_query_modifier() {
+                app.activate_selected();
+            }
         }
 
         (KeyCode::Char('?'), _) => {
             app.toggle_help();
+        }
+
+        (KeyCode::Char('!'), _) => {
+            app.toggle_legend();
         }
 
         (KeyCode::Char(character), modifiers)
@@ -608,6 +821,55 @@ fn handle_mouse_event(
     scrollbar_drag: &mut Option<ScrollbarDragState>,
     help_scrollbar_drag: &mut bool,
 ) {
+    if app.remote_index_setup_visible() {
+        /*
+         * The setup window owns every mouse event while visible.
+         *
+         * Events that do not land on one of its choices are deliberately ignored
+         * rather than being passed to the browser underneath.
+         */
+        *scrollbar_drag = None;
+
+        *help_scrollbar_drag = false;
+
+        *last_left_click = None;
+
+        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        let Some(setup_regions) = regions.remote_index_setup else {
+            return;
+        };
+
+        let inside = |area: Rect| {
+            event.column >= area.x
+                && event.column < area.x.saturating_add(area.width)
+                && event.row >= area.y
+                && event.row < area.y.saturating_add(area.height)
+        };
+
+        if inside(setup_regions.standard) {
+            app.select_remote_index_dialog_focus(RemoteIndexDialogFocus::Policy);
+
+            app.select_remote_index_policy(false);
+        } else if inside(setup_regions.include_hidden) {
+            app.select_remote_index_dialog_focus(RemoteIndexDialogFocus::Policy);
+
+            app.select_remote_index_policy(true);
+        } else if inside(setup_regions.ok) {
+            app.select_remote_index_dialog_focus(RemoteIndexDialogFocus::Ok);
+
+            app.confirm_remote_index_setup();
+        } else if inside(setup_regions.cancel) {
+            app.select_remote_index_dialog_focus(RemoteIndexDialogFocus::Cancel);
+
+            app.close_remote_index_setup();
+        }
+
+        return;
+    }
+
     if app.deletion_visible() {
         *scrollbar_drag = None;
 
@@ -923,6 +1185,8 @@ fn handle_connection_mouse_event(
     } else if point_inside(regions.delete) {
         if !app.connection_store.profiles().is_empty() {
             app.set_connection_focus(ConnectionField::Delete);
+
+            app.delete_connection_profile();
         }
     } else if point_inside(regions.disconnect) {
         if app.source_is_remote() {

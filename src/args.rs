@@ -15,10 +15,18 @@ use clap::Parser;
 )]
 pub struct Cli {
     /*
-     * Optional directory or file from which Wraith should begin.
+     * Optional directory or file from which Scry should begin.
+     *
+     * Local browsing defaults to the current directory.
+     *
+     * Remote browsing distinguishes between:
+     *
+     *     no PATH    use the local launch directory on the remote host
+     *     .          use the remote account's home directory
+     *     PATH       use PATH exactly as supplied
      */
-    #[arg(value_name = "PATH", default_value = ".")]
-    pub path: PathBuf,
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
 
     /*
      * Connect to a remote filesystem through SSH/SFTP.

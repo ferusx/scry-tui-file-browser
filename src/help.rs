@@ -1,765 +1,570 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::env;
-use std::io::{self, IsTerminal};
-
-use crossterm::terminal;
-
-/*
- * These definitions are public so the future internal Ratatui help overlay
- * can reuse the same descriptions. External and internal help should never
- * drift apart.
- */
-#[derive(Debug, Clone, Copy)]
-pub struct HelpOption {
-    pub short: &'static str,
-
-    pub long: &'static str,
-
-    pub description: &'static str,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct KeyBindingHelp {
-    pub keys: &'static str,
-
-    pub description: &'static str,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct HelpExample {
-    pub command: &'static str,
-
-    pub description: &'static str,
-}
-
-pub const OPTIONS: &[HelpOption] = &[
-    HelpOption {
-        short: "-h",
-        long: "--help",
-        description: "Print this help information",
-    },
-    HelpOption {
-        short: "-V",
-        long: "--version",
-        description: "Print the Scry version",
-    },
-    HelpOption {
-        short: "",
-        long: "--ssh TARGET",
-        description: "Browse a remote computer through SSH/SFTP",
-    },
-    HelpOption {
-        short: "-a",
-        long: "--all",
-        description: "Show hidden files and directories",
-    },
-    HelpOption {
-        short: "-r",
-        long: "--recursive",
-        description: "Start with a recursive listing",
-    },
-    HelpOption {
-        short: "-T",
-        long: "--tree",
-        description: "Start in Tree mode",
-    },
-    HelpOption {
-        short: "-p",
-        long: "--permissions",
-        description: "Show the permissions column",
-    },
-    HelpOption {
-        short: "-s",
-        long: "--size",
-        description: "Show the file-size column",
-    },
-    HelpOption {
-        short: "-d",
-        long: "--date",
-        description: "Show the modification-date column",
-    },
-    HelpOption {
-        short: "-u",
-        long: "--user",
-        description: "Show the owner column",
-    },
-];
-
-pub const KEY_BINDINGS: &[KeyBindingHelp] = &[
-    KeyBindingHelp {
-        keys: "↑ / ↓",
-        description: "Move the selection",
-    },
-    KeyBindingHelp {
-        keys: "PgUp / PgDn",
-        description: "Move one visible page",
-    },
-    KeyBindingHelp {
-        keys: "Home / End",
-        description: "Select the first or last entry",
-    },
-    KeyBindingHelp {
-        keys: "←",
-        description: "Collapse a branch or move to the parent",
-    },
-    KeyBindingHelp {
-        keys: "→",
-        description: "Expand the selected directory",
-    },
-    KeyBindingHelp {
-        keys: "Enter",
-        description: "Enter as new root or open the selected file",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+T",
-        description: "Switch between List and Tree modes",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+D",
-        description: "Show or hide the Details pane",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+S",
-        description: "Show or hide the Selection panel",
-    },
-    KeyBindingHelp {
-        keys: "Alt+M",
-        description: "Show or hide the metadata columns",
-    },
-    KeyBindingHelp {
-        keys: "Alt+H",
-        description: "Show or hide hidden entries",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+O",
-        description: "Cycle through the sort modes",
-    },
-    KeyBindingHelp {
-        keys: "Alt+R",
-        description: "Toggle recursive mode",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+R",
-        description: "Reverse the current sort order",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+U",
-        description: "Clear the current search",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+C",
-        description: "Quit Scry",
-    },
-    KeyBindingHelp {
-        keys: "Mouse wheel",
-        description: "Scroll through entries",
-    },
-    KeyBindingHelp {
-        keys: "Double-click",
-        description: "Activate the selected entry",
-    },
-    KeyBindingHelp {
-        keys: "Middle-click",
-        description: "Collapse or move to the parent",
-    },
-];
-
-pub const DELETION_KEY_BINDING: KeyBindingHelp = KeyBindingHelp {
-    keys: "Delete",
-    description: "Delete the selected local file or directory",
+use ratatui::{
+    style::{Modifier, Style},
+    text::Line,
 };
 
-pub const DISABLED_DELETION_KEY_BINDING: KeyBindingHelp = KeyBindingHelp {
-    keys: "Delete",
-    description: "Delete sel. entry (enable via scry.toml)",
-};
+use crate::themes::Theme;
 
-pub const EXAMPLES: &[HelpExample] = &[
-    HelpExample {
-        command: "scry -T -p -s ~/Projects",
-        description: "Browse ~/Projects in Tree mode with permissions and file sizes",
-    },
-    HelpExample {
-        command: "scry -r ~/",
-        description: "Browse home directory in recursive mode",
-    },
-    HelpExample {
-        command: "scry -rT ~/ -pds",
-        description: "Browse ~/ recursively in Tree mode with permissions, date, and file size",
-    },
-    HelpExample {
-        command: "scry --ssh 192.168.1.50 -pT",
-        description: "Browse remote directory in Tree mode with permissions",
-    },
-];
+pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
 
-/*
- * RGB values follow Scry's main palette.
- */
-const ANSI_RESET: &str = "\x1b[0m";
+    push_paragraph(
+        &mut lines,
+        "Scry is a fast terminal file browser for exploring local and remote \
+        filesystems. It combines live searching with List and Tree views, detailed \
+        metadata inspection, file opening and optional deletion, and SSH browsing \
+        backed by persistent remote indexes for fast recursive searches.",
+        text_width,
+        theme,
+    );
 
-const ANSI_BOLD: &str = "\x1b[1m";
+    push_title(&mut lines, "The Interface", theme);
 
-const ANSI_FRAME: &str = "\x1b[38;2;75;80;92m";
+    push_section(&mut lines, "Search Field", theme);
 
-const ANSI_PURPLE: &str = "\x1b[38;2;160;110;220m";
+    push_paragraph(
+        &mut lines,
+        "The Search field is always ready for input. Typing begins filtering or \
+        searching immediately, while the current mode is shown in brackets beside \
+        the field. The visible caret may be moved one character at a time \
+        (Ctrl+Left and Ctrl+Right), sent to the beginning or end of the query \
+        (Ctrl+Home and Ctrl+End), or cleared together with the complete query \
+        (Ctrl+U).",
+        text_width,
+        theme,
+    );
 
-const ANSI_CYAN: &str = "\x1b[38;2;110;220;225m";
+    push_section(&mut lines, "Details Panel", theme);
 
-const ANSI_GRAY: &str = "\x1b[38;2;200;200;200m";
+    push_paragraph(
+        &mut lines,
+        "The Details panel presents information about the selected entry, including \
+        its name, classification, size, modification date, age, owner, permissions, \
+        and full path. It may be shown or hidden at any time (Ctrl+D).",
+        text_width,
+        theme,
+    );
 
-// const ANSI_PURPLE_BACKGROUND: &str = "\x1b[48;2;160;110;220m";
+    push_section(&mut lines, "Metadata Panel", theme);
 
-const ANSI_GRAY_BACKGROUND: &str = "\x1b[48;2;60;60;80m";
+    push_paragraph(
+        &mut lines,
+        "The Metadata panel appears beside the main listing and provides optional \
+        Permissions, Size, Date, and User columns. The complete panel may be shown \
+        or hidden (Alt+M), while the individual columns are controlled separately \
+        with F7, F8, F9, and F10. Its width adapts to the columns currently in use.",
+        text_width,
+        theme,
+    );
 
-const ANSI_MUTED: &str = "\x1b[38;2;125;132;145m";
+    push_section(&mut lines, "Main Listing", theme);
 
-const ANSI_TEXT: &str = "\x1b[38;2;205;210;220m";
+    push_paragraph(
+        &mut lines,
+        "The main listing is where files, directories, symbolic links, search \
+        results, and Tree branches are displayed. The highlighted row is the \
+        current selection, while the parent control in the panel title returns to \
+        the preceding directory or search root. File and directory icons may be \
+        shown or hidden (F3), and hidden entries may be revealed or concealed \
+        (Alt+H).",
+        text_width,
+        theme,
+    );
 
-#[derive(Debug, Clone, Copy)]
-struct Palette {
-    enabled: bool,
+    push_section(&mut lines, "Selection Panel", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The Selection panel shows the classification and complete path of the \
+        currently highlighted entry, making long paths available even when they \
+        cannot fit inside the main listing. It may be shown or hidden (Ctrl+S).",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Footer", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The footer provides an immediate reminder of frequently used controls and \
+        displays the current state of important interface options. Its contents \
+        adapt to the active view and available features rather than attempting to \
+        reproduce every command.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Shortcut Legend", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The Shortcut Legend is the quick reference for Scry's keyboard and mouse \
+        controls (Ctrl+!). It is intended for rapid lookup, while this Help window \
+        explains the interface, features, and workflows in fuller detail.",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "Browsing and Navigation", theme);
+
+    push_section(&mut lines, "List Mode", theme);
+
+    push_paragraph(
+        &mut lines,
+        "List mode presents the contents of the active directory as a straightforward \
+        collection of entries. The selection may be moved through the listing, \
+        directories may be entered, and files may be opened with their appropriate \
+        application. Returning to the parent restores previously retained positions \
+        where possible, so moving back through the filesystem does not always begin \
+        again at the top of each directory.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Tree Mode", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Tree mode displays directories as expandable branches and makes the \
+        relationship between parents and descendants visible. It may be enabled or \
+        disabled at any time (Ctrl+T). Right expands the selected directory, while \
+        Left collapses an open branch or moves the selection to its parent. Enter \
+        makes the selected directory the new active root, closing the former \
+        hierarchy behind it.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Sorting", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Entries may be sorted by Name, Size, Date, or Type, with the current choice \
+        shown in the main listing title. The available sort modes may be cycled \
+        (Ctrl+O), and the direction may be reversed independently (Ctrl+R). \
+        Directories remain grouped above ordinary files so navigation stays \
+        predictable.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Hidden Entries and Icons", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Hidden files and directories may be revealed or concealed without leaving \
+        the current location (Alt+H). Optional file and directory icons may also be \
+        shown or hidden (F3), allowing the listing to favor either visual \
+        classification or maximum compatibility with terminals and fonts that do \
+        not provide icon support.",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "Searching", theme);
+
+    push_section(&mut lines, "Normal Searching", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Normal searching filters the entries within the current directory as text \
+        is entered. Searches are case-insensitive by default and may match either \
+        filenames or their surrounding paths. Ordinary text is applied immediately, \
+        and multiple unsigned words are interpreted together as one exact phrase. \
+        A query consisting only of a single dot is treated as having no text \
+        filter.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Recursive Searching", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Recursive searching extends the current scope to every descendant beneath \
+        the active directory (Alt+R). Local filesystems are scanned in the \
+        background, so a large directory tree may require some time before its \
+        complete search corpus is available. Exact results may appear progressively \
+        as entries are discovered.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Fuzzy Searching", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Fuzzy searching favors useful approximate matches instead of requiring an \
+        exact substring (Ctrl+F). It can recognize abbreviations, omitted \
+        characters, small typing mistakes, and adjacent transpositions; for \
+        example, \"hlp\" and \"hlep\" may both locate \"help\". Results are ordered \
+        by relevance so the strongest matches appear first.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Fuzzy and Recursive Searching", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Fuzzy and Recursive searching combines approximate matching with the full \
+        descendant scope of the active directory. It is enabled by using Fuzzy \
+        searching (Ctrl+F) together with Recursive searching (Alt+R). Because the \
+        complete corpus may be very large, Scry retains and displays only the \
+        strongest ranked results rather than presenting every possible match in \
+        ordinary sort order.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Type Modifiers", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The type: modifier restricts results by classification. General categories \
+        such as \"type:directory\", \"type:source\", and \"type:image\" may be used \
+        alongside dedicated language classes such as \"type:python\" and \
+        \"type:asm\". A modifier may be followed by ordinary text, as in \
+        \"type:source index\", to require both the classification and the remaining \
+        search phrase.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Extension Modifiers", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The ext: modifier examines the actual file extension rather than searching \
+        for text anywhere in the filename or path. For example, \"ext:jpg\" matches \
+        files whose extension is .jpg, while \"type:image ext:tif\" requires both \
+        an image classification and the exact .tif extension. A leading dot is \
+        optional, so \"ext:rs\" and \"ext:.rs\" are equivalent.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Inclusive and Exclusive Terms", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Terms beginning with + are required, while terms beginning with - are \
+        excluded. Scry first interprets a signed term as a known type or language, \
+        then as a known extension, and otherwise as filename or path text. Thus \
+        \"+python\" requires Python files, \"-java\" excludes Java files, \"+jpg\" \
+        requires the .jpg extension, and \"-.cache\" rejects paths containing \
+        .cache. Every positive term must match, while a match against any negative \
+        term removes the entry.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Pending Modifiers", theme);
+
+    push_paragraph(
+        &mut lines,
+        "A modifier being written at the end of the query remains pending until it \
+        is committed. This prevents partial terms such as \"-e\", \"-ex\", or \
+        \"ext:pn\" from repeatedly changing a large result set while they are still \
+        being entered. Press Space to begin another term, or Enter to commit the \
+        pending modifier without activating the selected entry. Pressing Enter \
+        again performs the normal selection action.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Searching over SSH", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Ordinary searches over SSH filter the entries already loaded from the \
+        current remote directory. Recursive remote searches use the host's \
+        persistent index, while the active remote directory continues to define \
+        the visible search scope. Existing indexes remain readable after compatible \
+        Scry upgrades, although rebuilding an older index may be necessary before \
+        newly introduced file classifications become available.",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "SSH Connections", theme);
+
+    push_section(&mut lines, "Connection Window", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The Connection window manages reusable SSH profiles and may be opened at \
+        any time (F4). Each profile may contain a profile name, host, username, \
+        port, identity file, and starting directory. Save stores the current \
+        profile locally, Connect opens the selected connection, Delete removes the \
+        stored profile, Disconnect returns to the local filesystem, and Cancel \
+        closes the window without connecting.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Remote Browsing", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Remote files and directories behave much like their local counterparts: \
+        directories may be entered, listings may be sorted and searched, and the \
+        same List and Tree views remain available. A remote file must first be \
+        transferred into Scry's local cache before it can be opened with a desktop \
+        application or terminal program.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "File Transfers", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Remote transfers are written through temporary partial files so an \
+        interrupted download is not mistaken for a complete local copy. The \
+        transfer window reports the filename, transferred bytes, completion \
+        percentage, elapsed time, and average speed while the operation is active. \
+        When the transfer finishes or fails, the final result remains visible \
+        until it is acknowledged with Enter or Escape.",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "Remote Index", theme);
+
+    push_section(&mut lines, "Purpose", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Recursive searching over SSH uses a persistent remote index instead of \
+        asking SFTP to rescan the host for every query. The index records the \
+        remote filesystem once and stores the result locally, allowing later \
+        recursive searches to respond quickly even when the host contains hundreds \
+        of thousands or millions of entries.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Building an Index", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The Remote Index Builder may be opened manually (F5). A Standard build \
+        records ordinary entries, while Include Hidden also records files and \
+        directories whose names begin with a dot. After the build has started, it \
+        continues in the background and reports its progress while the rest of \
+        Scry remains available for browsing.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Loading and Rebuilding", theme);
+
+    push_paragraph(
+        &mut lines,
+        "A completed index is stored locally and reused automatically for later \
+        connections to the same remote host, account, and port. Compatible older \
+        indexes remain readable, but rebuilding may be useful after Scry gains new \
+        file classifications or indexing behavior. An older index preserves the \
+        classifications written when it was created, while a rebuilt index records \
+        the richer information available in the current version.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Scope and Safety", theme);
+
+    push_paragraph(
+        &mut lines,
+        "A remote index represents the host filesystem beginning at /, but the \
+        currently active remote directory limits which part of that index appears \
+        in search results. Volatile system trees such as /proc, /sys, /dev, and \
+        /run are skipped during indexing because they contain temporary kernel and \
+        device information rather than ordinary files intended for browsing.",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "Opening Files", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Directories are entered directly, while executable files are launched in a \
+        terminal. Ordinary files are opened with the desktop's default application, \
+        and text files may fall back to a terminal editor when no suitable desktop \
+        opener is available. Remote files are first transferred into Scry's local \
+        cache and are then opened in the same way as local files.",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "Deletion", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Deletion is disabled by default and must be enabled in Scry's configuration \
+        before the Delete key becomes active. Deletion is currently available only \
+        for local entries; remote files and directories cannot be removed through \
+        SSH. Every request opens a confirmation window with Cancel selected by \
+        default. Ordinary files and symbolic links are removed directly, while \
+        directories and all of their contents are removed recursively. A symbolic \
+        link is deleted as a link and is never followed into its target. Scry also \
+        refuses dangerous targets such as the filesystem root, the current browsing \
+        root, or paths outside the active root. Confirmed deletion is permanent and \
+        does not use a trash or recovery area.",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "Configuration", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Scry reads its startup settings from scry.toml in the user's configuration \
+        directory. The file controls default display choices, browser behavior, \
+        optional features, and SSH settings, while command-line options take \
+        precedence for the current launch. Missing or invalid values fall back to \
+        safe built-in defaults instead of preventing Scry from starting. Complete \
+        command-line usage and available options are documented separately through \
+        \"scry --help\".",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "Themes", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Scry's appearance is selected through the configuration file, with theme \
+        definitions stored in Scry's theme directory. A theme may assign colors to \
+        interface frames, ordinary files and directories, file classifications, \
+        permission characters, icons, selections, messages, and other visual \
+        elements. Missing themes, malformed files, and invalid individual color \
+        values fall back safely to Scry's built-in defaults so a broken theme \
+        cannot prevent the application from starting.",
+        text_width,
+        theme,
+    );
+
+    push_title(&mut lines, "Keyboard and Mouse Use", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Scry supports both keyboard and mouse navigation throughout the interface. \
+        Mouse actions include selecting entries, activating them with a double \
+        click, using the middle button to return to a parent or collapse a Tree \
+        branch, dragging scrollbars through long listings, and clicking available \
+        controls in supported windows. The complete keyboard and mouse bindings \
+        are available in the Shortcut Legend (Ctrl+!).",
+        text_width,
+        theme,
+    );
+
+    /*
+     * Leave one empty line below the final paragraph so the document does not
+     * end directly against the bottom edge.
+     */
+    lines.push(Line::raw(""));
+
+    lines
 }
 
-impl Palette {
-    fn new() -> Self {
-        /*
-         * ANSI styling is enabled only when standard output is a terminal.
-         *
-         * NO_COLOR is also respected. This keeps redirected and piped help
-         * output completely free from escape sequences:
-         *
-         *     scry --help > help.txt
-         *     scry --help | less
-         */
-        Self {
-            enabled: io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
+fn push_title(lines: &mut Vec<Line<'static>>, title: &str, theme: &Theme) {
+    /*
+     * Main document headings receive the strongest visual separation.
+     */
+    if !lines.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::styled(
+        title.to_string(),
+        Style::default()
+            .fg(theme.ui.query)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    lines.push(Line::raw(""));
+}
+
+fn push_section(lines: &mut Vec<Line<'static>>, title: &str, theme: &Theme) {
+    /*
+     * Add one separating row only when the previous line is not
+     * already blank. This prevents an oversized gap when a subtitle
+     * follows a main title, while still separating it from ordinary
+     * paragraph text.
+     */
+    if lines.last().is_some_and(|line| line.width() > 0) {
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::styled(
+        format!("  {}", title),
+        Style::default()
+            .fg(theme.ui.classification)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    lines.push(Line::raw(""));
+}
+
+fn push_paragraph(lines: &mut Vec<Line<'static>>, text: &str, text_width: usize, theme: &Theme) {
+    for wrapped_line in wrap_text(text, text_width) {
+        lines.push(Line::styled(
+            wrapped_line,
+            Style::default().fg(theme.ui.file),
+        ));
+    }
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+
+    let mut wrapped_lines = Vec::new();
+
+    for source_paragraph in text.split('\n') {
+        if source_paragraph.trim().is_empty() {
+            wrapped_lines.push(String::new());
+
+            continue;
+        }
+
+        let mut current_line = String::new();
+
+        for word in source_paragraph.split_whitespace() {
+            /*
+             * The first word can always enter an empty line.
+             */
+            if current_line.is_empty() {
+                current_line.push_str(word);
+
+                continue;
+            }
+
+            let proposed_width = current_line
+                .chars()
+                .count()
+                .saturating_add(1)
+                .saturating_add(word.chars().count());
+
+            if proposed_width <= width {
+                current_line.push(' ');
+
+                current_line.push_str(word);
+            } else {
+                wrapped_lines.push(current_line);
+
+                current_line = word.to_string();
+            }
+        }
+
+        if !current_line.is_empty() {
+            wrapped_lines.push(current_line);
         }
     }
 
-    fn paint(self, value: &str, style: &str) -> String {
-        if self.enabled {
-            format!("{}{}{}", style, value, ANSI_RESET,)
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn title(self, value: &str) -> String {
-        if self.enabled {
-            format!("{}{}{}{}", ANSI_BOLD, ANSI_PURPLE, value, ANSI_RESET,)
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn command(self, value: &str) -> String {
-        if self.enabled {
-            format!(
-                "{}{}{}{}",
-                ANSI_GRAY, ANSI_GRAY_BACKGROUND, value, ANSI_RESET,
-            )
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn bold_text(self, value: &str) -> String {
-        if self.enabled {
-            format!("{}{}{}{}", ANSI_BOLD, ANSI_TEXT, value, ANSI_RESET,)
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn section(self, value: &str) -> String {
-        self.paint(value, ANSI_PURPLE)
-    }
-
-    fn frame(self, value: &str) -> String {
-        self.paint(value, ANSI_FRAME)
-    }
-
-    fn accent(self, value: &str) -> String {
-        self.paint(value, ANSI_CYAN)
-    }
-
-    fn muted(self, value: &str) -> String {
-        self.paint(value, ANSI_MUTED)
-    }
-
-    fn text(self, value: &str) -> String {
-        self.paint(value, ANSI_TEXT)
-    }
-}
-
-pub fn print_help(enable_deletion: bool) -> io::Result<()> {
-    let palette = Palette::new();
-
-    let options_widths = option_column_widths();
-
-    let options_table_width = options_widths.0 + options_widths.1 + options_widths.2 + 10;
-
-    let terminal_width = terminal::size()
-        .map(|(width, _)| width as usize)
-        .unwrap_or(options_table_width);
-
-    let page_width = terminal_width.max(options_table_width).min(100);
-
-    println!();
-
-    println!(
-        "{}",
-        palette.title(&center_text(
-            &format!("Scry {}", env!("CARGO_PKG_VERSION"),),
-            page_width,
-        ),),
-    );
-
-    println!();
-
-    println!(
-        "{}{}",
-        palette.bold_text("Scry"),
-        palette.text(
-            " is a fast terminal file browser and recursive finder. Browse directories, search entire trees as you type, sort by metadata, inspect files, and navigate with either the keyboard or mouse.",
-        ),
-    );
-
-    println!();
-
-    println!(
-        "{}",
-        palette.text(
-            "In Tree mode, Right expands a branch while Enter makes the selected directory the new root and closes the previous hierarchy behind you.",
-        ),
-    );
-
-    println!();
-
-    println!(
-        "{}{}",
-        palette.bold_text("Scry"),
-        palette.text(" at GitHub: https://github.com/ferusx/scry-tui-file-browser",),
-    );
-
-    println!();
-
-    println!("{}", palette.section("Usage:"),);
-
-    println!("  {}", palette.command("scry  [OPTIONS] [PATH]",),);
-
-    println!();
-
-    println!("{}", palette.section("Arguments:"),);
-
-    println!(
-        "  {}  {}",
-        palette.accent("PATH"),
-        palette
-            .text("Directory or file from which Scry should begin (default: current directory)",),
-    );
-
-    println!();
-
-    println!("{}", palette.section("Options:"),);
-
-    print_options_table(palette, options_widths);
-
-    println!();
-
-    println!("{}", palette.section("Keyboard and mouse:"),);
-
-    print_key_table(palette, enable_deletion);
-
-    println!();
-
-    println!("{}", palette.section("Examples:",),);
-
-    print_examples_table(palette);
-
-    println!();
-
-    println!(
-        "{}",
-        palette.muted("Type directly in Scry to begin a recursive search.",),
-    );
-
-    println!();
-
-    Ok(())
-}
-
-fn option_column_widths() -> (usize, usize, usize) {
-    let short_width = OPTIONS
-        .iter()
-        .map(|option| option.short.chars().count())
-        .chain(std::iter::once("short".len()))
-        .max()
-        .unwrap_or(5);
-
-    let long_width = OPTIONS
-        .iter()
-        .map(|option| option.long.chars().count())
-        .chain(std::iter::once("long".len()))
-        .max()
-        .unwrap_or(4);
-
-    let description_width = OPTIONS
-        .iter()
-        .map(|option| option.description.chars().count())
-        .chain(std::iter::once("description".len()))
-        .max()
-        .unwrap_or(11);
-
-    (short_width, long_width, description_width)
-}
-
-fn print_options_table(palette: Palette, widths: (usize, usize, usize)) {
-    let (short_width, long_width, description_width) = widths;
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '┌',
-            '┬',
-            '┐',
-            &[short_width, long_width, description_width,],
-        ),),
-    );
-
-    print_three_column_row(palette, "short", "long", "description", widths, true);
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '├',
-            '┼',
-            '┤',
-            &[short_width, long_width, description_width,],
-        ),),
-    );
-
-    for option in OPTIONS {
-        print_three_column_row(
-            palette,
-            option.short,
-            option.long,
-            option.description,
-            widths,
-            false,
-        );
-    }
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '└',
-            '┴',
-            '┘',
-            &[short_width, long_width, description_width,],
-        ),),
-    );
-}
-
-fn print_three_column_row(
-    palette: Palette,
-    first: &str,
-    second: &str,
-    third: &str,
-    widths: (usize, usize, usize),
-    heading: bool,
-) {
-    let (first_width, second_width, third_width) = widths;
-
-    let first = pad_right(first, first_width);
-
-    let second = pad_right(second, second_width);
-
-    let third = pad_right(third, third_width);
-
-    let first = if heading {
-        palette.section(&first)
-    } else {
-        palette.accent(&first)
-    };
-
-    let second = if heading {
-        palette.section(&second)
-    } else {
-        palette.accent(&second)
-    };
-
-    let third = if heading {
-        palette.section(&third)
-    } else {
-        palette.text(&third)
-    };
-
-    println!(
-        "{} {} {} {} {} {} {}",
-        palette.frame("│"),
-        first,
-        palette.frame("│"),
-        second,
-        palette.frame("│"),
-        third,
-        palette.frame("│"),
-    );
-}
-
-fn print_key_table(palette: Palette, enable_deletion: bool) {
-    let deletion_binding = if enable_deletion {
-        DELETION_KEY_BINDING
-    } else {
-        DISABLED_DELETION_KEY_BINDING
-    };
-
-    let bindings = KEY_BINDINGS
-        .iter()
-        .copied()
-        .chain(std::iter::once(deletion_binding))
-        .collect::<Vec<_>>();
-
-    let key_width = bindings
-        .iter()
-        .map(|binding| binding.keys.chars().count())
-        .chain(std::iter::once("keys".len()))
-        .max()
-        .unwrap_or(4);
-
-    let description_width = bindings
-        .iter()
-        .map(|binding| binding.description.chars().count())
-        .chain(std::iter::once("description".len()))
-        .max()
-        .unwrap_or(11);
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '┌',
-            '┬',
-            '┐',
-            &[key_width, description_width],
-        )),
-    );
-
-    print_two_column_row(
-        palette,
-        "keys",
-        "description",
-        key_width,
-        description_width,
-        true,
-    );
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '├',
-            '┼',
-            '┤',
-            &[key_width, description_width],
-        )),
-    );
-
-    for binding in bindings {
-        print_two_column_row(
-            palette,
-            binding.keys,
-            binding.description,
-            key_width,
-            description_width,
-            false,
-        );
-    }
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '└',
-            '┴',
-            '┘',
-            &[key_width, description_width],
-        )),
-    );
-}
-
-fn print_examples_table(palette: Palette) {
-    let command_width = EXAMPLES
-        .iter()
-        .map(|example| example.command.chars().count())
-        .chain(std::iter::once("command".len()))
-        .max()
-        .unwrap_or(7);
-
-    let description_width = EXAMPLES
-        .iter()
-        .map(|example| example.description.chars().count())
-        .chain(std::iter::once("description".len()))
-        .max()
-        .unwrap_or(11);
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '┌',
-            '┬',
-            '┐',
-            &[command_width, description_width,],
-        ),),
-    );
-
-    print_example_row(
-        palette,
-        "command",
-        "description",
-        command_width,
-        description_width,
-        true,
-    );
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '├',
-            '┼',
-            '┤',
-            &[command_width, description_width,],
-        ),),
-    );
-
-    for example in EXAMPLES {
-        print_example_row(
-            palette,
-            example.command,
-            example.description,
-            command_width,
-            description_width,
-            false,
-        );
-    }
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '└',
-            '┴',
-            '┘',
-            &[command_width, description_width,],
-        ),),
-    );
-}
-
-fn print_example_row(
-    palette: Palette,
-    command: &str,
-    description: &str,
-    command_width: usize,
-    description_width: usize,
-    heading: bool,
-) {
-    let command = pad_right(command, command_width);
-
-    let description = pad_right(description, description_width);
-
-    let command = if heading {
-        palette.section(&command)
-    } else {
-        palette.accent(&command)
-    };
-
-    let description = if heading {
-        palette.section(&description)
-    } else {
-        palette.text(&description)
-    };
-
-    println!(
-        "{} {} {} {} {}",
-        palette.frame("│"),
-        command,
-        palette.frame("│"),
-        description,
-        palette.frame("│"),
-    );
-}
-
-fn print_two_column_row(
-    palette: Palette,
-    first: &str,
-    second: &str,
-    first_width: usize,
-    second_width: usize,
-    heading: bool,
-) {
-    let first = pad_right(first, first_width);
-
-    let second = pad_right(second, second_width);
-
-    let first = if heading {
-        palette.section(&first)
-    } else {
-        palette.accent(&first)
-    };
-
-    let second = if heading {
-        palette.section(&second)
-    } else {
-        palette.text(&second)
-    };
-
-    println!(
-        "{} {} {} {} {}",
-        palette.frame("│"),
-        first,
-        palette.frame("│"),
-        second,
-        palette.frame("│"),
-    );
-}
-
-fn table_border(left: char, junction: char, right: char, widths: &[usize]) -> String {
-    let mut result = String::new();
-
-    result.push(left);
-
-    for (index, width) in widths.iter().enumerate() {
-        /*
-         * Two extra cells account for the spaces surrounding each value.
-         */
-        result.push_str(&"─".repeat(width.saturating_add(2)));
-
-        if index + 1 == widths.len() {
-            result.push(right);
-        } else {
-            result.push(junction);
-        }
-    }
-
-    result
-}
-
-fn pad_right(value: &str, width: usize) -> String {
-    let current_width = value.chars().count();
-
-    if current_width >= width {
-        value.to_string()
-    } else {
-        format!("{}{}", value, " ".repeat(width - current_width,),)
-    }
-}
-
-fn center_text(value: &str, width: usize) -> String {
-    let value_width = value.chars().count();
-
-    if value_width >= width {
-        return value.to_string();
-    }
-
-    let left_padding = width.saturating_sub(value_width) / 2;
-
-    format!("{}{}", " ".repeat(left_padding), value,)
+    wrapped_lines
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -8,7 +9,7 @@ use crate::entry::{EntryKind, EntryMetadata};
 
 const CONTENT_PROBE_SIZE: usize = 8 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileClass {
     Directory,
 
@@ -33,6 +34,58 @@ pub enum FileClass {
     JavaScript,
 
     TypeScript,
+
+    Assembly,
+
+    Lua,
+
+    Ruby,
+
+    Perl,
+
+    Php,
+
+    Go,
+
+    Swift,
+
+    Dart,
+
+    CSharp,
+
+    Scala,
+
+    Groovy,
+
+    R,
+
+    Awk,
+
+    Elixir,
+
+    Erlang,
+
+    FSharp,
+
+    VisualBasic,
+
+    Clojure,
+
+    Zig,
+
+    Nim,
+
+    Crystal,
+
+    Haskell,
+
+    Ocaml,
+
+    Pascal,
+
+    Solidity,
+
+    Vala,
 
     Web,
 
@@ -113,6 +166,58 @@ impl FileClass {
             Self::JavaScript => "JavaScript",
 
             Self::TypeScript => "TypeScript",
+
+            Self::Assembly => "Assembly",
+
+            Self::Lua => "Lua",
+
+            Self::Ruby => "Ruby",
+
+            Self::Perl => "Perl",
+
+            Self::Php => "PHP",
+
+            Self::Go => "Go",
+
+            Self::Swift => "Swift",
+
+            Self::Dart => "Dart",
+
+            Self::CSharp => "C#",
+
+            Self::Scala => "Scala",
+
+            Self::Groovy => "Groovy",
+
+            Self::R => "R",
+
+            Self::Awk => "Awk",
+
+            Self::Elixir => "Elixir",
+
+            Self::Erlang => "Erlang",
+
+            Self::FSharp => "F#",
+
+            Self::VisualBasic => "Visual Basic",
+
+            Self::Clojure => "Clojure",
+
+            Self::Zig => "Zig",
+
+            Self::Nim => "Nim",
+
+            Self::Crystal => "Crystal",
+
+            Self::Haskell => "Haskell",
+
+            Self::Ocaml => "OCaml",
+
+            Self::Pascal => "Pascal",
+
+            Self::Solidity => "Solidity",
+
+            Self::Vala => "Vala",
 
             Self::Web => "Web",
 
@@ -330,11 +435,38 @@ fn classify_interpreter(interpreter: &str) -> FileClass {
         FileClass::JavaScript
     } else if interpreter == "deno" {
         FileClass::TypeScript
-    } else if matches!(
-        interpreter.as_str(),
-        "ruby" | "perl" | "lua" | "php" | "rscript" | "groovy" | "awk" | "gawk" | "nawk"
-    ) {
-        FileClass::SourceCode
+    } else if interpreter == "ruby" {
+        FileClass::Ruby
+    } else if matches!(interpreter.as_str(), "perl" | "perl5") {
+        FileClass::Perl
+    } else if interpreter == "lua" || interpreter.starts_with("lua5") {
+        FileClass::Lua
+    } else if interpreter == "php" {
+        FileClass::Php
+    } else if matches!(interpreter.as_str(), "r" | "rscript") {
+        FileClass::R
+    } else if interpreter == "groovy" {
+        FileClass::Groovy
+    } else if matches!(interpreter.as_str(), "awk" | "gawk" | "nawk" | "mawk") {
+        FileClass::Awk
+    } else if interpreter == "dart" {
+        FileClass::Dart
+    } else if interpreter == "elixir" {
+        FileClass::Elixir
+    } else if matches!(interpreter.as_str(), "escript" | "erl") {
+        FileClass::Erlang
+    } else if matches!(interpreter.as_str(), "fsi" | "dotnet-fsi") {
+        FileClass::FSharp
+    } else if interpreter == "clojure" {
+        FileClass::Clojure
+    } else if interpreter == "nim" {
+        FileClass::Nim
+    } else if interpreter == "crystal" {
+        FileClass::Crystal
+    } else if matches!(interpreter.as_str(), "runhaskell" | "runghc") {
+        FileClass::Haskell
+    } else if matches!(interpreter.as_str(), "ocaml" | "ocamlrun") {
+        FileClass::Ocaml
     } else {
         FileClass::Executable
     }
@@ -429,7 +561,7 @@ fn classify_compound_extension(filename: &str) -> Option<FileClass> {
     Some(class)
 }
 
-fn classify_extension(extension: &str) -> Option<FileClass> {
+pub(crate) fn classify_extension(extension: &str) -> Option<FileClass> {
     let class = match extension {
         /*
          * Programming languages.
@@ -448,12 +580,57 @@ fn classify_extension(extension: &str) -> Option<FileClass> {
 
         "js" | "jsx" | "mjs" | "cjs" => FileClass::JavaScript,
 
-        "ts" | "tsx" | "mts" | "cts" => FileClass::TypeScript,
+        "asm" | "s" | "inc" | "nasm" => FileClass::Assembly,
 
-        "go" | "swift" | "scala" | "lua" | "rb" | "php" | "pl" | "pm" | "r" | "dart" | "ex"
-        | "exs" | "erl" | "hrl" | "fs" | "fsx" | "fsi" | "vb" | "vbs" | "asm" | "s" | "clj"
-        | "cljs" | "cljc" | "groovy" | "zig" | "nim" | "cr" | "hs" | "lhs" | "ml" | "mli"
-        | "pas" | "pp" | "sol" | "vala" | "vapi" => FileClass::SourceCode,
+        "lua" => FileClass::Lua,
+
+        "rb" | "rake" | "gemspec" => FileClass::Ruby,
+
+        "pl" | "pm" | "pod" | "t" => FileClass::Perl,
+
+        "php" | "php3" | "php4" | "php5" | "php7" | "php8" | "phtml" => FileClass::Php,
+
+        "go" => FileClass::Go,
+
+        "swift" => FileClass::Swift,
+
+        "dart" => FileClass::Dart,
+
+        "cs" | "csx" => FileClass::CSharp,
+
+        "scala" | "sc" => FileClass::Scala,
+
+        "groovy" | "gvy" | "gy" | "gsh" => FileClass::Groovy,
+
+        "r" | "rmd" | "rnw" => FileClass::R,
+
+        "awk" => FileClass::Awk,
+
+        "ex" | "exs" => FileClass::Elixir,
+
+        "erl" | "hrl" => FileClass::Erlang,
+
+        "fs" | "fsx" | "fsi" | "fsscript" => FileClass::FSharp,
+
+        "vb" | "vbs" => FileClass::VisualBasic,
+
+        "clj" | "cljs" | "cljc" | "edn" => FileClass::Clojure,
+
+        "zig" => FileClass::Zig,
+
+        "nim" | "nims" | "nimble" => FileClass::Nim,
+
+        "cr" => FileClass::Crystal,
+
+        "hs" | "lhs" => FileClass::Haskell,
+
+        "ml" | "mli" => FileClass::Ocaml,
+
+        "pas" | "pp" | "p" => FileClass::Pascal,
+
+        "sol" => FileClass::Solidity,
+
+        "vala" | "vapi" => FileClass::Vala,
 
         /*
          * Shell and command scripts.

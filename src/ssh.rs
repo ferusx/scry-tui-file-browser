@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use std::{
+    collections::VecDeque,
     env, fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,7 +32,14 @@ use crate::{
     classify::classify,
     config::SshConfig,
     entry::{EntryKind, EntryMetadata},
-    scan::{FileEntry, SortMode, sort_entries},
+    remote_index::{
+        CachedRemoteEntry, RemoteIndexBuildMessage, RemoteIndexIdentity, RemoteIndexScanMode,
+        RemoteIndexWriter,
+    },
+    scan::{
+        FAST_SCAN_ENTRY_LIMIT, FileEntry, RecursiveScanMode, SCAN_BATCH_SIZE, ScanMessage,
+        SortMode, should_skip_directory, sort_entries,
+    },
     source::{FileSource, TransferControl, TransferProgress},
 };
 
@@ -66,6 +78,15 @@ pub struct SftpSource {
     sftp: Sftp,
 
     runtime: Runtime,
+
+    /*
+     * Retain the complete connection description so recursive scanning can
+     * establish an independent SFTP connection without stealing the primary
+     * browsing source from App.
+     */
+    target: SshTarget,
+
+    ssh_config: SshConfig,
 
     label: String,
 
@@ -286,6 +307,10 @@ impl SftpSource {
                 sftp,
 
                 runtime,
+
+                target: target.clone(),
+
+                ssh_config: *config,
 
                 label: format!("SSH: {}", target.destination_label(),),
 
@@ -641,6 +666,356 @@ impl SftpSource {
     }
 }
 
+fn start_remote_index_build(
+    target: SshTarget,
+    ssh_config: SshConfig,
+    includes_hidden: bool,
+) -> Receiver<RemoteIndexBuildMessage> {
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+        build_remote_index(target, ssh_config, includes_hidden, sender);
+    });
+
+    receiver
+}
+
+fn build_remote_index(
+    target: SshTarget,
+    ssh_config: SshConfig,
+    includes_hidden: bool,
+    sender: Sender<RemoteIndexBuildMessage>,
+) {
+    let identity = RemoteIndexIdentity::new(target.host.clone(), target.user.clone(), target.port);
+
+    let skipped_root_directories = vec![
+        "proc".to_string(),
+        "sys".to_string(),
+        "dev".to_string(),
+        "run".to_string(),
+    ];
+
+    let mut writer = match RemoteIndexWriter::create(
+        identity,
+        includes_hidden,
+        RemoteIndexScanMode::Total,
+        0,
+        skipped_root_directories,
+    ) {
+        Ok(writer) => writer,
+
+        Err(error) => {
+            let _ = sender.send(RemoteIndexBuildMessage::Failed {
+                message: format!("Unable to create the remote index: {}", error,),
+            });
+
+            return;
+        }
+    };
+
+    /*
+     * Index construction owns a separate SSH/SFTP connection.
+     *
+     * The primary source remains available for ordinary browsing throughout
+     * the complete build.
+     */
+    let (_, scanner_source) = match SftpSource::connect(&target, &ssh_config) {
+        Ok(connection) => connection,
+
+        Err(error) => {
+            let _ = sender.send(RemoteIndexBuildMessage::Failed {
+                message: format!(
+                    "Unable to start remote indexing through {}: {}",
+                    target.destination_label(),
+                    error,
+                ),
+            });
+
+            return;
+        }
+    };
+
+    let root = PathBuf::from("/");
+
+    let mut pending_directories = VecDeque::from([root.clone()]);
+
+    while let Some(directory) = pending_directories.pop_front() {
+        let entries = match scanner_source.read_remote_directory(&directory) {
+            Ok(entries) => entries,
+
+            Err(error) if directory == root => {
+                let _ = sender.send(RemoteIndexBuildMessage::Failed {
+                    message: format!("Unable to index remote root /: {}", error,),
+                });
+
+                return;
+            }
+
+            /*
+             * Permission-denied, disappearing, and inaccessible descendant
+             * directories are skipped without invalidating the complete
+             * accessible index.
+             */
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let mut cached_batch = Vec::with_capacity(entries.len());
+
+        for mut entry in entries {
+            if !includes_hidden && entry.name.starts_with('.') {
+                continue;
+            }
+
+            if should_skip_directory(&root, &entry.path, &entry.name) {
+                continue;
+            }
+
+            entry.relative_path = entry
+                .path
+                .strip_prefix(&root)
+                .unwrap_or(&entry.path)
+                .to_path_buf();
+
+            let searchable_path = entry.relative_path.to_string_lossy().to_lowercase();
+
+            entry.searchable_path = Arc::from(searchable_path);
+
+            entry.searchable_name = Arc::from(entry.name.to_lowercase());
+
+            if entry.is_directory && !entry.is_symlink {
+                pending_directories.push_back(entry.path.clone());
+            }
+
+            cached_batch.push(CachedRemoteEntry::from_file_entry(&entry));
+        }
+
+        if cached_batch.is_empty() {
+            continue;
+        }
+
+        if let Err(error) = writer.write_batch(&cached_batch) {
+            let _ = sender.send(RemoteIndexBuildMessage::Failed {
+                message: format!("Unable to write the remote index: {}", error,),
+            });
+
+            return;
+        }
+
+        if sender
+            .send(RemoteIndexBuildMessage::Progress {
+                entries_written: writer.entry_count(),
+            })
+            .is_err()
+        {
+            /*
+             * App was closed or disconnected.
+             *
+             * Dropping RemoteIndexWriter removes only the unfinished part file
+             * and preserves any older valid index.
+             */
+            return;
+        }
+    }
+
+    match writer.finish(false) {
+        Ok(info) => {
+            let _ = sender.send(RemoteIndexBuildMessage::Finished(info));
+        }
+
+        Err(error) => {
+            let _ = sender.send(RemoteIndexBuildMessage::Failed {
+                message: format!("Unable to complete the remote index: {}", error,),
+            });
+        }
+    }
+}
+
+fn start_remote_recursive_scan(
+    target: SshTarget,
+    ssh_config: SshConfig,
+    root: PathBuf,
+    show_hidden: bool,
+    generation: u64,
+    mode: RecursiveScanMode,
+) -> Receiver<ScanMessage> {
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+        scan_remote_directory_tree(
+            target,
+            ssh_config,
+            root,
+            show_hidden,
+            generation,
+            mode,
+            sender,
+        );
+    });
+
+    receiver
+}
+
+fn scan_remote_directory_tree(
+    target: SshTarget,
+    ssh_config: SshConfig,
+    root: PathBuf,
+    show_hidden: bool,
+    generation: u64,
+    mode: RecursiveScanMode,
+    sender: Sender<ScanMessage>,
+) {
+    /*
+     * Recursive scanning owns a completely separate SSH/SFTP connection.
+     *
+     * The primary source remains available to App for navigation, branch
+     * expansion, metadata queries, and file transfers.
+     */
+    let (_, scanner_source) = match SftpSource::connect(&target, &ssh_config) {
+        Ok(connection) => connection,
+
+        Err(error) => {
+            let _ = sender.send(ScanMessage::Failed {
+                generation,
+
+                message: format!(
+                    "Unable to start remote recursive search through {}: {}",
+                    target.destination_label(),
+                    error,
+                ),
+            });
+
+            return;
+        }
+    };
+
+    let mut pending_directories = VecDeque::from([root.clone()]);
+
+    let mut scanned_entries = 0_usize;
+
+    let mut batch = Vec::with_capacity(SCAN_BATCH_SIZE);
+
+    while let Some(directory) = pending_directories.pop_front() {
+        let entries = match scanner_source.read_remote_directory(&directory) {
+            Ok(entries) => entries,
+
+            Err(error) if directory == root => {
+                let _ = sender.send(ScanMessage::Failed {
+                    generation,
+
+                    message: format!(
+                        "Unable to search remote directory {}: {}",
+                        root.display(),
+                        error,
+                    ),
+                });
+
+                return;
+            }
+
+            /*
+             * Permission errors and disappearing subdirectories must not abort
+             * an otherwise valid recursive scan.
+             */
+            Err(_) => {
+                continue;
+            }
+        };
+
+        for mut entry in entries {
+            if !show_hidden && entry.name.starts_with('.') {
+                continue;
+            }
+
+            if should_skip_directory(&root, &entry.path, &entry.name) {
+                continue;
+            }
+
+            /*
+             * The ordinary remote directory reader describes entries relative
+             * to their immediate parent.
+             *
+             * Recursive searching instead needs every entry relative to the
+             * complete scan root.
+             */
+            entry.relative_path = entry
+                .path
+                .strip_prefix(&root)
+                .unwrap_or(&entry.path)
+                .to_path_buf();
+
+            let searchable_path = entry.relative_path.to_string_lossy().to_lowercase();
+
+            entry.searchable_path = Arc::from(searchable_path);
+
+            entry.searchable_name = Arc::from(entry.name.to_lowercase());
+
+            /*
+             * Do not follow directory symlinks. They remain visible as results,
+             * but traversing them could create remote filesystem loops.
+             */
+            if entry.is_directory && !entry.is_symlink {
+                pending_directories.push_back(entry.path.clone());
+            }
+
+            batch.push(entry);
+
+            scanned_entries = scanned_entries.saturating_add(1);
+
+            if mode == RecursiveScanMode::Fast && scanned_entries >= FAST_SCAN_ENTRY_LIMIT {
+                if !batch.is_empty()
+                    && send_remote_scan_batch(&sender, generation, &mut batch).is_err()
+                {
+                    return;
+                }
+
+                let _ = sender.send(ScanMessage::Finished {
+                    generation,
+
+                    partial: true,
+                });
+
+                return;
+            }
+
+            if batch.len() >= SCAN_BATCH_SIZE
+                && send_remote_scan_batch(&sender, generation, &mut batch).is_err()
+            {
+                /*
+                 * App discarded the receiver because the user changed roots,
+                 * disconnected, or began a newer scan.
+                 */
+                return;
+            }
+        }
+    }
+
+    if !batch.is_empty() && send_remote_scan_batch(&sender, generation, &mut batch).is_err() {
+        return;
+    }
+
+    let _ = sender.send(ScanMessage::Finished {
+        generation,
+
+        partial: false,
+    });
+}
+
+fn send_remote_scan_batch(
+    sender: &Sender<ScanMessage>,
+    generation: u64,
+    batch: &mut Vec<FileEntry>,
+) -> Result<(), mpsc::SendError<ScanMessage>> {
+    let entries = std::mem::replace(batch, Vec::with_capacity(SCAN_BATCH_SIZE));
+
+    sender.send(ScanMessage::Batch {
+        generation,
+
+        entries,
+    })
+}
+
 impl FileSource for SftpSource {
     fn read_directory(
         &mut self,
@@ -664,7 +1039,24 @@ impl FileSource for SftpSource {
     }
 
     fn supports_recursive_scan(&self) -> bool {
-        false
+        true
+    }
+
+    fn start_recursive_scan(
+        &mut self,
+        root: PathBuf,
+        show_hidden: bool,
+        generation: u64,
+        mode: RecursiveScanMode,
+    ) -> io::Result<Receiver<ScanMessage>> {
+        Ok(start_remote_recursive_scan(
+            self.target.clone(),
+            self.ssh_config,
+            root,
+            show_hidden,
+            generation,
+            mode,
+        ))
     }
 
     fn source_label(&self) -> String {
@@ -681,6 +1073,25 @@ impl FileSource for SftpSource {
 
     fn is_remote(&self) -> bool {
         true
+    }
+
+    fn remote_index_identity(&self) -> Option<RemoteIndexIdentity> {
+        Some(RemoteIndexIdentity::new(
+            self.target.host.clone(),
+            self.target.user.clone(),
+            self.target.port,
+        ))
+    }
+
+    fn start_remote_index_build(
+        &mut self,
+        includes_hidden: bool,
+    ) -> io::Result<Receiver<RemoteIndexBuildMessage>> {
+        Ok(start_remote_index_build(
+            self.target.clone(),
+            self.ssh_config,
+            includes_hidden,
+        ))
     }
 }
 

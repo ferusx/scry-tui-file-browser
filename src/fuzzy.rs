@@ -75,6 +75,7 @@ pub fn start_fuzzy_worker(
     query: String,
     generation: u64,
     show_hidden: bool,
+    scope_prefix: Option<String>,
     cancel_signal: Arc<AtomicBool>,
 ) -> Receiver<FuzzyWorkerResult> {
     let (sender, receiver) = mpsc::channel();
@@ -121,6 +122,18 @@ pub fn start_fuzzy_worker(
 
             if !show_hidden && record.searchable_name.starts_with('.') {
                 continue;
+            }
+
+            if let Some(scope_prefix) = scope_prefix.as_deref() {
+                if !scope_prefix.is_empty()
+                    && record.searchable_path.as_ref() != scope_prefix
+                    && !record
+                        .searchable_path
+                        .strip_prefix(scope_prefix)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                {
+                    continue;
+                }
             }
 
             /*
