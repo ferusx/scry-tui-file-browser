@@ -32,6 +32,7 @@ use crate::{
     classify::classify,
     config::SshConfig,
     entry::{EntryKind, EntryMetadata},
+    file_info::{DirectorySummary, FileInfo, FileInfoMessage, RemoteCacheInfo},
     remote_index::{
         CachedRemoteEntry, RemoteIndexBuildMessage, RemoteIndexIdentity, RemoteIndexScanMode,
         RemoteIndexWriter,
@@ -276,18 +277,18 @@ impl SftpSource {
                 SftpSourceError::Connection {
                     destination: destination.clone(),
 
-                    message: format!("{error:#?}"),
+                    message: error.to_string(),
                 }
             })?;
 
             session
                 .check()
                 .await
-                .map_err(|error| SftpSourceError::ConnectionCheck(format!("{error:#?}")))?;
+                .map_err(|error| SftpSourceError::ConnectionCheck(format!("{error:#}")))?;
 
             let sftp = Sftp::from_session(session, SftpOptions::default())
                 .await
-                .map_err(|error| SftpSourceError::SftpInitialization(format!("{error:#?}")))?;
+                .map_err(|error| SftpSourceError::SftpInitialization(format!("{error:#}")))?;
 
             let home_directory = {
                 let mut filesystem = sftp.fs();
@@ -295,7 +296,7 @@ impl SftpSource {
                 filesystem
                     .canonicalize(".")
                     .await
-                    .map_err(|error| SftpSourceError::RemotePath(format!("{error:#?}")))?
+                    .map_err(|error| SftpSourceError::RemotePath(format!("{error:#}")))?
             };
 
             Ok::<_, SftpSourceError>((home_directory, sftp))
@@ -400,6 +401,68 @@ impl SftpSource {
         write_cache_metadata(&metadata_path, remote_metadata)?;
 
         Ok(cache_path)
+    }
+
+    /*
+     * Download one remote file into an explicit local destination.
+     *
+     * Publication follows the same safety rules as Scry's cache:
+     *
+     * - create parent directories first;
+     * - stream into a private .scry-part file;
+     * - remove an abandoned part file from an earlier interrupted attempt;
+     * - validate the final byte count;
+     * - expose the destination only after the complete transfer succeeds.
+     */
+    fn download_remote_file_to(
+        &mut self,
+        remote_path: &Path,
+        destination_path: &Path,
+        progress: &mut dyn FnMut(TransferProgress) -> io::Result<TransferControl>,
+    ) -> io::Result<PathBuf> {
+        let parent = destination_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "download destination has no parent directory: {}",
+                    destination_path.display(),
+                ),
+            )
+        })?;
+
+        fs::create_dir_all(parent)?;
+
+        let part_path = cache_part_path(destination_path);
+
+        /*
+         * A stale part file is never a valid completed download.
+         */
+        remove_file_if_present(&part_path)?;
+
+        let remote_metadata = self.remote_cache_metadata(remote_path)?;
+
+        let download_result = self.stream_remote_file_to_part(
+            remote_path,
+            &part_path,
+            remote_metadata.size_bytes,
+            progress,
+        );
+
+        if let Err(error) = download_result {
+            let _ = fs::remove_file(&part_path);
+
+            return Err(error);
+        }
+
+        /*
+         * The timestamped batch directory should ordinarily be new and empty.
+         *
+         * Atomic replacement still protects against an interrupted retry or an
+         * externally created destination appearing while the batch is running.
+         */
+        replace_file_atomically(&part_path, destination_path)?;
+
+        Ok(destination_path.to_path_buf())
     }
 
     fn remote_cache_metadata(&self, remote_path: &Path) -> io::Result<RemoteCacheMetadata> {
@@ -574,23 +637,7 @@ impl SftpSource {
     }
 
     fn cache_path_for(&self, remote_path: &Path) -> io::Result<PathBuf> {
-        let filename = remote_path
-            .file_name()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("remote path has no filename: {}", remote_path.display(),),
-                )
-            })?
-            .to_string_lossy();
-
-        let filename = sanitize_cache_filename(&filename);
-
-        let path_hash = stable_path_hash(remote_path);
-
-        Ok(scry_remote_cache_root()?
-            .join(&self.cache_namespace)
-            .join(format!("{path_hash:016x}__{filename}",)))
+        cache_path_for_namespace(&self.cache_namespace, remote_path)
     }
 
     fn read_remote_directory(&self, directory: &Path) -> io::Result<Vec<FileEntry>> {
@@ -664,6 +711,224 @@ impl SftpSource {
                 .is_some_and(|file_type| file_type.is_dir()))
         })
     }
+}
+
+fn cache_path_for_namespace(cache_namespace: &str, remote_path: &Path) -> io::Result<PathBuf> {
+    let filename = remote_path
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("remote path has no filename: {}", remote_path.display(),),
+            )
+        })?
+        .to_string_lossy();
+
+    let filename = sanitize_cache_filename(&filename);
+
+    let path_hash = stable_path_hash(remote_path);
+
+    Ok(scry_remote_cache_root()?
+        .join(cache_namespace)
+        .join(format!("{path_hash:016x}__{filename}",)))
+}
+
+fn start_remote_file_info(
+    target: SshTarget,
+    ssh_config: SshConfig,
+    cache_namespace: String,
+    initial_info: FileInfo,
+    generation: u64,
+) -> Receiver<FileInfoMessage> {
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+        let path = initial_info.path.clone();
+
+        let result = collect_remote_file_info(target, ssh_config, cache_namespace, initial_info);
+
+        let message = match result {
+            Ok(info) => FileInfoMessage::Finished { generation, info },
+
+            Err(error) => FileInfoMessage::Failed {
+                generation,
+
+                message: format!(
+                    "Unable to inspect remote entry {}: {}",
+                    path.display(),
+                    error,
+                ),
+            },
+        };
+
+        let _ = sender.send(message);
+    });
+
+    receiver
+}
+
+fn collect_remote_file_info(
+    target: SshTarget,
+    ssh_config: SshConfig,
+    cache_namespace: String,
+    mut info: FileInfo,
+) -> io::Result<FileInfo> {
+    /*
+     * The worker owns this source completely.
+     *
+     * The primary SFTP source remains installed in App and continues to own the
+     * browsing session.
+     */
+    let (_, source) = SftpSource::connect(&target, &ssh_config)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+
+    let remote_metadata = source.runtime.block_on(async {
+        let mut filesystem = source.sftp.fs();
+
+        filesystem.metadata(&info.path).await.map_err(sftp_io_error)
+    })?;
+
+    info.kind = remote_entry_kind(remote_metadata.file_type());
+
+    info.size_bytes = remote_metadata.len().unwrap_or(info.size_bytes);
+
+    info.permissions_mode = Some(remote_permissions_mode(remote_metadata.permissions()));
+
+    info.owner_id = remote_metadata.uid();
+
+    info.group_id = remote_metadata.gid();
+
+    /*
+     * SFTP supplies numeric ownership but ordinarily does not resolve remote
+     * account and group names.
+     *
+     * Do not resolve these through the local machine's user database because
+     * UID 1000 locally may represent a completely different person remotely.
+     */
+    info.owner_name = None;
+
+    info.group_name = None;
+
+    info.modified_time = remote_metadata.modified().map(|time| time.as_system_time());
+
+    /*
+     * The SFTP metadata exposed by the current source does not reliably provide
+     * access or birth time.
+     */
+    info.accessed_time = None;
+
+    info.created_time = None;
+
+    if info.kind == EntryKind::Directory {
+        match summarize_remote_directory(&source, &info.path) {
+            Ok(summary) => {
+                info.directory_summary = Some(summary);
+            }
+
+            Err(error) => {
+                info.notes.push(format!(
+                    "Unable to count immediate remote directory contents: {}",
+                    error,
+                ));
+            }
+        }
+    }
+
+    /*
+     * Symlink target inspection is intentionally left unavailable when the
+     * server does not expose a reliable link-target operation through the
+     * current SFTP abstraction.
+     */
+    if info.kind == EntryKind::Symlink {
+        info.notes
+            .push("The remote symlink target was not reported by the SFTP source".to_string());
+    }
+
+    info.cache_info = Some(remote_cache_info(
+        &cache_namespace,
+        &info.path,
+        info.size_bytes,
+        info.modified_time,
+    )?);
+
+    Ok(info)
+}
+
+fn summarize_remote_directory(source: &SftpSource, path: &Path) -> io::Result<DirectorySummary> {
+    let entries = source.read_remote_directory(path)?;
+
+    let mut summary = DirectorySummary::default();
+
+    for entry in entries {
+        summary.total = summary.total.saturating_add(1);
+
+        if entry.is_symlink {
+            summary.symlinks = summary.symlinks.saturating_add(1);
+        } else if entry.is_directory {
+            summary.directories = summary.directories.saturating_add(1);
+        } else {
+            summary.files = summary.files.saturating_add(1);
+        }
+    }
+
+    Ok(summary)
+}
+
+fn remote_cache_info(
+    cache_namespace: &str,
+    remote_path: &Path,
+    remote_size_bytes: u64,
+    remote_modified_time: Option<SystemTime>,
+) -> io::Result<RemoteCacheInfo> {
+    let cache_path = cache_path_for_namespace(cache_namespace, remote_path)?;
+
+    let metadata_path = cache_metadata_path(&cache_path);
+
+    let cached_metadata = match fs::metadata(&cache_path) {
+        Ok(metadata) if metadata.is_file() => Some(metadata),
+
+        Ok(_) => None,
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+
+        Err(error) => {
+            return Err(error);
+        }
+    };
+
+    let cached_copy_exists = cached_metadata.is_some();
+
+    let cached_size_bytes = cached_metadata.as_ref().map(fs::Metadata::len);
+
+    let (modified_seconds, modified_nanoseconds) = system_time_parts(remote_modified_time);
+
+    let remote_metadata = RemoteCacheMetadata {
+        size_bytes: remote_size_bytes,
+
+        modified_seconds,
+
+        modified_nanoseconds,
+    };
+
+    let cached_copy_current = if cached_copy_exists {
+        Some(cached_file_is_current(
+            &cache_path,
+            &metadata_path,
+            remote_metadata,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(RemoteCacheInfo {
+        cache_path,
+
+        cached_copy_exists,
+
+        cached_copy_current,
+
+        cached_size_bytes,
+    })
 }
 
 fn start_remote_index_build(
@@ -1038,6 +1303,20 @@ impl FileSource for SftpSource {
         self.remote_path_is_directory(path)
     }
 
+    fn start_file_info(
+        &mut self,
+        initial_info: FileInfo,
+        generation: u64,
+    ) -> io::Result<Receiver<FileInfoMessage>> {
+        Ok(start_remote_file_info(
+            self.target.clone(),
+            self.ssh_config,
+            self.cache_namespace.clone(),
+            initial_info,
+            generation,
+        ))
+    }
+
     fn supports_recursive_scan(&self) -> bool {
         true
     }
@@ -1069,6 +1348,15 @@ impl FileSource for SftpSource {
         progress: &mut dyn FnMut(TransferProgress) -> io::Result<TransferControl>,
     ) -> io::Result<PathBuf> {
         self.materialize_remote_file(path, progress)
+    }
+
+    fn download_file_to(
+        &mut self,
+        source_path: &Path,
+        destination_path: &Path,
+        progress: &mut dyn FnMut(TransferProgress) -> io::Result<TransferControl>,
+    ) -> io::Result<PathBuf> {
+        self.download_remote_file_to(source_path, destination_path, progress)
     }
 
     fn is_remote(&self) -> bool {
@@ -1503,7 +1791,7 @@ fn make_cached_file_non_executable(_path: &Path) -> io::Result<()> {
 }
 
 fn sftp_io_error(error: openssh_sftp_client::Error) -> io::Error {
-    io::Error::other(format!("{error:#?}"))
+    io::Error::other(format!("{error:#}"))
 }
 
 impl fmt::Display for SshTargetError {

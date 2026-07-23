@@ -1,90 +1,182 @@
 # Scry TUI File Browser
 
-**Scry** is a fast, richly featured terminal file browser and recursive finder
-written in Rust. It combines live Exact and Fuzzy searching, List and Tree
-navigation, detailed file classification, configurable metadata, mouse support,
-SSH/SFTP browsing, and persistent remote indexes inside a polished terminal
+> **Project status: unreleased**
+>
+> Scry is under active development and has not yet published a stable release.
+> Interfaces, configuration fields, shortcuts, and stored data formats may still
+> change before the first release.
+
+**Scry** is a fast, richly featured terminal file browser, recursive finder, and
+SSH/SFTP filesystem explorer written in Rust. It combines responsive List and
+Tree navigation, Exact and Fuzzy searching, a structured Boolean query language,
+detailed metadata inspection, configurable presentation, persistent sessions,
+remote indexing, and safe file-transfer workflows inside a polished terminal
 interface.
 
 > Scrying through files, locally or across the network.
 
 ## Features
 
+### Browsing and interface
+
 - Fast local filesystem browsing
 - Remote filesystem browsing through SSH and SFTP
 - List and expandable Tree views
-- Exact, Fuzzy, Recursive, and Fuzzy+Recursive searching
-- Live filtering of filenames and complete paths
-- Rich query modifiers using `type:`, `ext:`, `+`, and `-`
-- Broad source-language and file-category classification
-- Persistent SSH indexes for fast remote recursive searching
-- Background remote index construction with Standard and Include Hidden policies
-- Sorting by name, size, modification date, or type
-- Reversible sort direction
-- Colored Unix permission display
-- File size, owner, date, type, age, permissions, and full-path details
+- Keyboard-first navigation with extensive mouse support
 - Foldable Details, Selection, and Metadata panels
 - Independently toggleable Permissions, Size, Date, and User columns
+- Adaptive metadata widths
 - Optional file and directory icons
-- Saved SSH connection profiles
-- Remote file transfers with byte counts, percentage, elapsed time, speed, caching, and safe partial files
-- Local file opening through terminal programs or desktop-default applications
-- Optional local deletion with confirmation and path-safety checks
-- Mouse selection, wheel scrolling, double-click activation, middle-click navigation, and draggable scrollbars
-- Configurable startup behavior through `scry.toml`
 - Configurable themes with safe built-in fallbacks
-- Built-in Help, Shortcut Legend, and About windows
 - Compact contextual footer hints
+- Timed information and error notifications
+- Built-in Help, Shortcut Legend, About, and File Information windows
+
+### Search and classification
+
+- Exact, Fuzzy, Recursive, and Fuzzy+Recursive searching
+- Live filtering of filenames and complete paths
+- Background local recursive scans with progressive results
+- Bounded best-match ranking for large Fuzzy result sets
+- Query modifiers using `type:`, `ext:`, `+`, and `-`
+- Boolean expressions using `AND`, `OR`, `NOT`, and parentheses
+- Case-sensitive text operands through `type:sensitive`
+- Parser-backed in-app reference containing every supported `type:` value and alias
+- Broad source-language and file-category classification
+- Query match highlighting across multiple terms
+- Files-only and directories-only result filtering
+
+### SSH and remote workflows
+
+- OpenSSH-backed remote connections
+- Saved SSH connection profiles
+- Support for usernames, custom ports, identity files, and starting directories
+- Persistent remote indexes for fast recursive searching
+- Standard and Include Hidden remote-index policies
+- Background index construction with progress reporting
+- Private local caching for opened remote files
+- Safe `.scry-part` temporary files and byte-count validation
+- Transfer progress with bytes, percentage, elapsed time, and speed
+- SSH-only multi-file marking with persistent marks
+- Batch downloads with aggregate progress and completion summaries
+- Flat batch-download layout by default
+- Optional remote hierarchy preservation with `--preserve-hierarchy`
+- Safe duplicate-name disambiguation during flattened downloads
+
+### Files, sessions, and configuration
+
+- Detailed File Information window with extended metadata
+- Local file opening through terminal programs or desktop-default applications
+- Optional keep-open or exit-after-open behavior
+- Optional local deletion with confirmation and path-safety checks
+- Persistent local and SSH session restoration
+- Restored directories, selection, viewport, query, modes, panels, sorting, and SSH marks
+- Configurable startup behavior through `scry.toml`
+- Documented configuration generation with `--generate-config`
+- Concise external help through `--help`
+- Complete printable manual through `--manual`
 - Linux and FreeBSD support
 
 ## Screenshots
 
 ### Local browsing
 
+Scry presents filesystem entries alongside adaptive metadata columns, detailed
+selection information, optional file icons, sorting state, and contextual
+controls.
+
 <p align="center">
-  <img src="screenshots/scry1_.png" alt="Scry local browser with Details visible and metadata hidden" width="49%">
-  <img src="screenshots/scry2.png" alt="Scry local browser with metadata and Selection visible" width="49%">
+  <img src="screenshots/scry-local-browser.png" alt="Scry browsing Rust source files in local List mode with permissions, size, date, owner, Details, and Selection panels" width="95%">
 </p>
 
-### Tree view
+### Tree view and themes
+
+Tree mode displays expandable filesystem branches while preserving the Details,
+Metadata, and Selection panels. Scry's complete interface may also be recolored
+through custom themes.
 
 <p align="center">
-  <img src="screenshots/scry3_.png" alt="Scry Tree view with metadata and Details pane" width="95%">
+  <img src="screenshots/scry-tree-themed.png" alt="Scry displaying an expanded Android SDK directory tree with a blue custom theme" width="95%">
 </p>
 
-### SSH browsing
+### Fuzzy and recursive searching
+
+Fuzzy+Recursive mode searches complete directory trees while ranking the most
+useful approximate matches.
 
 <p align="center">
-  <img src="screenshots/scry4_.png" alt="Scry SSH connection manager" width="95%">
+  <img src="screenshots/scry-fuzzy-recursive.png" alt="Scry performing a Fuzzy and Recursive search in the Downloads directory" width="95%">
 </p>
 
+### Structured query modifiers
+
+Query modifiers may restrict results by classification and extension while
+working naturally inside Tree mode.
+
 <p align="center">
-  <img src="screenshots/scry5_.png" alt="Scry browsing a remote filesystem over SSH" width="95%">
+  <img src="screenshots/scry-type-extension-tree.png" alt="Scry Tree mode filtered by the query type:source ext:sh" width="95%">
 </p>
 
-### Shortcuts and About
+### Boolean query language
+
+Advanced searches support `AND`, `OR`, `NOT`, parentheses, compact modifiers,
+and case-sensitive text operands.
 
 <p align="center">
-  <img src="screenshots/scry6.png" alt="Scry shortcuts window" width="49%">
-  <img src="screenshots/scry7.png" alt="About Scry window" width="49%">
+  <img src="screenshots/scry-boolean-search.png" alt="Scry displaying Recursive Tree results for a Boolean source-code query" width="95%">
 </p>
 
-### Scry themed up
+### Complete query reference
+
+The in-app Shortcut Legend includes every supported query form, every accepted
+`type:` value, and all aliases. The reference is generated from the same
+definitions used by the parser.
 
 <p align="center">
-  <img src="screenshots/scry8.png" alt="Fuzzy search mode" width="49%">
-  <img src="screenshots/scry9.png" alt="Fuzzy search over SSH" width="49%">
+  <img src="screenshots/scry-query-reference.png" alt="Scry Shortcut Legend showing query modifiers and accepted type values" width="95%">
 </p>
 
-### Deletion support
+### File Information
+
+The File Information window provides extended identity, filesystem, timestamp,
+status, ownership, permission, and source metadata without leaving the browser.
 
 <p align="center">
-  <img src="screenshots/scry10.png" alt="Delete dialog" width="95%">
+  <img src="screenshots/scry-file-information.png" alt="Scry File Information window showing detailed metadata for a local HTML file" width="95%">
+</p>
+
+### Safe deletion
+
+Local deletion is optional and disabled by default. When enabled, Scry presents
+a confirmation dialog containing the selected entry's name and full path.
+
+<p align="center">
+  <img src="screenshots/scry-delete-dialog.png" alt="Scry confirmation dialog for deleting a selected local file" width="95%">
+</p>
+
+### SSH batch downloads
+
+Marked remote files may be downloaded together. The final summary reports the
+file count, destination, transferred bytes, elapsed time, average speed, and
+overall result.
+
+<p align="center">
+  <img src="screenshots/scry-batch-download.png" alt="Scry SSH batch-download completion window showing eleven successfully downloaded files" width="95%">
+</p>
+
+### Built-in Help
+
+The scrollable Help window explains Scry's interface, navigation, searching,
+remote workflows, file operations, sessions, and configuration in detail.
+
+<p align="center">
+  <img src="screenshots/scry-help.png" alt="Scry Help window displaying the interface documentation" width="95%">
 </p>
 
 ## Building
 
-Scry requires a recent Rust toolchain.
+Scry currently has no published release package. Build it directly from the
+source repository with a recent stable Rust toolchain:
 
 ```sh
 git clone https://github.com/ferusx/scry-tui-file-browser.git
@@ -92,7 +184,7 @@ cd scry-tui-file-browser
 cargo build --release
 ```
 
-The compiled binary will be available at:
+The optimized binary will be available at:
 
 ```text
 target/release/scry
@@ -110,17 +202,31 @@ Or install it into Cargo's binary directory:
 cargo install --path .
 ```
 
+During development, the debug binary can be built and run with:
+
+```sh
+cargo build
+target/debug/scry
+```
+
 ### Icon font
 
-Scry's optional file-type icons use Nerd Font glyphs. For the intended appearance, configure your terminal emulator to use a [Nerd Font](https://www.nerdfonts.com/)-compatible font.
+Scry's optional file and directory icons use Nerd Font glyphs. For the intended
+appearance, configure the terminal emulator to use a
+[Nerd Font](https://www.nerdfonts.com/)-compatible font.
 
-Icons can be enabled or disabled at runtime with `F3`. Scry remains fully usable without them.
+Icons may be enabled or disabled at runtime with `F3` and through
+`show_icons` in `scry.toml`. Scry remains fully usable without icon support.
 
 ## Usage
 
 ```text
 scry [OPTIONS] [PATH]
 ```
+
+`PATH` selects the local or remote starting location. Without a path, local
+browsing begins in the process's current directory. With `--ssh`, an omitted
+path or `.` opens the remote account's home directory.
 
 Examples:
 
@@ -134,50 +240,116 @@ scry ~/Projects
 # Start in Tree mode with permissions and sizes
 scry -T -p -s ~/Projects
 
-# Start with a recursive listing
-scry -r ~
+# Start with a recursive Exact listing
+scry --recursive ~
+
+# Start with Fuzzy and Recursive search enabled
+scry --recursive --fuzzy ~
+
+# Start with a prepared query
+scry --recursive --query "type:source index -target" ~/Projects
+
+# Restrict startup results to files and symbolic links
+scry --files-only ~/Downloads
+
+# Restrict startup results to directories
+scry --dirs-only ~/Projects
 
 # Browse a remote host through SSH/SFTP
 scry --ssh user@example-host
+
+# Browse a specific remote directory
+scry --ssh user@example-host /var/log
+
+# Restore the most recently saved session
+scry --restore-session
+
+# Preserve remote paths during marked batch downloads
+scry --ssh user@example-host --preserve-hierarchy
+
+# Print concise command-line help
+scry --help
+
+# Print the complete explanatory manual
+scry --manual
+
+# Generate a documented configuration template
+scry --generate-config
+```
+
+## Help and manual
+
+Scry provides three complementary documentation routes:
+
+- `scry --help` prints a concise command-line reference and startup examples.
+- `scry --manual` prints the complete explanatory manual used by the F1 Help
+  window. Its output is suitable for pagers, redirection, and text editors.
+- `Ctrl+!` opens the in-app Shortcut Legend, including the complete query
+  modifier and `type:` alias reference.
+
+Examples:
+
+```sh
+scry --manual | less
+scry --manual > scry-manual.txt
+scry --manual | bat
 ```
 
 ## Searching
 
-Type directly into Scry's Search field to begin filtering. Queries update live,
-and may match both filenames and paths. Searching is case-insensitive by default.
+Typing directly into the Search field begins filtering immediately. Queries may
+match filenames or complete relative paths.
 
 Scry provides four closely related search modes:
 
-- **Exact** filters the current directory using literal text matching.
+- **Exact** filters the active directory using literal text matching.
 - **Fuzzy** ranks approximate filename and path-component matches.
-- **Recursive** searches all descendants beneath the active directory.
+- **Recursive** searches all descendants beneath the active root.
 - **Fuzzy+Recursive** combines recursive scope with fuzzy relevance ranking.
 
-Press `Ctrl+F` to switch between Exact and Fuzzy matching. Press `Alt+R` to
-enable or disable recursive scope.
+Switch between Exact and Fuzzy matching with `Ctrl+F`. Toggle recursive scope
+with `Alt+R`.
 
-Exact searching treats multiple ordinary words as one text phrase. Fuzzy
-searching supports exact matches, prefixes, substrings, compact abbreviations,
-missing characters, small typing mistakes, and adjacent transpositions. For
-example, both `hlp` and `hlep` may locate `help`.
+Exact searching treats multiple ordinary unsigned words as one phrase. Fuzzy
+searching recognizes exact matches, prefixes, substrings, compact
+abbreviations, missing characters, small typing mistakes, and adjacent
+transpositions. For example, both `hlp` and `hlep` may locate `help`.
 
-Local recursive scans run in the background and publish results progressively.
-Fuzzy searches retain only the strongest 500 ranked matches, keeping the
-interface responsive even when the underlying tree is very large. Fuzzy results
-are ordered by relevance rather than by the selected ordinary sort mode.
+Local recursive scans run in the background and publish Exact results
+progressively. Fuzzy searches retain the strongest 500 ranked matches, keeping
+the interface responsive even when the underlying corpus contains hundreds of
+thousands or millions of entries.
 
-The visible query caret can be moved with `Ctrl+Left` and `Ctrl+Right`, sent to
-the beginning or end with `Ctrl+Home` and `Ctrl+End`, and cleared together with
-the complete query using `Ctrl+U`.
+Recursive Tree mode retains a bounded Exact result set for safe hierarchy
+construction, while ordinary Exact List mode remains unlimited.
 
-## Query modifiers
+The query caret may be moved with `Ctrl+Left` and `Ctrl+Right`, sent to the
+beginning or end with `Ctrl+Home` and `Ctrl+End`, and cleared together with the
+complete query using `Ctrl+U`.
 
-Scry's query language can combine ordinary text with classifications,
-extensions, required terms, and exclusions.
+## Query language
+
+Scry supports both a compact query syntax and advanced Boolean expressions.
+
+Open the in-app Shortcut Legend with `Ctrl+!` for the complete parser-backed
+reference containing every supported query form, every accepted `type:` value,
+and all aliases.
+
+### Ordinary text
+
+Ordinary text matches filenames and paths:
+
+```text
+wallpaper
+source index
+/etc
+```
+
+Searching is case-insensitive by default.
 
 ### Type modifiers
 
-Use `type:` to restrict results by file classification:
+Use `type:` to restrict results by classification:
 
 ```text
 type:directory
@@ -187,11 +359,11 @@ type:asm
 type:image
 ```
 
-General categories such as `source`, `document`, `archive`, `image`, `audio`,
-`video`, `config`, and `database` are supported alongside dedicated programming
-language classifications.
+The full list includes filesystem kinds, programming languages, source and
+build files, archives, packages, documents, media, databases, certificates,
+disk images, plugins, text, binary, and unknown files.
 
-A type modifier may be combined with ordinary text:
+Type filters may be combined with ordinary text:
 
 ```text
 type:source index
@@ -201,7 +373,7 @@ type:image wallpaper
 
 ### Extension modifiers
 
-Use `ext:` when the actual extension must match:
+Use `ext:` when the actual file extension must match:
 
 ```text
 ext:jpg
@@ -214,7 +386,7 @@ match arbitrary occurrences elsewhere in the path.
 
 ### Required and excluded terms
 
-Prefix a term with `+` to require it, or with `-` to exclude it:
+Prefix a term with `+` to require it or `-` to exclude it:
 
 ```text
 +python
@@ -229,42 +401,124 @@ Signed terms are resolved in this order:
 2. known file extension;
 3. ordinary filename or path text.
 
-Every positive term must match. A match against any negative term excludes the
-entry.
+Positive classification and extension terms form an accepted-type group, while
+positive ordinary text terms remain cumulative. Any matching negative term
+excludes the entry.
 
-Modifiers and ordinary text may be combined:
+Examples:
 
 ```text
 type:source +rust -target parser
 ext:jpg -.cache holiday
++python +lua
+-index -test
 ```
 
-### Pending modifiers
+### Boolean expressions
+
+Advanced searches may use `AND`, `OR`, `NOT`, and parentheses:
+
+```text
+rust AND test
+rust OR python
+type:source AND NOT target
+(rust OR python) AND test
+```
+
+Operators are case-insensitive, although uppercase makes longer expressions
+easier to read.
+
+Boolean precedence is:
+
+1. `NOT`
+2. `AND`
+3. `OR`
+
+Therefore:
+
+```text
+rust OR python AND test
+```
+
+is interpreted as:
+
+```text
+rust OR (python AND test)
+```
+
+Parentheses override the default precedence.
+
+Compact operands remain valid inside Boolean expressions:
+
+```text
+type:source AND (rust OR cpp)
+ext:jpg AND NOT .cache
++rs OR +cpp
+rs AND -test
+```
+
+### Case-sensitive operands
+
+Use `type:sensitive` to make later textual operands case-sensitive:
+
+```text
+type:sensitive README
+rust OR type:sensitive Makefile
+```
+
+The directive affects textual operands appearing after it. Type and extension
+classifications remain normalized.
+
+### Pending modifiers and incomplete expressions
 
 A trailing `+`, `-`, `type:`, or `ext:` term remains pending while it is being
-typed and does not repeatedly disturb the current result set. Press `Space` to
-begin another term, or `Enter` to commit the pending modifier.
+typed and does not repeatedly disturb the current result set.
 
-The first `Enter` commits a pending modifier. A subsequent `Enter` performs the
-normal action on the selected entry.
+Modifiers and Boolean expressions are evaluated live as they are typed. Incomplete
+forms remain harmless until they become valid. `Enter` is reserved for activating
+the selected entry.
+
+Incomplete Boolean expressions such as these are harmless during live typing:
+
+```text
+rust OR
+(
+NOT
+```
+
+They begin filtering only after they form a valid expression.
 
 ## Command-line options
 
 | Option | Description |
 |---|---|
-| `-h`, `--help` | Print help information |
+| `-h`, `--help` | Print concise command-line help |
+| `--manual` | Print the complete Scry manual |
 | `-V`, `--version` | Print the Scry version |
+| `--generate-config` | Generate `scry.toml.generated` and exit |
+| `--restore-session` | Restore the most recently saved browser session |
 | `--ssh TARGET` | Browse a remote computer through SSH/SFTP |
+| `--preserve-hierarchy` | Preserve remote paths during marked batch downloads |
 | `-a`, `--all` | Show hidden files and directories |
 | `-r`, `--recursive` | Start with a recursive listing |
+| `--fuzzy` | Start in Fuzzy search mode |
+| `--query TEXT` | Start with `TEXT` in the Search field |
+| `--files-only` | Show files and symbolic links only |
+| `--dirs-only` | Show directories only |
 | `-T`, `--tree` | Start in Tree mode |
-| `-p`, `--permissions` | Show the permissions column |
-| `-s`, `--size` | Show the file-size column |
-| `-d`, `--date` | Show the modification-date column |
-| `-u`, `--user` | Show the owner column |
+| `--no-open` | Do not open selected files externally |
+| `--exit-on-open` | Exit after successfully opening a file |
+| `-p`, `--permissions` | Show the Permissions column |
+| `-s`, `--size` | Show the Size column |
+| `-d`, `--date` | Show the Date column |
+| `-u`, `--user` | Show the User column |
 
-Command-line options override corresponding startup values from `scry.toml`.
-Run `scry --help` for the complete built-in command-line reference.
+`--files-only` and `--dirs-only` are mutually exclusive.
+
+`--no-open` and `--exit-on-open` are mutually exclusive.
+
+Command-line options override corresponding values from `scry.toml` and restored
+session state for the current launch.
 
 ## Keyboard and mouse
 
@@ -305,7 +559,7 @@ Some important controls:
 | `Ctrl+C` | Exit |
 
 Mouse support includes wheel scrolling, left-click selection, double-click
-activation, middle-click parent or collapse behavior, clickable controls where
+activation, middle-click paste clipboard, clickable controls where
 available, and draggable scrollbars.
 
 ## SSH and remote files
@@ -355,7 +609,7 @@ The Remote Index Builder may also be opened manually with `F5`.
 Two indexing policies are available:
 
 - **Standard** records ordinary files and directories.
-- **Include Hidden** also records entries whose names begin with a dot.
+- **Include dot-entries** also records entries whose names begin with a dot.
 
 Index construction runs independently in the background while Scry remains
 available for browsing. Progress is reported as entries are written. The
@@ -371,7 +625,7 @@ necessary to record newly introduced language and file classifications.
 
 ## Opening files
 
-Directories are entered directly. Executable files are launched in a terminal,
+Directories are entered directly by pressing `Enter` or the `right` arrow key. Executable files are launched in a terminal,
 while ordinary files are opened through the desktop's default application. Text
 files may fall back to a terminal editor when no suitable desktop opener is
 available.
@@ -429,26 +683,32 @@ theme = "default"
 
 [display]
 show_hidden = false
+show_icons = true
 show_details = true
 show_selection = true
 show_columns = true
 show_permissions = false
-show_size = false
-show_date = false
+show_size = true
+show_date = true
 show_user = false
 
 [browser]
 view = "list"
 recursive = false
+fuzzy = false
 sort = "name"
 reverse = false
+entry_filter = "all"
 
 [features]
-enable_deletion = false
+enable_deletion = true
+allow_file_opening = true
+exit_on_open = false
 
 [ssh]
 connect_timeout_seconds = 10
 server_alive_interval_seconds = 15
+preserve_hierarchy = false
 ```
 
 ## Themes
@@ -460,7 +720,7 @@ scrollbars, and other interface elements.
 
 Missing themes, malformed files, absent color groups, and invalid individual
 color values fall back safely to Scry's built-in palette. A broken theme cannot
-prevent the application from starting.
+prevent the application from starting. In such an event, the application will start with the default theme loaded.
 
 ## Platform support
 
@@ -489,7 +749,7 @@ Scry is under active development. The following major systems are functional:
 
 Current refinement work is focused on further Tree-mode performance, adaptive
 presentation, search highlighting, notification behavior, and additional
-quality-of-life controls.
+quality-of-life controls. Every feature covered in this file is currently working or otherwise clearly stated as not-yet-implemented.
 
 ## Acknowledgements
 

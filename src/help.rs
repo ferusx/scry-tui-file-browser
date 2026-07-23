@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+use std::io::{self, Write};
+
 use ratatui::{
     style::{Modifier, Style},
     text::Line,
@@ -10,12 +12,12 @@ use crate::themes::Theme;
 pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    push_paragraph(
+    push_intro_paragraph(
         &mut lines,
         "Scry is a fast terminal file browser for exploring local and remote \
-        filesystems. It combines live searching with List and Tree views, detailed \
-        metadata inspection, file opening and optional deletion, and SSH browsing \
-        backed by persistent remote indexes for fast recursive searches.",
+    filesystems. It combines live searching with List and Tree views, detailed \
+    metadata inspection, file opening and optional deletion, and SSH browsing \
+    backed by persistent remote indexes for fast recursive searches.",
         text_width,
         theme,
     );
@@ -27,11 +29,12 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "The Search field is always ready for input. Typing begins filtering or \
-        searching immediately, while the current mode is shown in brackets beside \
-        the field. The visible caret may be moved one character at a time \
-        (Ctrl+Left and Ctrl+Right), sent to the beginning or end of the query \
-        (Ctrl+Home and Ctrl+End), or cleared together with the complete query \
-        (Ctrl+U).",
+    searching immediately, while the current mode is shown in brackets beside \
+    the field. Backspace deletes the character before the caret and never changes \
+    the active directory. The visible caret may be moved one character at a time \
+    (Ctrl+Left and Ctrl+Right), sent to the beginning or end of the query \
+    (Ctrl+Home and Ctrl+End), or cleared together with the complete query \
+    (Ctrl+U).",
         text_width,
         theme,
     );
@@ -219,6 +222,20 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         theme,
     );
 
+    push_section(&mut lines, "Query-language Reference", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The sections below explain Scry's compact modifiers and Boolean query \
+    language in detail. Open the Shortcut Legend with Ctrl+! for a complete \
+    quick-reference list of every query form, every accepted type: value, and \
+    all supported aliases. That reference is generated from the same definitions \
+    used by the query parser, so the documented values remain synchronized with \
+    the search engine.",
+        text_width,
+        theme,
+    );
+
     push_section(&mut lines, "Type Modifiers", theme);
 
     push_paragraph(
@@ -257,6 +274,50 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         requires the .jpg extension, and \"-.cache\" rejects paths containing \
         .cache. Every positive term must match, while a match against any negative \
         term removes the entry.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Boolean Expressions", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Advanced searches may combine operands with the word operators AND, OR, and \
+    NOT. Operators are recognized without regard to capitalization, but writing \
+    them in uppercase makes longer expressions easier to read. Parentheses may be \
+    used to group related terms. For example, \"rust AND test\" requires both \
+    operands, \"rust OR python\" accepts either, and \
+    \"type:source AND NOT target\" finds source files whose paths do not match \
+    target.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Boolean Precedence", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Boolean expressions follow the precedence order NOT, then AND, then OR. Thus \
+    \"rust OR python AND test\" is interpreted as \
+    \"rust OR (python AND test)\". Parentheses may be added whenever another \
+    grouping is intended, such as \"(rust OR python) AND test\". Incomplete live \
+    expressions remain harmless while they are being typed and begin filtering \
+    only after they form a valid expression.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Case-sensitive Searching", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Searching is case-insensitive by default. The directive type:sensitive makes \
+    textual operands appearing after it case-sensitive for the remainder of the \
+    query. For example, \"type:sensitive README\" distinguishes README from \
+    readme, while \"rust OR type:sensitive Makefile\" keeps the earlier rust \
+    operand insensitive and applies exact capitalization to Makefile. Type and \
+    extension classifications themselves remain normalized rather than becoming \
+    case-sensitive.",
         text_width,
         theme,
     );
@@ -318,16 +379,55 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         theme,
     );
 
+    push_section(&mut lines, "Marking Files", theme);
+
+    push_paragraph(
+        &mut lines,
+        "While browsing through SSH, files may be marked for a later batch download \
+    with Ctrl+Space. Pressing Ctrl+Space again on an already marked file removes \
+    its mark. Marks are independent from the ordinary highlighted row and remain \
+    attached to their full paths while the user filters results, changes \
+    directories, switches between List and Tree views, or restores a saved SSH \
+    session. Directories cannot currently be marked. Alt+U clears every marked \
+    file. Marking and clearing marks are unavailable during local browsing.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Batch Downloads", theme);
+
+    push_paragraph(
+        &mut lines,
+        "While browsing through SSH, Alt+D downloads every marked file as one batch. \
+    By default, the files are gathered directly inside a newly created local \
+    batch directory, making files selected from different remote locations \
+    immediately accessible in one place. Duplicate filenames receive safe numeric \
+    suffixes rather than overwriting one another. Remote directory paths may \
+    instead be retained by enabling preserve_hierarchy in scry.toml or launching \
+    Scry with --preserve-hierarchy. When Scry entered SSH through the F4 Connection \
+    window, the download is placed beneath the saved local browsing directory. \
+    When Scry was launched directly with --ssh, the process's launch directory is \
+    used instead.",
+        text_width,
+        theme,
+    );
+
     push_section(&mut lines, "File Transfers", theme);
 
     push_paragraph(
         &mut lines,
         "Remote transfers are written through temporary partial files so an \
-        interrupted download is not mistaken for a complete local copy. The \
-        transfer window reports the filename, transferred bytes, completion \
-        percentage, elapsed time, and average speed while the operation is active. \
-        When the transfer finishes or fails, the final result remains visible \
-        until it is acknowledged with Enter or Escape.",
+    interrupted download is not mistaken for a complete local copy. A single \
+    remote file activated with Enter is transferred into Scry's private cache \
+    before it is opened. A marked batch started with Alt+D is instead written \
+    into a visible local download directory. During a batch, the transfer window \
+    identifies the current file and reports aggregate bytes, completion percentage, \
+    elapsed time, speed, and file position within the queue. When the batch \
+    finishes, the final window reports the number of files downloaded, failures \
+    where applicable, the destination directory, total transferred size, elapsed \
+    time, and average speed. Failed files remain marked so they may be retried. \
+    A completed or failed result remains visible until it is acknowledged with \
+    Enter or Escape.",
         text_width,
         theme,
     );
@@ -389,13 +489,41 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
 
     push_title(&mut lines, "Opening Files", theme);
 
+    push_section(&mut lines, "Opening Behavior", theme);
+
     push_paragraph(
         &mut lines,
         "Directories are entered directly, while executable files are launched in a \
-        terminal. Ordinary files are opened with the desktop's default application, \
-        and text files may fall back to a terminal editor when no suitable desktop \
-        opener is available. Remote files are first transferred into Scry's local \
-        cache and are then opened in the same way as local files.",
+    terminal. Ordinary files are opened with the desktop's default application, \
+    and text files may fall back to a terminal editor when no suitable desktop \
+    opener is available. Remote files are first transferred into Scry's local \
+    cache and are then opened in the same way as local files.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Keeping Scry Open", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Scry remains open after successfully launching a file by default, allowing \
+    browsing to continue while the external application runs. Set exit_on_open \
+    to true in scry.toml or launch with --exit-on-open when Scry should close \
+    after a file has been opened successfully. Directory navigation and failed \
+    open attempts never trigger this automatic exit.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Disabling File Opening", theme);
+
+    push_paragraph(
+        &mut lines,
+        "External file opening may be disabled with allow_file_opening = false in \
+    scry.toml or for one launch with --no-open. This affects ordinary file \
+    activation only; directories may still be entered and browsed normally. \
+    --no-open and --exit-on-open are mutually exclusive because one disables \
+    the action that the other waits to complete.",
         text_width,
         theme,
     );
@@ -418,17 +546,77 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         theme,
     );
 
+    push_title(&mut lines, "Session Restoration", theme);
+
+    push_section(&mut lines, "Enabling Restoration", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Session restoration is disabled by default. It may be enabled permanently \
+    with restore_session = true in the [session] section of scry.toml, or for one \
+    launch with --restore-session. When enabled, Scry saves its stable browser \
+    state during a normal shutdown and attempts to restore it the next time Scry \
+    is launched without an explicit replacement source.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Restored State", theme);
+
+    push_paragraph(
+        &mut lines,
+        "A restored session may recover the local or SSH source, active directory, \
+    selected entry, viewport position, search query, List or Tree view, Exact or \
+    Fuzzy mode, recursive scope, entry filter, sorting, hidden-entry state, icons, \
+    panels, and metadata columns. Marked SSH files are also restored, allowing an \
+    interrupted browsing session to reconnect later and resume its planned batch \
+    download.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Command-line Precedence", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Explicit startup choices take precedence over saved state. Supplying a local \
+    PATH or --ssh target selects that source instead of the saved one, while \
+    command-line view, search, filter, query, opening, and metadata options \
+    override corresponding restored values for the current launch. This allows a \
+    saved session to provide convenient defaults without preventing deliberate \
+    one-time startup choices.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Storage and Failure Safety", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Session data is stored as session.json beneath \
+    $XDG_STATE_HOME/scry when XDG_STATE_HOME is set, otherwise beneath \
+    ~/.local/state/scry. The file is published atomically through a temporary \
+    part file. Passwords and temporary interface state are not stored. If a saved \
+    source cannot be reopened or an SSH host cannot be reached, Scry falls back \
+    safely rather than treating an incomplete restoration as a valid replacement \
+    for the previous saved session.",
+        text_width,
+        theme,
+    );
+
     push_title(&mut lines, "Configuration", theme);
 
     push_paragraph(
         &mut lines,
         "Scry reads its startup settings from scry.toml in the user's configuration \
-        directory. The file controls default display choices, browser behavior, \
-        optional features, and SSH settings, while command-line options take \
-        precedence for the current launch. Missing or invalid values fall back to \
-        safe built-in defaults instead of preventing Scry from starting. Complete \
-        command-line usage and available options are documented separately through \
-        \"scry --help\".",
+    directory. The file controls display choices, browser behavior, optional \
+    features, session restoration, SSH behavior, and marked-download hierarchy, \
+    while command-line options take precedence for the current launch. Missing or \
+    invalid values fall back to safe built-in defaults instead of preventing Scry \
+    from starting. A documented configuration template may be generated with \
+    --generate-config, complete command-line usage is available through \
+    \"scry --help\", and this full manual may also be printed with \
+    \"scry --manual\".",
         text_width,
         theme,
     );
@@ -471,6 +659,30 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/*
+ * Print the same document used by the F1 Help window as plain text.
+ *
+ * Styling is deliberately discarded. The resulting output is safe to redirect
+ * into files, pipe through pagers, or open in an external text editor.
+ */
+pub fn print_manual(theme: &Theme, text_width: usize) -> io::Result<()> {
+    let lines = content(theme, text_width);
+
+    let stdout = io::stdout();
+
+    let mut output = stdout.lock();
+
+    for line in lines {
+        for span in line.spans {
+            write!(output, "{}", span.content)?;
+        }
+
+        writeln!(output)?;
+    }
+
+    Ok(())
+}
+
 fn push_title(lines: &mut Vec<Line<'static>>, title: &str, theme: &Theme) {
     /*
      * Main document headings receive the strongest visual separation.
@@ -509,6 +721,22 @@ fn push_section(lines: &mut Vec<Line<'static>>, title: &str, theme: &Theme) {
     ));
 
     lines.push(Line::raw(""));
+}
+
+fn push_intro_paragraph(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    text_width: usize,
+    theme: &Theme,
+) {
+    for wrapped_line in wrap_text(text, text_width) {
+        lines.push(Line::styled(
+            wrapped_line,
+            Style::default()
+                .fg(theme.ui.muted)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
 }
 
 fn push_paragraph(lines: &mut Vec<Line<'static>>, text: &str, text_width: usize, theme: &Theme) {

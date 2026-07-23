@@ -10,13 +10,49 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::search_index::{SearchIndex, character_mask};
+use crate::{
+    query::{ParsedQuery, record_matches_query_filters},
+    search_index::{SearchIndex, character_mask},
+};
 
 const CANCELLATION_CHECK_INTERVAL: usize = 1024;
 
 const FUZZY_RESULT_LIMIT: usize = 500;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(75);
+
+/*
+ * While an Exact search is still running, publish only a bounded preview.
+ *
+ * The completed message contains every Exact match. This avoids repeatedly
+ * cloning a potentially enormous result vector during one corpus traversal.
+ */
+const EXACT_PROGRESS_RESULT_LIMIT: usize = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerEntryFilter {
+    All,
+
+    FilesOnly,
+
+    DirectoriesOnly,
+}
+
+impl WorkerEntryFilter {
+    fn matches(self, is_directory: bool, is_symlink: bool) -> bool {
+        match self {
+            Self::All => true,
+
+            /*
+             * Symlinks remain file-like unless the indexed entry itself is a
+             * real directory.
+             */
+            Self::FilesOnly => !is_directory || is_symlink,
+
+            Self::DirectoriesOnly => is_directory,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct FuzzyWorkerResult {
@@ -31,6 +67,15 @@ pub struct FuzzyWorkerResult {
     pub finished: bool,
 
     pub cancelled: bool,
+
+    /*
+     * True only when an Exact worker found more eligible matches than its
+     * configured result limit could retain.
+     *
+     * Fuzzy workers always report false because their best-500 policy is an
+     * established ranking policy rather than the Exact Tree safety cap.
+     */
+    pub limit_reached: bool,
 }
 
 /*
@@ -72,16 +117,23 @@ impl PartialOrd for RankedMatch {
  */
 pub fn start_fuzzy_worker(
     index: Arc<SearchIndex>,
-    query: String,
+    parsed_query: ParsedQuery,
     generation: u64,
     show_hidden: bool,
     scope_prefix: Option<String>,
+    entry_filter: WorkerEntryFilter,
     cancel_signal: Arc<AtomicBool>,
 ) -> Receiver<FuzzyWorkerResult> {
     let (sender, receiver) = mpsc::channel();
 
     thread::spawn(move || {
-        let folded_query = query.to_lowercase();
+        /*
+         * ParsedQuery already stores its ordinary text in lowercase.
+         *
+         * Structured terms remain in parsed_query and are evaluated directly
+         * against SearchRecord inside this worker.
+         */
+        let folded_query = parsed_query.search_text().to_string();
 
         let query_mask = character_mask(&folded_query);
 
@@ -92,8 +144,8 @@ pub fn start_fuzzy_worker(
         /*
          * Reverse keeps the worst retained result at the top of the heap.
          *
-         * Once 500 matches have been retained, a new candidate replaces that
-         * worst match only when it ranks higher.
+         * Once the limit has been reached, a new candidate replaces that worst
+         * match only when it ranks higher.
          */
         let mut best_matches: BinaryHeap<Reverse<RankedMatch>> =
             BinaryHeap::with_capacity(FUZZY_RESULT_LIMIT.saturating_add(1));
@@ -115,15 +167,16 @@ pub fn start_fuzzy_worker(
                     finished: true,
 
                     cancelled: true,
+
+                    limit_reached: false,
                 });
 
                 return;
             }
 
-            if !show_hidden && record.searchable_name.starts_with('.') {
-                continue;
-            }
-
+            /*
+             * Scope is checked before every more expensive query operation.
+             */
             if let Some(scope_prefix) = scope_prefix.as_deref() {
                 if !scope_prefix.is_empty()
                     && record.searchable_path.as_ref() != scope_prefix
@@ -137,47 +190,85 @@ pub fn start_fuzzy_worker(
             }
 
             /*
-             * If the query is longer than the complete searchable path by more
-             * than the permitted typo distance, neither subsequence matching nor
-             * typo matching can succeed.
+             * Hidden state was prepared once when SearchRecord entered the
+             * resident index.
              */
-            if folded_query.len() > record.path_length as usize + maximum_typo_distance {
+            if !show_hidden && record.contains_hidden_component {
+                continue;
+            }
+
+            if !entry_filter.matches(record.is_directory, record.is_symlink) {
                 continue;
             }
 
             /*
-             * Count query characters completely absent from the candidate path.
-             *
-             * Exact and subsequence matching permit none. Typo matching may
-             * account for a small number through replacements or insertions.
+             * type:, ext:, positive terms, and negative terms are now evaluated
+             * here rather than through a corpus-sized Boolean mask constructed
+             * by App.
              */
-            if query_mask != 0 {
-                let missing_characters =
-                    (query_mask & !record.character_mask).count_ones() as usize;
-
-                if missing_characters > maximum_typo_distance {
-                    continue;
-                }
+            if !record_matches_query_filters(record, &parsed_query) {
+                continue;
             }
 
-            let Some(score) = score_candidate(
-                &record.searchable_name,
-                &record.searchable_path,
-                &folded_query,
-            ) else {
-                continue;
-            };
+            /*
+             * Modifier-only queries have no ordinary fuzzy text.
+             *
+             * Every structurally eligible record receives an equal base score;
+             * directories retain their established priority.
+             */
+            if folded_query.is_empty() || folded_query == "." {
+                retain_ranked_match(
+                    &mut best_matches,
+                    RankedMatch {
+                        entry_index: record.entry_index,
 
-            retain_ranked_match(
-                &mut best_matches,
-                RankedMatch {
-                    entry_index: record.entry_index,
+                        is_directory: record.is_directory,
 
-                    is_directory: record.is_directory,
+                        score: 0,
+                    },
+                );
+            } else {
+                /*
+                 * If the query is longer than the complete searchable path by
+                 * more than the permitted typo distance, no scoring route can
+                 * succeed.
+                 */
+                if folded_query.len() > record.path_length as usize + maximum_typo_distance {
+                    continue;
+                }
 
-                    score,
-                },
-            );
+                /*
+                 * Reject candidates missing too many query characters before
+                 * invoking subsequence or edit-distance scoring.
+                 */
+                if query_mask != 0 {
+                    let missing_characters =
+                        (query_mask & !record.character_mask).count_ones() as usize;
+
+                    if missing_characters > maximum_typo_distance {
+                        continue;
+                    }
+                }
+
+                let Some(score) = score_candidate(
+                    &record.searchable_name,
+                    &record.searchable_path,
+                    &folded_query,
+                ) else {
+                    continue;
+                };
+
+                retain_ranked_match(
+                    &mut best_matches,
+                    RankedMatch {
+                        entry_index: record.entry_index,
+
+                        is_directory: record.is_directory,
+
+                        score,
+                    },
+                );
+            }
 
             if last_progress.elapsed() >= PROGRESS_INTERVAL {
                 let indices = ranked_indices(&best_matches);
@@ -195,6 +286,8 @@ pub fn start_fuzzy_worker(
                         finished: false,
 
                         cancelled: false,
+
+                        limit_reached: false,
                     })
                     .is_err()
                 {
@@ -218,6 +311,8 @@ pub fn start_fuzzy_worker(
                 finished: true,
 
                 cancelled: true,
+
+                limit_reached: false,
             });
 
             return;
@@ -237,6 +332,201 @@ pub fn start_fuzzy_worker(
             finished: true,
 
             cancelled: false,
+
+            limit_reached: false,
+        });
+    });
+
+    receiver
+}
+
+pub fn start_exact_worker(
+    index: Arc<SearchIndex>,
+    parsed_query: ParsedQuery,
+    generation: u64,
+    show_hidden: bool,
+    scope_prefix: Option<String>,
+    entry_filter: WorkerEntryFilter,
+    result_limit: Option<usize>,
+    cancel_signal: Arc<AtomicBool>,
+) -> Receiver<FuzzyWorkerResult> {
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+        let exact_text = parsed_query.search_text();
+
+        let total = index.len();
+
+        let mut matching_indices = Vec::new();
+
+        /*
+         * This becomes true only after the worker encounters an eligible match that
+         * cannot be retained because the caller's Exact result limit is already full.
+         */
+        let mut limit_reached = false;
+
+        let mut last_progress = Instant::now();
+
+        for (position, record) in index.records().iter().enumerate() {
+            if position % CANCELLATION_CHECK_INTERVAL == 0 && cancel_signal.load(Ordering::Relaxed)
+            {
+                let _ = sender.send(FuzzyWorkerResult {
+                    generation,
+
+                    indices: Vec::new(),
+
+                    examined: position,
+
+                    total,
+
+                    finished: true,
+
+                    cancelled: true,
+
+                    limit_reached,
+                });
+
+                return;
+            }
+
+            /*
+             * Restrict a host-wide persistent index to the currently selected
+             * recursive root.
+             */
+            if let Some(scope_prefix) = scope_prefix.as_deref() {
+                if !scope_prefix.is_empty()
+                    && record.searchable_path.as_ref() != scope_prefix
+                    && !record
+                        .searchable_path
+                        .strip_prefix(scope_prefix)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                {
+                    continue;
+                }
+            }
+
+            if !show_hidden && record.contains_hidden_component {
+                continue;
+            }
+
+            if !entry_filter.matches(record.is_directory, record.is_symlink) {
+                continue;
+            }
+
+            if !record_matches_query_filters(record, &parsed_query) {
+                continue;
+            }
+
+            /*
+             * Exact mode preserves its ordinary substring semantics.
+             *
+             * Modifier-only queries have no unsigned text, so every entry that
+             * passed the structured filters is a match.
+             */
+            if !exact_text.is_empty()
+                && exact_text != "."
+                && !record.searchable_path.contains(exact_text)
+            {
+                continue;
+            }
+
+            /*
+             * Exact List mode passes None and therefore retains every match.
+             *
+             * Exact Tree mode passes a bounded limit because constructing a contextual
+             * hierarchy from hundreds of thousands of matches is not useful and can block
+             * the terminal event thread for several seconds.
+             *
+             * Continue scanning after the limit has been filled so progress, cancellation,
+             * and the examined count remain accurate.
+             */
+            match result_limit {
+                Some(limit) if matching_indices.len() >= limit => {
+                    /*
+                     * Continue scanning the corpus so progress and cancellation remain
+                     * accurate, but remember that at least one additional match existed.
+                     */
+                    limit_reached = true;
+                }
+
+                _ => {
+                    matching_indices.push(record.entry_index);
+                }
+            }
+
+            /*
+             * Publish a bounded preview throughout the complete traversal.
+             *
+             * A broad Exact query may exceed the preview limit almost immediately.
+             * Continuing to publish the first bounded result page prevents the previous
+             * query's results from remaining onscreen until a million-entry scan finishes.
+             *
+             * Only at most EXACT_PROGRESS_RESULT_LIMIT indices are cloned per update.
+             */
+            if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                let preview_length = matching_indices.len().min(EXACT_PROGRESS_RESULT_LIMIT);
+
+                let preview_indices = matching_indices[..preview_length].to_vec();
+
+                if sender
+                    .send(FuzzyWorkerResult {
+                        generation,
+
+                        indices: preview_indices,
+
+                        examined: position.saturating_add(1),
+
+                        total,
+
+                        finished: false,
+
+                        cancelled: false,
+
+                        limit_reached,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+
+                last_progress = Instant::now();
+            }
+        }
+
+        if cancel_signal.load(Ordering::Relaxed) {
+            let _ = sender.send(FuzzyWorkerResult {
+                generation,
+
+                indices: Vec::new(),
+
+                examined: total,
+
+                total,
+
+                finished: true,
+
+                cancelled: true,
+
+                limit_reached,
+            });
+
+            return;
+        }
+
+        let _ = sender.send(FuzzyWorkerResult {
+            generation,
+
+            indices: matching_indices,
+
+            examined: total,
+
+            total,
+
+            finished: true,
+
+            cancelled: false,
+
+            limit_reached,
         });
     });
 

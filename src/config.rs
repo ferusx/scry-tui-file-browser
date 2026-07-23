@@ -10,16 +10,34 @@ use serde::Deserialize;
 
 const CONFIG_FILENAME: &str = "scry.toml";
 
+const GENERATED_CONFIG_FILENAME: &str = "scry.toml.generated";
+
 const DEFAULT_CONFIG: &str = r#"# Scry configuration
 #
 # Command-line options override settings from this file.
 #
-# Available themes will be read from Scry's themes directory.
-
+# Themes must be put in ~/.config/scry/themes/
+ 
+# Theme
+#
+# Sets Scry's active theme style 
+#
 theme = "default"
 
+
+# DISPLAY
+#
+# The five first entries enable hidden entries, icons 
+# and show/hide Scry's foldable sections: details panel,
+# selection panel, and the meta panel which holds the 
+# columns.
+#
+# The last four entries show/hide the metal panel'S
+# columns.
+#
 [display]
 show_hidden = false
+show_icons = true
 show_details = true
 show_selection = true
 show_columns = true
@@ -28,18 +46,50 @@ show_size = false
 show_date = false
 show_user = false
 
+# BROWSER
+#
+# 'view' has two modes: list mode (normal view) and tree mode
+# 'sort' has four fields: name|size|date|type
+#
 [browser]
 view = "list"
 recursive = false
+fuzzy = false
+entry_filter = "all"
 sort = "name"
 reverse = false
 
+# FEATURES
+#
+# Here deletion can be enabled, external file opening can
+# be disabled, and Scry can optionally exit after opening
+# a selected file successfully.
+#
 [features]
 enable_deletion = false
+allow_file_opening = true
+exit_on_open = false
 
+# SESSION
+#
+# When enabled, a plain `scry` launch restores the browser state saved when
+# Scry last exited. Explicit paths, SSH targets, and command-line startup
+# options continue to override restored values.
+#
+[session]
+restore_session = false
+
+# SSH
+#
+# preserve_hierarchy preserves remote directory paths during marked batch downloads.
+#
+# false places every downloaded file directly inside the new batch directory.
+# true recreates the remote directory hierarchy beneath that directory.
+# 
 [ssh]
 connect_timeout_seconds = 10
 server_alive_interval_seconds = 15
+preserve_hierarchy = false
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +108,8 @@ pub struct ScryConfig {
 
     pub features: FeatureConfig,
 
+    pub session: SessionConfig,
+
     pub ssh: SshConfig,
 }
 
@@ -72,6 +124,8 @@ impl Default for ScryConfig {
 
             features: FeatureConfig::default(),
 
+            session: SessionConfig::default(),
+
             ssh: SshConfig::default(),
         }
     }
@@ -81,6 +135,8 @@ impl Default for ScryConfig {
 #[serde(default)]
 pub struct DisplayConfig {
     pub show_hidden: bool,
+
+    pub show_icons: bool,
 
     pub show_details: bool,
 
@@ -101,6 +157,8 @@ impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
             show_hidden: false,
+
+            show_icons: true,
 
             show_details: true,
 
@@ -126,6 +184,10 @@ pub struct BrowserConfig {
 
     pub recursive: bool,
 
+    pub fuzzy: bool,
+
+    pub entry_filter: String,
+
     pub sort: String,
 
     pub reverse: bool,
@@ -137,6 +199,10 @@ impl Default for BrowserConfig {
             view: "list".to_string(),
 
             recursive: false,
+
+            fuzzy: false,
+
+            entry_filter: "all".to_string(),
 
             sort: "name".to_string(),
 
@@ -155,12 +221,51 @@ pub struct FeatureConfig {
      * deletion controls remain absent from Scry's interface.
      */
     pub enable_deletion: bool,
+
+    /*
+     * Permit selected files to be opened externally.
+     *
+     * Directory navigation remains available even when this is false.
+     */
+    pub allow_file_opening: bool,
+
+    /*
+     * Exit Scry after an externally opened file is launched successfully.
+     *
+     * Directory navigation and failed file-open attempts leave Scry running.
+     */
+    pub exit_on_open: bool,
 }
 
 impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             enable_deletion: false,
+
+            allow_file_opening: true,
+
+            exit_on_open: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /*
+     * Restore the most recently saved browser session when Scry is launched
+     * without an explicit path or SSH target.
+     *
+     * Disabled by default so ordinary startup behavior remains unchanged unless
+     * the user deliberately opts in through scry.toml or --restore-session.
+     */
+    pub restore_session: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            restore_session: false,
         }
     }
 }
@@ -179,6 +284,15 @@ pub struct SshConfig {
      * A value of zero disables server-alive messages.
      */
     pub server_alive_interval_seconds: u64,
+
+    /*
+     * Preserve the complete remote directory hierarchy beneath batch-download
+     * directories.
+     *
+     * When false, every marked file is placed directly inside the batch root.
+     * Duplicate filenames are disambiguated without overwriting existing files.
+     */
+    pub preserve_hierarchy: bool,
 }
 
 impl Default for SshConfig {
@@ -187,6 +301,8 @@ impl Default for SshConfig {
             connect_timeout_seconds: 10,
 
             server_alive_interval_seconds: 15,
+
+            preserve_hierarchy: false,
         }
     }
 }
@@ -257,6 +373,23 @@ impl ScryConfig {
                 eprintln!("scry: unknown browser view '{}'; using 'list'", invalid,);
 
                 "list".to_string()
+            }
+        };
+
+        self.browser.entry_filter = match self.browser.entry_filter.trim().to_lowercase().as_str() {
+            "all" => "all".to_string(),
+
+            "files" | "file" | "files-only" => "files".to_string(),
+
+            "directories" | "directory" | "dirs" | "dir" | "dirs-only" => "directories".to_string(),
+
+            invalid => {
+                eprintln!(
+                    "scry: unknown browser entry filter '{}'; using 'all'",
+                    invalid,
+                );
+
+                "all".to_string()
             }
         };
 
@@ -335,6 +468,42 @@ pub fn config_directory_path() -> io::Result<PathBuf> {
 
 pub fn config_file_path() -> io::Result<PathBuf> {
     Ok(config_directory_path()?.join(CONFIG_FILENAME))
+}
+
+pub fn generated_config_file_path() -> io::Result<PathBuf> {
+    Ok(config_directory_path()?.join(GENERATED_CONFIG_FILENAME))
+}
+
+pub fn generate_config_copy() -> io::Result<PathBuf> {
+    let path = generated_config_file_path()?;
+
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "generated configuration path has no parent directory",
+        ));
+    };
+
+    fs::create_dir_all(parent)?;
+
+    /*
+     * The generated template is disposable and may always be refreshed.
+     *
+     * This operation never touches the active scry.toml configuration.
+     * An existing scry.toml.generated is replaced with the newest built-in
+     * template so newly introduced settings appear immediately.
+     */
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+
+    file.write_all(DEFAULT_CONFIG.as_bytes())?;
+
+    file.flush()?;
+
+    Ok(path)
 }
 
 fn create_default_config(path: &Path) -> io::Result<()> {

@@ -3,29 +3,33 @@
 mod app;
 mod args;
 mod classify;
+mod clipboard;
 mod config;
 mod connection;
 mod entry;
+mod external_help;
+mod file_info;
 mod fuzzy;
 mod help;
-mod legend;
 mod open;
 mod query;
 mod remote_index;
 mod scan;
 mod search_index;
+mod session;
 mod source;
 mod ssh;
 mod themes;
 mod ui;
 
-use app::{App, DeletionChoice, RemoteIndexDialogFocus, ViewMode};
+use app::{App, DeletionChoice, EntryFilter, RemoteIndexDialogFocus, ViewMode};
 use args::Cli;
 use clap::Parser;
 use connection::ConnectionField;
 use ratatui::layout::Rect;
+use session::{SessionSource, SessionState};
 use ssh::{SftpSource, SshTarget};
-use std::io::{self, stdout};
+use std::io::{self, IsTerminal, stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -37,18 +41,269 @@ use crossterm::{
     execute,
 };
 
+/*
+ * Copy persisted display and browser choices into the ordinary startup
+ * configuration.
+ *
+ * App::apply_startup_config() remains the single place that establishes modes
+ * in the required order: sorting, search style, recursive scope, then Tree mode.
+ */
+fn apply_session_to_startup_config(config: &mut config::ScryConfig, state: &SessionState) {
+    config.display.show_hidden = state.show_hidden;
+
+    config.display.show_icons = state.show_icons;
+
+    config.display.show_details = state.show_details;
+
+    config.display.show_selection = state.show_selection;
+
+    config.display.show_columns = state.show_columns;
+
+    config.display.show_permissions = state.show_permissions;
+
+    config.display.show_size = state.show_size;
+
+    config.display.show_date = state.show_date;
+
+    config.display.show_user = state.show_user;
+
+    config.browser.view = match state.view_mode.as_str() {
+        "tree" => "tree",
+
+        _ => "list",
+    }
+    .to_string();
+
+    config.browser.fuzzy = state.search_mode == "fuzzy";
+
+    config.browser.recursive = state.recursive;
+
+    config.browser.entry_filter = match state.entry_filter.as_str() {
+        "files" => "files",
+
+        "directories" => "directories",
+
+        _ => "all",
+    }
+    .to_string();
+
+    config.browser.sort = match state.sort_mode.as_str() {
+        "size" => "size",
+
+        "date" => "date",
+
+        "type" => "type",
+
+        _ => "name",
+    }
+    .to_string();
+
+    config.browser.reverse = state.reverse;
+}
+
+/*
+ * Construct the filesystem source recorded by a saved session.
+ *
+ * SSH connection errors are returned so main() can fall back to a normal local
+ * listing without entering raw terminal mode.
+ */
+fn app_from_session(state: &SessionState, ssh_config: &config::SshConfig) -> Result<App, String> {
+    match &state.source {
+        SessionSource::Local { directory, .. } => App::new(directory.clone()).map_err(|error| {
+            format!(
+                "unable to restore local directory {}: {}",
+                directory.display(),
+                error,
+            )
+        }),
+
+        SessionSource::Ssh {
+            host,
+            user,
+            port,
+            identity_file,
+            directory,
+            ..
+        } => {
+            let target = SshTarget {
+                host: host.clone(),
+
+                user: user.clone(),
+
+                port: *port,
+
+                identity_file: identity_file.clone(),
+            };
+
+            eprintln!(
+                "scry: restoring SSH session through {}...",
+                target.openssh_destination(),
+            );
+
+            let (remote_home, source) =
+                SftpSource::connect(&target, ssh_config).map_err(|error| {
+                    format!(
+                        "unable to reconnect to {}: {}",
+                        target.openssh_destination(),
+                        error,
+                    )
+                })?;
+
+            let mut app =
+                App::with_source_and_home(directory.clone(), remote_home, Box::new(source))
+                    .map_err(|error| {
+                        format!(
+                            "unable to restore remote directory {}: {}",
+                            directory.display(),
+                            error,
+                        )
+                    })?;
+
+            app.set_active_ssh_target(target);
+
+            Ok(app)
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
+    if let Some(result) = clipboard::run_owner_if_requested() {
+        return result;
+    }
+
     let cli = Cli::parse();
 
-    let config = config::ScryConfig::load();
+    /*
+     * Configuration generation must happen before ScryConfig::load().
+     *
+     * Normal loading may create the live scry.toml when it is missing, whereas
+     * --generate-config must create only the inert .generated copy.
+     */
+    if cli.generate_config {
+        let generated_path = match config::generate_config_copy() {
+            Ok(path) => path,
 
-    if cli.help {
-        legend::print_help(config.features.enable_deletion)?;
+            Err(error) => {
+                eprintln!("scry: unable to generate configuration: {}", error);
+
+                std::process::exit(1);
+            }
+        };
+
+        let live_path = match config::config_file_path() {
+            Ok(path) => path,
+
+            Err(error) => {
+                eprintln!(
+                    "scry: generated {}, but unable to determine the live configuration path: {}",
+                    generated_path.display(),
+                    error,
+                );
+
+                std::process::exit(1);
+            }
+        };
+
+        println!(
+            "Generated configuration template: {}",
+            generated_path.display(),
+        );
+
+        println!(
+            "Rename it to {} after reviewing and editing it.",
+            live_path.display(),
+        );
 
         return Ok(());
     }
 
+    let config = config::ScryConfig::load();
+
+    let session_enabled = cli.restore_session || config.session.restore_session;
+
+    /*
+     * A saved source is restored only for an otherwise destination-less launch.
+     *
+     * Explicit PATH and --ssh values always identify an intentional startup source
+     * and therefore take precedence over yesterday's session.
+     */
+    let should_restore_source = session_enabled && cli.path.is_none() && cli.ssh.is_none();
+
+    let mut save_session_on_exit = session_enabled;
+
+    let mut restored_session = if should_restore_source {
+        match session::load() {
+            Ok(Some(state)) if state.is_supported() => Some(state),
+
+            Ok(Some(state)) => {
+                eprintln!(
+                    "scry: saved session format {} is unsupported; expected version {}",
+                    state.version,
+                    session::SESSION_FORMAT_VERSION,
+                );
+
+                /*
+                 * Preserve the newer or otherwise unsupported file rather than
+                 * replacing it with an ordinary fallback session on exit.
+                 */
+                save_session_on_exit = false;
+
+                None
+            }
+
+            Ok(None) => None,
+
+            Err(error) => {
+                eprintln!("scry: unable to load saved session: {}", error);
+
+                /*
+                 * A malformed or temporarily unreadable session should not be
+                 * overwritten merely because Scry successfully opened normally.
+                 */
+                save_session_on_exit = false;
+
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if cli.manual {
+        /*
+         * Reuse the complete F1 Help document.
+         *
+         * Interactive terminals use their current width, while redirected output
+         * uses a stable readable width so the resulting file does not depend on an
+         * unavailable or unusually narrow terminal.
+         */
+        let text_width = if io::stdout().is_terminal() {
+            crossterm::terminal::size()
+                .map(|(width, _)| width.saturating_sub(4).clamp(40, 100) as usize)
+                .unwrap_or(78)
+        } else {
+            78
+        };
+
+        let theme = crate::themes::Theme::load(&config.theme);
+
+        help::print_manual(&theme, text_width)?;
+
+        return Ok(());
+    }
+
+    if cli.help {
+        external_help::print_help()?;
+
+        return Ok(());
+    }
+
+    let mut startup_warning: Option<String> = None;
+
     let mut app = if let Some(value) = cli.ssh.as_deref() {
+        /*
+         * Explicit --ssh always overrides a saved session source.
+         */
         let target = match SshTarget::parse(value) {
             Ok(target) => target,
 
@@ -74,23 +329,20 @@ fn main() -> io::Result<()> {
             }
         };
 
-        /*
-         * Remote startup rules:
-         *
-         *     no PATH    remote home directory
-         *     .          remote home directory
-         *     PATH       PATH exactly as supplied
-         */
         let remote_start = match cli.path.as_deref() {
-            None => remote_home,
+            None => remote_home.clone(),
 
-            Some(path) if path == std::path::Path::new(".") => remote_home,
+            Some(path) if path == std::path::Path::new(".") => remote_home.clone(),
 
             Some(path) => path.to_path_buf(),
         };
 
-        match App::with_source(remote_start.clone(), Box::new(source)) {
-            Ok(app) => app,
+        match App::with_source_and_home(remote_start.clone(), remote_home, Box::new(source)) {
+            Ok(mut app) => {
+                app.set_active_ssh_target(target);
+
+                app
+            }
 
             Err(error) => {
                 eprintln!(
@@ -102,11 +354,41 @@ fn main() -> io::Result<()> {
                 std::process::exit(1);
             }
         }
+    } else if let Some(state) = restored_session.as_ref() {
+        match app_from_session(state, &config.ssh) {
+            Ok(app) => app,
+
+            Err(error) => {
+                /*
+                 * A failed saved SSH connection or vanished local directory must not
+                 * prevent Scry from opening.
+                 *
+                 * Preserve the old session file so the user may retry later.
+                 */
+                save_session_on_exit = false;
+
+                startup_warning = Some(format!(
+                    "Unable to restore the saved session: {}. Started locally instead.",
+                    error,
+                ));
+
+                restored_session = None;
+
+                match App::new(std::path::PathBuf::from(".")) {
+                    Ok(app) => app,
+
+                    Err(fallback_error) => {
+                        eprintln!(
+                            "scry: session restoration failed, and the local fallback could not open: {}",
+                            fallback_error,
+                        );
+
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
     } else {
-        /*
-         * An omitted local PATH has the ordinary shell meaning: begin in the
-         * process's current directory.
-         */
         let local_start = cli
             .path
             .clone()
@@ -123,23 +405,70 @@ fn main() -> io::Result<()> {
         }
     };
 
-    app.apply_startup_config(&config);
+    let mut startup_config = config.clone();
+
+    if let Some(state) = restored_session.as_ref() {
+        /*
+         * Session state overrides the browser/display defaults from scry.toml.
+         *
+         * Explicit command-line switches are applied afterward and therefore remain
+         * the final authority for this launch.
+         */
+        apply_session_to_startup_config(&mut startup_config, state);
+    }
+
+    app.apply_startup_config(&startup_config);
+
+    if let Some(state) = restored_session.as_ref() {
+        app.restore_session_state(state);
+    }
+
+    if let Some(message) = startup_warning {
+        app.show_error_message(message);
+    }
+
+    if cli.preserve_hierarchy {
+        app.enable_preserved_download_hierarchy();
+    }
+
     /*
      * Command-line switches override configuration values.
      *
-     * Existing positive Boolean switches can force a feature on, but must never
-     * toggle an already-enabled configuration value back off.
+     * Startup modes are established before the startup query is installed.
+     * This ensures that the query is evaluated only after its final scope,
+     * matching mode, entry-kind policy, and view have been selected.
      */
     if cli.all && !app.show_hidden {
         app.toggle_hidden();
     }
 
-    if cli.recursive && !app.recursive_mode {
-        app.enable_recursive_mode();
+    if cli.recursive {
+        app.request_recursive_mode();
+    }
+
+    if cli.fuzzy {
+        app.enable_fuzzy_mode();
+    }
+
+    if cli.files_only {
+        app.set_entry_filter(EntryFilter::FilesOnly);
+    } else if cli.dirs_only {
+        app.set_entry_filter(EntryFilter::DirectoriesOnly);
     }
 
     if cli.tree && app.view_mode != ViewMode::Tree {
         app.toggle_tree_mode();
+    }
+
+    /*
+     * Apply the query after List/Tree, Exact/Fuzzy, and recursive scope have
+     * reached their final startup state.
+     *
+     * This is particularly important for non-recursive Tree mode because entering
+     * that mode establishes its hierarchy before filtering begins.
+     */
+    if let Some(query) = cli.query {
+        app.set_startup_query(query);
     }
 
     if cli.permissions {
@@ -158,6 +487,14 @@ fn main() -> io::Result<()> {
         app.show_user = true;
     }
 
+    if cli.no_open {
+        app.disable_file_opening();
+    }
+
+    if cli.exit_on_open {
+        app.enable_exit_on_open();
+    }
+
     execute!(
         stdout(),
         EnableMouseCapture,
@@ -172,18 +509,27 @@ fn main() -> io::Result<()> {
 
     disable_result?;
 
-    if let Some(path) = app.opened_file_path {
-        let containing_directory = path
-            .parent()
-            .map(|parent| parent.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
+    if save_session_on_exit {
+        match app.session_state() {
+            Ok(state) => {
+                if let Err(error) = session::save(&state) {
+                    eprintln!("scry: unable to save session state: {}", error);
+                }
+            }
 
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+            Err(error) => {
+                eprintln!("scry: unable to construct session state: {}", error);
+            }
+        }
+    }
 
-        println!("{} - {}", containing_directory, filename,);
+    if let Some(text) = app.clipboard_handoff_text() {
+        if let Err(error) = clipboard::spawn_owner(&text) {
+            eprintln!(
+                "scry: unable to preserve clipboard contents after exit: {}",
+                error,
+            );
+        }
     }
 
     Ok(())
@@ -193,7 +539,15 @@ fn main() -> io::Result<()> {
 struct ScrollbarDragState {
     start_mouse_row: u16,
 
-    start_selected: usize,
+    /*
+     * Thumb-top position inside its available travel range when dragging began.
+     */
+    start_thumb_top: usize,
+
+    /*
+     * Preserve the selection's screen row while the viewport moves.
+     */
+    selected_viewport_row: usize,
 }
 
 fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
@@ -211,6 +565,14 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
 
     while !app.should_quit {
         let mut needs_redraw = app.process_scan_messages();
+
+        if app.process_pending_recursive_search() {
+            needs_redraw = true;
+        }
+
+        if app.process_notification_timeouts() {
+            needs_redraw = true;
+        }
 
         if app.process_remote_index_load_messages() {
             needs_redraw = true;
@@ -232,6 +594,9 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
             needs_redraw = true;
         }
 
+        if app.process_file_info_messages() {
+            needs_redraw = true;
+        }
         /*
          * Redraw while a transfer is active so elapsed time and the popup remain
          * current between genuine byte-progress messages.
@@ -281,6 +646,10 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
             needs_redraw = true;
         }
 
+        if app.process_pending_recursive_search() {
+            needs_redraw = true;
+        }
+
         if app.process_remote_index_load_messages() {
             needs_redraw = true;
         }
@@ -301,6 +670,10 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
             needs_redraw = true;
         }
 
+        if app.process_file_info_messages() {
+            needs_redraw = true;
+        }
+
         if app.connection_in_progress {
             needs_redraw = true;
         }
@@ -315,7 +688,79 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
     Ok(())
 }
 
-fn handle_key_event(app: &mut App, key_event: KeyEvent) {
+fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
+    /*
+     * Alphabetic Ctrl/Alt shortcuts are case-insensitive.
+     *
+     * Caps Lock and enhanced keyboard protocols may report Alt+R as either:
+     *
+     *     Char('R') with ALT
+     *     Char('R') with ALT | SHIFT
+     *
+     * Normalize only modified shortcut events. Ordinary text entry retains its
+     * original case.
+     */
+    if key_event
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        if let KeyCode::Char(character) = key_event.code {
+            if character.is_ascii_alphabetic() {
+                key_event.code = KeyCode::Char(character.to_ascii_lowercase());
+
+                key_event.modifiers.remove(KeyModifiers::SHIFT);
+            }
+        }
+    }
+
+    if app.file_info_visible() {
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::F(2), _) | (KeyCode::Char('i'), KeyModifiers::ALT) => {
+                app.close_file_info();
+            }
+
+            (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                app.close_file_info();
+            }
+
+            (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+                app.close_file_info();
+            }
+
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                app.scroll_file_info_up();
+            }
+
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                app.scroll_file_info_down();
+            }
+
+            (KeyCode::PageUp, _) => {
+                app.page_file_info_up();
+            }
+
+            (KeyCode::PageDown, _) => {
+                app.page_file_info_down();
+            }
+
+            (KeyCode::Home, _) => {
+                app.file_info_scroll_to_start();
+            }
+
+            (KeyCode::End, _) => {
+                app.file_info_scroll_to_end();
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
     if app.remote_index_setup_visible() {
         let focus = app.remote_index_setup.as_ref().map(|setup| setup.focus);
 
@@ -554,20 +999,24 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
                 app.quit();
             }
 
+            (KeyCode::Char('!'), _) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+                app.close_legend();
+            }
+
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                app.scroll_help_up();
+                app.scroll_legend_up();
             }
 
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                app.scroll_help_down();
+                app.scroll_legend_down();
             }
 
             (KeyCode::PageUp, _) => {
-                app.page_help_up();
+                app.page_legend_up();
             }
 
             (KeyCode::PageDown, _) => {
-                app.page_help_down();
+                app.page_legend_down();
             }
 
             (KeyCode::Home, _) => {
@@ -575,11 +1024,7 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
             }
 
             (KeyCode::End, _) => {
-                app.help_scroll_to_end();
-            }
-
-            (KeyCode::Char('!'), _) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
-                app.close_legend();
+                app.legend_scroll_to_end();
             }
 
             _ => {}
@@ -618,7 +1063,10 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
                 app.help_scroll_to_end();
             }
 
-            (KeyCode::Char('?'), _) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+            (KeyCode::Char('?'), _)
+            | (KeyCode::F(1), _)
+            | (KeyCode::Esc, _)
+            | (KeyCode::Enter, _) => {
                 app.close_help();
             }
 
@@ -631,6 +1079,18 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
     match (key_event.code, key_event.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.quit();
+        }
+
+        (KeyCode::F(1), _) => {
+            app.toggle_help();
+        }
+
+        (KeyCode::F(2), _) => {
+            app.open_file_info();
+        }
+
+        (KeyCode::Char('i'), KeyModifiers::ALT) => {
+            app.open_file_info();
         }
 
         (KeyCode::F(3), _) => {
@@ -661,6 +1121,10 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
             app.toggle_user_column();
         }
 
+        (KeyCode::Char('u'), KeyModifiers::ALT) => {
+            app.clear_marks();
+        }
+
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
             app.clear_query();
         }
@@ -674,22 +1138,23 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
         }
 
         /*
-         * Backspace may be reported either as KeyCode::Backspace or as Ctrl+H,
-         * depending on the terminal and keyboard-enhancement support.
+         * Backspace belongs exclusively to search-field editing.
+         *
+         * Some terminals report Backspace as Ctrl+H, so both forms retain the same
+         * query-editing behavior. At the beginning of an empty query, the key does
+         * nothing instead of unexpectedly navigating to the parent directory.
          */
         (KeyCode::Backspace, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-            if app.query.is_empty() {
-                app.enter_parent_directory();
-            } else {
-                app.pop_query_character();
-            }
+            app.pop_query_character();
         }
 
         /*
          * Ctrl+M is the carriage-return control code and may be reported as Enter by
          * the terminal. Never allow it to activate a directory or file.
          */
-        (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {}
+        (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.open_file_info();
+        }
 
         /*
          * Ctrl+M must never activate anything.
@@ -698,6 +1163,10 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
 
         (KeyCode::Char('h'), KeyModifiers::ALT) => {
             app.toggle_hidden();
+        }
+
+        (KeyCode::Char('d'), KeyModifiers::ALT) => {
+            app.begin_marked_transfer_batch();
         }
 
         (KeyCode::Char('m'), KeyModifiers::ALT) => {
@@ -729,22 +1198,23 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
         }
 
         /*
-         * Query-caret movement uses Ctrl so ordinary navigation keys
-         * remain available to the filesystem browser and Tree mode.
+         * Check whether Control is present rather than requiring it to be the
+         * only modifier. Enhanced keyboard protocols may attach additional
+         * modifier bits to Ctrl+Arrow events.
          */
-        (KeyCode::Left, KeyModifiers::CONTROL) => {
+        (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             app.move_query_cursor_left();
         }
 
-        (KeyCode::Right, KeyModifiers::CONTROL) => {
+        (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             app.move_query_cursor_right();
         }
 
-        (KeyCode::Home, KeyModifiers::CONTROL) => {
+        (KeyCode::Home, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             app.move_query_cursor_to_start();
         }
 
-        (KeyCode::End, KeyModifiers::CONTROL) => {
+        (KeyCode::End, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             app.move_query_cursor_to_end();
         }
 
@@ -788,8 +1258,18 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
             app.begin_deletion_confirmation();
         }
 
+        /*
+         * While browsing through SSH, marked files take precedence over ordinary
+         * activation.
+         *
+         * This applies specifically to keyboard Enter. Mouse double-click continues
+         * activating the entry beneath the pointer rather than unexpectedly launching
+         * marks collected elsewhere.
+         */
         (KeyCode::Enter, KeyModifiers::NONE) => {
-            if !app.commit_pending_query_modifier() {
+            if app.source_is_remote() && app.marked_count() > 0 {
+                app.begin_marked_transfer_batch();
+            } else {
                 app.activate_selected();
             }
         }
@@ -800,6 +1280,24 @@ fn handle_key_event(app: &mut App, key_event: KeyEvent) {
 
         (KeyCode::Char('!'), _) => {
             app.toggle_legend();
+        }
+
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+            app.copy_selected_path();
+        }
+
+        /*
+         * Ctrl+Space marks or unmarks the file beneath the cursor.
+         *
+         * Some terminals report Ctrl+Space as a literal space carrying CONTROL,
+         * while others expose the traditional NUL character. Support both forms.
+         */
+        (KeyCode::Char(' '), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_mark_selected();
+        }
+
+        (KeyCode::Char('\0'), _) => {
+            app.toggle_mark_selected();
         }
 
         (KeyCode::Char(character), modifiers)
@@ -821,6 +1319,29 @@ fn handle_mouse_event(
     scrollbar_drag: &mut Option<ScrollbarDragState>,
     help_scrollbar_drag: &mut bool,
 ) {
+    /*
+     * File Information is modal.
+     *
+     * A left click on its Close button dismisses the window. Every other mouse
+     * event is consumed so it cannot affect the browser hidden beneath it.
+     */
+    if app.file_info_visible() {
+        if let (MouseEventKind::Down(MouseButton::Left), Some(close_area)) =
+            (event.kind, regions.file_info_close)
+        {
+            let inside_close_button = event.column >= close_area.x
+                && event.column < close_area.x.saturating_add(close_area.width)
+                && event.row >= close_area.y
+                && event.row < close_area.y.saturating_add(close_area.height);
+
+            if inside_close_button {
+                app.close_file_info();
+            }
+        }
+
+        return;
+    }
+
     if app.remote_index_setup_visible() {
         /*
          * The setup window owns every mouse event while visible.
@@ -927,14 +1448,14 @@ fn handle_mouse_event(
         return;
     }
 
-    if app.help_visible() {
+    if app.help_visible() || app.legend_visible() {
         *scrollbar_drag = None;
 
         *last_left_click = None;
 
-        let help_scrollbar = regions.help_scrollbar;
+        let overlay_scrollbar = regions.help_scrollbar;
 
-        let on_help_scrollbar = help_scrollbar.is_some_and(|area| {
+        let on_overlay_scrollbar = overlay_scrollbar.is_some_and(|area| {
             event.column >= area.x
                 && event.column < area.x.saturating_add(area.width)
                 && event.row >= area.y
@@ -943,31 +1464,43 @@ fn handle_mouse_event(
 
         match event.kind {
             MouseEventKind::ScrollUp => {
-                app.scroll_help_up();
+                if app.legend_visible() {
+                    app.scroll_legend_up();
+                } else {
+                    app.scroll_help_up();
+                }
             }
 
             MouseEventKind::ScrollDown => {
-                app.scroll_help_down();
+                if app.legend_visible() {
+                    app.scroll_legend_down();
+                } else {
+                    app.scroll_help_down();
+                }
             }
 
-            MouseEventKind::Down(MouseButton::Left) if on_help_scrollbar => {
+            MouseEventKind::Down(MouseButton::Left) if on_overlay_scrollbar => {
                 *help_scrollbar_drag = true;
 
-                drag_help_scrollbar(
+                drag_overlay_scrollbar(
                     app,
                     event.row,
-                    help_scrollbar.expect("checked help scrollbar region"),
+                    overlay_scrollbar.expect("checked overlay scrollbar region"),
                 );
             }
 
             MouseEventKind::Drag(MouseButton::Left) if *help_scrollbar_drag => {
-                if let Some(area) = help_scrollbar {
-                    drag_help_scrollbar(app, event.row, area);
+                if let Some(area) = overlay_scrollbar {
+                    drag_overlay_scrollbar(app, event.row, area);
                 }
             }
 
             MouseEventKind::Up(MouseButton::Left) => {
                 *help_scrollbar_drag = false;
+
+                *scrollbar_drag = None;
+
+                app.scrollbar_drag_active = false;
             }
 
             _ => {}
@@ -1000,7 +1533,39 @@ fn handle_mouse_event(
         && event.row > area.y
         && event.row < area.y.saturating_add(area.height).saturating_sub(1);
 
-    let on_scrollbar = inside_entry_rows && event.column == right_edge;
+    /*
+     * The home control occupies the lower-left border of the filesystem panel.
+     */
+    let inside_home_button = event.column >= regions.home_button.x
+        && event.column
+            < regions
+                .home_button
+                .x
+                .saturating_add(regions.home_button.width)
+        && event.row >= regions.home_button.y
+        && event.row
+            < regions
+                .home_button
+                .y
+                .saturating_add(regions.home_button.height);
+
+    /*
+     * The terminal's visible mouse pointer may overlap the scrollbar while its
+     * reported cell lies immediately to either side of the rendered column.
+     *
+     * Test the scrollbar rows independently from inside_entries_panel so the
+     * cell immediately to the right of the panel remains a valid grab target.
+     */
+    let inside_scrollbar_rows =
+        event.row > area.y && event.row < area.y.saturating_add(area.height).saturating_sub(1);
+
+    let scrollbar_hit_left = right_edge.saturating_sub(1);
+
+    let scrollbar_hit_right = right_edge.saturating_add(1);
+
+    let on_scrollbar = inside_scrollbar_rows
+        && event.column >= scrollbar_hit_left
+        && event.column <= scrollbar_hit_right;
 
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) if on_parent_button => {
@@ -1026,11 +1591,47 @@ fn handle_mouse_event(
         MouseEventKind::Down(MouseButton::Left) if on_scrollbar => {
             *last_left_click = None;
 
+            let content_length = app.current_visible_entry_count();
+
+            let viewport_length = app.viewport_rows;
+
+            let track_length = area.height.saturating_sub(2) as usize;
+
+            let thumb_length =
+                scrollbar_thumb_length(content_length, viewport_length, track_length);
+
+            let thumb_travel = track_length.saturating_sub(thumb_length);
+
+            let maximum_offset = content_length.saturating_sub(viewport_length);
+
+            /*
+             * Convert the current viewport offset into the thumb's actual track position.
+             *
+             * Rounded division keeps this coordinate consistent with the rendered handle.
+             */
+            let start_thumb_top = if maximum_offset == 0 || thumb_travel == 0 {
+                0
+            } else {
+                app.list_offset
+                    .saturating_mul(thumb_travel)
+                    .saturating_add(maximum_offset / 2)
+                    / maximum_offset
+            };
+
+            let selected_viewport_row = app
+                .selected
+                .saturating_sub(app.list_offset)
+                .min(app.viewport_rows.saturating_sub(1));
+
             *scrollbar_drag = Some(ScrollbarDragState {
                 start_mouse_row: event.row,
 
-                start_selected: app.selected,
+                start_thumb_top,
+
+                selected_viewport_row,
             });
+
+            app.scrollbar_drag_active = true;
         }
 
         /*
@@ -1049,10 +1650,26 @@ fn handle_mouse_event(
          */
         MouseEventKind::Up(MouseButton::Left) => {
             *scrollbar_drag = None;
+
+            app.scrollbar_drag_active = false;
         }
 
         MouseEventKind::Down(MouseButton::Left) => {
             *scrollbar_drag = None;
+
+            app.scrollbar_drag_active = false;
+
+            /*
+             * The bottom-border Home control must be handled before the ordinary
+             * entry-row check because the border is deliberately outside the rows.
+             */
+            if inside_home_button {
+                *last_left_click = None;
+
+                app.enter_home_directory();
+
+                return;
+            }
 
             if !inside_entry_rows {
                 *last_left_click = None;
@@ -1091,9 +1708,19 @@ fn handle_mouse_event(
     }
 }
 
-fn drag_help_scrollbar(app: &mut App, mouse_row: u16, area: Rect) {
-    if app.help_max_scroll == 0 || area.height <= 1 {
-        app.help_scroll = 0;
+fn drag_overlay_scrollbar(app: &mut App, mouse_row: u16, area: Rect) {
+    let maximum_scroll = if app.legend_visible() {
+        app.legend_max_scroll
+    } else {
+        app.help_max_scroll
+    };
+
+    if maximum_scroll == 0 || area.height <= 1 {
+        if app.legend_visible() {
+            app.legend_scroll = 0;
+        } else {
+            app.help_scroll = 0;
+        }
 
         return;
     }
@@ -1104,9 +1731,15 @@ fn drag_help_scrollbar(app: &mut App, mouse_row: u16, area: Rect) {
 
     let track_maximum = area.height.saturating_sub(1) as usize;
 
-    let scroll = track_position * app.help_max_scroll as usize / track_maximum;
+    let scroll = track_position * maximum_scroll as usize / track_maximum;
 
-    app.help_scroll = scroll.min(app.help_max_scroll as usize) as u16;
+    let scroll = scroll.min(maximum_scroll as usize) as u16;
+
+    if app.legend_visible() {
+        app.legend_scroll = scroll;
+    } else {
+        app.help_scroll = scroll;
+    }
 }
 
 fn handle_transfer_mouse_event(
@@ -1194,6 +1827,8 @@ fn handle_connection_mouse_event(
 
             app.disconnect_remote();
         }
+    } else if point_inside(regions.close) {
+        app.close_connection_dialog();
     } else if point_inside(regions.profiles) && !app.connection_store.profiles().is_empty() {
         app.set_connection_focus(ConnectionField::Profiles);
     }
@@ -1235,26 +1870,41 @@ fn drag_scrollbar(
 
     let thumb_length = scrollbar_thumb_length(content_length, viewport_length, track_length);
 
-    /*
-     * The thumb itself occupies part of the track, so this is the actual
-     * distance through which its top edge can travel.
-     */
     let thumb_travel = track_length.saturating_sub(thumb_length);
 
-    let selection_travel = content_length.saturating_sub(1);
+    let maximum_offset = content_length.saturating_sub(viewport_length);
 
-    if thumb_travel == 0 || selection_travel == 0 {
+    if thumb_travel == 0 || maximum_offset == 0 {
         return;
     }
 
     let mouse_delta = mouse_row as isize - drag.start_mouse_row as isize;
 
-    let selection_delta =
-        mouse_delta.saturating_mul(selection_travel as isize) / thumb_travel as isize;
+    /*
+     * Move in scrollbar-track coordinates first.
+     *
+     * One mouse-cell movement therefore moves the thumb by exactly one
+     * available track cell, preserving pointer-to-handle synchronization.
+     */
+    let new_thumb_top =
+        (drag.start_thumb_top as isize + mouse_delta).clamp(0, thumb_travel as isize) as usize;
 
-    let new_position = drag.start_selected as isize + selection_delta;
+    /*
+     * Convert the exact thumb position back into a valid viewport offset.
+     *
+     * Rounded division avoids the truncation that could leave the handle one
+     * cell away from the top or bottom.
+     */
+    let new_offset = new_thumb_top
+        .saturating_mul(maximum_offset)
+        .saturating_add(thumb_travel / 2)
+        / thumb_travel;
 
-    let new_position = new_position.clamp(0, selection_travel as isize) as usize;
+    let new_selected = new_offset
+        .saturating_add(drag.selected_viewport_row)
+        .min(content_length.saturating_sub(1));
 
-    app.select_visible_position(new_position);
+    app.list_offset = new_offset;
+
+    app.selected = new_selected;
 }

@@ -12,10 +12,16 @@ use ratatui::{
 };
 use std::time::{Duration, SystemTime};
 
-use crate::app::{App, DeletionChoice, RemoteIndexDialogFocus, SearchMode, TreeRow, ViewMode};
+use crate::app::{
+    App, DeletionChoice, EXACT_TREE_MATCH_LIMIT, RemoteIndexDialogFocus, SearchMode, TreeRow,
+    ViewMode,
+};
 use crate::connection::ConnectionField;
 use crate::fuzzy::fuzzy_highlight_positions;
 use crate::help;
+use crate::query::{
+    QUERY_SYNTAX_REFERENCE, QUERY_TYPE_REFERENCES, QueryHighlightTerm, parse_query,
+};
 use crate::scan::FileEntry;
 use crate::themes::Theme;
 
@@ -68,6 +74,12 @@ const PARENT_BUTTON_LEFT_BRACKET: &str = "[ ";
 const PARENT_BUTTON_TEXT: &str = "← go back";
 
 const PARENT_BUTTON_RIGHT_BRACKET: &str = " ]";
+
+const HOME_BUTTON_LEFT_BRACKET: &str = "[ ";
+
+const HOME_BUTTON_TEXT: &str = "↑ go home";
+
+const HOME_BUTTON_RIGHT_BRACKET: &str = " ]";
 
 /*
  * Size and owner widths adapt to the current result set.
@@ -138,6 +150,8 @@ pub struct ConnectionUiRegions {
     pub delete: Rect,
 
     pub disconnect: Rect,
+
+    pub close: Rect,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -145,6 +159,10 @@ pub struct UiRegions {
     pub entries: Rect,
 
     pub parent_button: Rect,
+
+    pub home_button: Rect,
+
+    pub file_info_close: Option<Rect>,
 
     pub help_scrollbar: Option<Rect>,
 
@@ -172,6 +190,8 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
     let mut connection_regions = None;
 
     let mut transfer_regions = None;
+
+    let mut file_info_close_region = None;
 
     let mut remote_index_setup_regions = None;
 
@@ -269,6 +289,23 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
         height: 1,
     };
 
+    let home_button = Rect {
+        /*
+         * The home control occupies the lower-left border of the filesystem panel.
+         */
+        x: entries_area.x.saturating_add(1),
+
+        y: entries_area
+            .y
+            .saturating_add(entries_area.height.saturating_sub(1)),
+
+        width: (HOME_BUTTON_LEFT_BRACKET.chars().count()
+            + HOME_BUTTON_TEXT.chars().count()
+            + HOME_BUTTON_RIGHT_BRACKET.chars().count()) as u16,
+
+        height: 1,
+    };
+
     if let Some(area) = selection_area {
         render_selection(frame, app, area);
     }
@@ -304,10 +341,20 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
         render_deletion_overlay(frame, app, frame.area());
     }
 
+    /*
+     * File Information is rendered last because it is a fully modal inspection
+     * window and must remain above every ordinary browser panel.
+     */
+    if app.file_info_visible() {
+        file_info_close_region = render_file_info_overlay(frame, app, frame.area());
+    }
+
     UiRegions {
         entries: entries_area,
 
         parent_button,
+
+        home_button,
 
         help_scrollbar: help_scrollbar_region,
 
@@ -316,6 +363,8 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
         transfer: transfer_regions,
 
         remote_index_setup: remote_index_setup_regions,
+
+        file_info_close: file_info_close_region,
     }
 }
 
@@ -895,7 +944,7 @@ fn render_metadata(
         /*
          * Clone only the small pieces needed for rendering so that the
          * immutable entry borrow ends before owner_name() mutably accesses
-         * Wraith's UID cache.
+         * Scry's UID cache.
          */
         let metadata = match app.view_mode {
             ViewMode::List => app.entry_at_filtered_position(position).map(|entry| {
@@ -949,7 +998,7 @@ fn render_metadata(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.frames.entries)),
         )
-        .highlight_symbol("▶ ")
+        .highlight_symbol("▶")
         .highlight_style(
             Style::default()
                 .fg(app.theme.selection.text)
@@ -1159,6 +1208,25 @@ fn entries_title_with_parent_button(title: String, theme: &Theme) -> Line<'stati
     ])
 }
 
+fn entries_title_with_home_button(theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            HOME_BUTTON_LEFT_BRACKET,
+            Style::default().fg(theme.frames.parent_brackets),
+        ),
+        Span::styled(
+            HOME_BUTTON_TEXT,
+            Style::default()
+                .fg(theme.frames.parent_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            HOME_BUTTON_RIGHT_BRACKET,
+            Style::default().fg(theme.frames.parent_brackets),
+        ),
+    ])
+}
+
 fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     /*
      * Two rows belong to the surrounding border.
@@ -1175,13 +1243,33 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         .saturating_add(visible_rows)
         .min(app.filtered_indices.len());
 
-    let highlight_query = if app.query == "." {
-        String::new()
-    } else {
-        app.query.clone()
-    };
+    /*
+     * Query modifiers affect eligibility but are not filename/path text.
+     *
+     * For:
+     *
+     *     type:source index -java
+     *
+     * only "index" should be highlighted.
+     */
+    let parsed_query = parse_query(&app.query);
 
-    let search_mode = app.search_mode;
+    let highlight_terms = parsed_query.highlight_terms();
+
+    /*
+     * The ordinary fuzzy search text retains scattered-character highlighting.
+     *
+     * Positive +terms and Boolean operands are exact eligibility conditions and
+     * therefore receive ordinary substring highlighting.
+     */
+    let fuzzy_highlight_query = if app.search_mode == SearchMode::Fuzzy
+        && !parsed_query.search_text().is_empty()
+        && parsed_query.search_text() != "."
+    {
+        Some(parsed_query.search_text())
+    } else {
+        None
+    };
 
     let mut items: Vec<ListItem> = Vec::new();
 
@@ -1196,13 +1284,16 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             continue;
         };
 
+        let marked = app.is_path_marked(&entry.path);
+
         let has_content = entry.is_directory && app.directory_has_content(&entry.path);
 
         items.push(entry_list_item(
             &entry,
-            &highlight_query,
-            search_mode,
+            &highlight_terms,
+            fuzzy_highlight_query,
             has_content,
+            marked,
             app.show_icons,
             &app.theme,
         ));
@@ -1241,18 +1332,26 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let sort_arrow = if app.sort_descending { "↓" } else { "↑" };
 
+    let marked_title = if app.marked_count() == 0 {
+        String::new()
+    } else {
+        format!(" — {} marked", app.marked_count())
+    };
+
     let title = if app.scan_in_progress && app.recursive_search_active() {
         format!(
-            " {} — {} shown — {} {} ",
+            " {}{} — {} shown — {} {} ",
             heading,
+            marked_title,
             app.filtered_indices.len(),
             app.sort_mode.label(),
             sort_arrow,
         )
     } else {
         format!(
-            " {} — {} shown / {} scanned — {} {} ",
+            " {}{} — {} shown / {} scanned — {} {} ",
             heading,
+            marked_title,
             app.filtered_indices.len(),
             app.active_entry_count(),
             app.sort_mode.label(),
@@ -1264,10 +1363,11 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         .block(
             Block::default()
                 .title(entries_title_with_parent_button(title, &app.theme))
+                .title_bottom(entries_title_with_home_button(&app.theme))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.frames.entries)),
         )
-        .highlight_symbol("▶ ")
+        .highlight_symbol("▶")
         .highlight_style(
             Style::default()
                 .fg(app.theme.selection.text)
@@ -1277,7 +1377,7 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let mut state = ListState::default();
 
-    if !app.filtered_indices.is_empty() {
+    if !app.filtered_indices.is_empty() && !app.scrollbar_drag_active {
         state.select(Some(app.selected.saturating_sub(window_start)));
     }
 
@@ -1288,7 +1388,7 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         area,
         app.filtered_indices.len(),
         visible_rows,
-        app.selected,
+        app.list_offset,
         &app.theme,
     );
 }
@@ -1317,8 +1417,23 @@ fn render_entries_scrollbar(
         .track_style(Style::default().fg(theme.scrollbar.track))
         .thumb_style(Style::default().fg(theme.scrollbar.thumb));
 
+    let maximum_offset = content_length.saturating_sub(viewport_length);
+
+    /*
+     * Ratatui's position scale extends to content_length - 1, while list_offset
+     * extends only to content_length - viewport_length.
+     *
+     * Scale the viewport offset onto Ratatui's full position range so the thumb
+     * can still reach both ends of the track.
+     */
+    let scrollbar_position = if maximum_offset == 0 {
+        0
+    } else {
+        position.saturating_mul(content_length.saturating_sub(1)) / maximum_offset
+    };
+
     let mut scrollbar_state = ScrollbarState::new(content_length)
-        .position(position)
+        .position(scrollbar_position)
         .viewport_content_length(viewport_length);
 
     /*
@@ -1346,10 +1461,20 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         .saturating_add(visible_rows)
         .min(app.filtered_tree_indices.len());
 
-    let highlight_query = if app.query == "." {
-        String::new()
+    /*
+     * Tree rows highlight only ordinary search text, never query modifiers.
+     */
+    let parsed_query = parse_query(&app.query);
+
+    let highlight_terms = parsed_query.highlight_terms();
+
+    let fuzzy_highlight_query = if app.search_mode == SearchMode::Fuzzy
+        && !parsed_query.search_text().is_empty()
+        && parsed_query.search_text() != "."
+    {
+        Some(parsed_query.search_text())
     } else {
-        app.query.clone()
+        None
     };
 
     let mut items: Vec<ListItem> = Vec::new();
@@ -1359,12 +1484,16 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             continue;
         };
 
+        let marked = app.is_path_marked(&row.entry.path);
+
         let has_content = row.entry.is_directory && app.directory_has_content(&row.entry.path);
 
         items.push(tree_list_item(
             &row,
-            &highlight_query,
+            &highlight_terms,
+            fuzzy_highlight_query,
             has_content,
+            marked,
             app.show_icons,
             &app.theme,
         ));
@@ -1372,9 +1501,16 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let sort_arrow = if app.sort_descending { "↓" } else { "↑" };
 
+    let marked_title = if app.marked_count() == 0 {
+        String::new()
+    } else {
+        format!(" — {} marked", app.marked_count())
+    };
+
     let title = if app.scan_in_progress && app.recursive_search_active() {
         format!(
-            " Recursive Tree — scanning {} entries… — {} {} ",
+            " Recursive Tree{} — scanning {} entries… — {} {} ",
+            marked_title,
             app.recursive_entries.len(),
             app.sort_mode.label(),
             sort_arrow,
@@ -1386,24 +1522,38 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             "Tree"
         };
 
-        format!(
-            " {} — {} shown / {} nodes — {} {} ",
-            tree_kind,
-            app.filtered_tree_indices.len(),
-            app.tree_rows.len(),
-            app.sort_mode.label(),
-            sort_arrow,
-        )
+        if app.exact_tree_limit_reached {
+            format!(
+                " {}{} — {} matches capped / {} nodes — limit reached — {} {} ",
+                tree_kind,
+                marked_title,
+                EXACT_TREE_MATCH_LIMIT,
+                app.tree_rows.len(),
+                app.sort_mode.label(),
+                sort_arrow,
+            )
+        } else {
+            format!(
+                " {}{} — {} shown / {} nodes — {} {} ",
+                tree_kind,
+                marked_title,
+                app.filtered_tree_indices.len(),
+                app.tree_rows.len(),
+                app.sort_mode.label(),
+                sort_arrow,
+            )
+        }
     };
 
     let list = List::new(items)
         .block(
             Block::default()
                 .title(entries_title_with_parent_button(title, &app.theme))
+                .title_bottom(entries_title_with_home_button(&app.theme))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.frames.entries)),
         )
-        .highlight_symbol("▶ ")
+        .highlight_symbol("▶")
         .highlight_style(
             Style::default()
                 .fg(app.theme.selection.text)
@@ -1413,7 +1563,7 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let mut state = ListState::default();
 
-    if !app.filtered_tree_indices.is_empty() {
+    if !app.filtered_tree_indices.is_empty() && !app.scrollbar_drag_active {
         state.select(Some(app.selected.saturating_sub(window_start)));
     }
 
@@ -1424,15 +1574,17 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         area,
         app.filtered_tree_indices.len(),
         visible_rows,
-        app.selected,
+        app.list_offset,
         &app.theme,
     );
 }
 
 fn tree_list_item(
     row: &TreeRow,
-    query: &str,
+    highlight_terms: &[QueryHighlightTerm],
+    fuzzy_highlight_query: Option<&str>,
     has_content: bool,
+    marked: bool,
     show_icons: bool,
     theme: &Theme,
 ) -> ListItem<'static> {
@@ -1475,7 +1627,16 @@ fn tree_list_item(
         ));
     }
 
-    spans.extend(highlighted_name_spans(&row.entry.name, query, color));
+    if marked {
+        spans.push(Span::styled("✓ ", Style::default().fg(theme.ui.query)));
+    }
+
+    spans.extend(highlighted_query_spans(
+        &row.entry.name,
+        highlight_terms,
+        fuzzy_highlight_query,
+        color,
+    ));
 
     if !suffix.is_empty() {
         spans.push(Span::styled(suffix.to_string(), Style::default().fg(color)));
@@ -1618,18 +1779,19 @@ fn file_icon_color(entry: &FileEntry, theme: &Theme) -> Color {
 
 fn entry_list_item(
     entry: &FileEntry,
-    query: &str,
-    search_mode: SearchMode,
+    highlight_terms: &[QueryHighlightTerm],
+    fuzzy_highlight_query: Option<&str>,
     has_content: bool,
+    marked: bool,
     show_icons: bool,
     theme: &Theme,
 ) -> ListItem<'static> {
     let (prefix, color, suffix) = if entry.is_directory {
-        ("▸ ", COLOR_DIRECTORY, if has_content { " →" } else { "/" })
+        ("▸", COLOR_DIRECTORY, if has_content { " →" } else { "/" })
     } else if entry.is_symlink {
         ("↪ ", COLOR_SYMLINK, "@")
     } else {
-        ("  ", COLOR_FILE, "")
+        (" ", COLOR_FILE, "")
     };
 
     let mut spans = vec![Span::styled(prefix.to_string(), Style::default().fg(color))];
@@ -1641,19 +1803,18 @@ fn entry_list_item(
         ));
     }
 
+    if marked {
+        spans.push(Span::styled("✓ ", Style::default().fg(theme.ui.query)));
+    }
+
     let display_path = entry.relative_path.to_string_lossy().into_owned();
 
-    match search_mode {
-        SearchMode::Exact => {
-            spans.extend(highlighted_name_spans(&display_path, query, color));
-        }
-
-        SearchMode::Fuzzy => {
-            let positions = fuzzy_highlight_positions(&display_path, query);
-
-            spans.extend(highlighted_position_spans(&display_path, &positions, color));
-        }
-    }
+    spans.extend(highlighted_query_spans(
+        &display_path,
+        highlight_terms,
+        fuzzy_highlight_query,
+        color,
+    ));
 
     if !suffix.is_empty() {
         spans.push(Span::styled(suffix.to_string(), Style::default().fg(color)));
@@ -1662,133 +1823,157 @@ fn entry_list_item(
     ListItem::new(Line::from(spans))
 }
 
-fn highlighted_position_spans(
+fn highlighted_query_spans(
     text: &str,
-    highlighted_positions: &[usize],
+    terms: &[QueryHighlightTerm],
+    fuzzy_query: Option<&str>,
     normal_color: Color,
 ) -> Vec<Span<'static>> {
-    if highlighted_positions.is_empty() {
+    let mut ranges = Vec::new();
+
+    /*
+     * Preserve Scry's existing scattered-character highlighting for the
+     * ordinary fuzzy query.
+     */
+    if let Some(query) = fuzzy_query {
+        let positions = fuzzy_highlight_positions(text, query);
+
+        let character_ranges: Vec<(usize, usize)> = text
+            .char_indices()
+            .map(|(start, character)| (start, start + character.len_utf8()))
+            .collect();
+
+        for position in positions {
+            if let Some(range) = character_ranges.get(position) {
+                ranges.push(*range);
+            }
+        }
+    }
+
+    for term in terms {
+        if term.value.is_empty() {
+            continue;
+        }
+
+        /*
+         * The ordinary fuzzy term was already represented by scattered
+         * positions above. Do not additionally paint it as a contiguous
+         * substring.
+         */
+        if fuzzy_query.is_some_and(|query| !term.case_sensitive && term.value == query) {
+            continue;
+        }
+
+        if term.case_sensitive {
+            collect_sensitive_match_ranges(text, &term.value, &mut ranges);
+        } else {
+            collect_insensitive_match_ranges(text, &term.value, &mut ranges);
+        }
+    }
+
+    if ranges.is_empty() {
         return vec![Span::styled(
             text.to_string(),
             Style::default().fg(normal_color),
         )];
     }
 
-    let highlighted: std::collections::HashSet<usize> =
-        highlighted_positions.iter().copied().collect();
+    /*
+     * Combine overlaps such as:
+     *
+     *     +bas +bash
+     *
+     * so "bash" becomes one clean highlighted span.
+     */
+    ranges.sort_unstable_by_key(|range| range.0);
+
+    let mut merged_ranges: Vec<(usize, usize)> = Vec::new();
+
+    for (start, end) in ranges {
+        if start >= end {
+            continue;
+        }
+
+        if let Some((_, previous_end)) = merged_ranges.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+
+            continue;
+        }
+
+        merged_ranges.push((start, end));
+    }
 
     let mut spans = Vec::new();
 
-    let mut current_text = String::new();
+    let mut previous_end = 0_usize;
 
-    let mut current_is_highlighted = None;
-
-    for (position, character) in text.chars().enumerate() {
-        let is_highlighted = highlighted.contains(&position);
-
-        if current_is_highlighted.is_some_and(|current| current != is_highlighted) {
+    for (start, end) in merged_ranges {
+        if previous_end < start {
             spans.push(Span::styled(
-                std::mem::take(&mut current_text),
-                Style::default().fg(if current_is_highlighted == Some(true) {
-                    COLOR_MATCH
-                } else {
-                    normal_color
-                }),
+                text[previous_end..start].to_string(),
+                Style::default().fg(normal_color),
             ));
         }
 
-        current_is_highlighted = Some(is_highlighted);
+        spans.push(Span::styled(
+            text[start..end].to_string(),
+            Style::default().fg(COLOR_MATCH),
+        ));
 
-        current_text.push(character);
+        previous_end = end;
     }
 
-    if !current_text.is_empty() {
+    if previous_end < text.len() {
         spans.push(Span::styled(
-            current_text,
-            Style::default().fg(if current_is_highlighted == Some(true) {
-                COLOR_MATCH
-            } else {
-                normal_color
-            }),
+            text[previous_end..].to_string(),
+            Style::default().fg(normal_color),
         ));
     }
 
     spans
 }
 
-fn highlighted_name_spans(name: &str, query: &str, normal_color: Color) -> Vec<Span<'static>> {
+fn collect_sensitive_match_ranges(text: &str, query: &str, ranges: &mut Vec<(usize, usize)>) {
     if query.is_empty() {
-        return vec![Span::styled(
-            name.to_string(),
-            Style::default().fg(normal_color),
-        )];
+        return;
     }
 
-    let folded_name = fold_with_source_ranges(name);
+    for (start, _) in text.match_indices(query) {
+        ranges.push((start, start + query.len()));
+    }
+}
+
+fn collect_insensitive_match_ranges(text: &str, query: &str, ranges: &mut Vec<(usize, usize)>) {
+    let folded_text = fold_with_source_ranges(text);
+
     let folded_query: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
 
-    if folded_query.is_empty() || folded_query.len() > folded_name.len() {
-        return vec![Span::styled(
-            name.to_string(),
-            Style::default().fg(normal_color),
-        )];
+    if folded_query.is_empty() || folded_query.len() > folded_text.len() {
+        return;
     }
 
-    let mut matches = Vec::new();
-    let mut search_index = 0;
+    let mut search_index = 0_usize;
 
-    while search_index + folded_query.len() <= folded_name.len() {
-        let matches_query = folded_name[search_index..search_index + folded_query.len()]
+    while search_index + folded_query.len() <= folded_text.len() {
+        let matches_query = folded_text[search_index..search_index + folded_query.len()]
             .iter()
             .map(|(character, _, _)| *character)
             .eq(folded_query.iter().copied());
 
         if matches_query {
-            let byte_start = folded_name[search_index].1;
-            let byte_end = folded_name[search_index + folded_query.len() - 1].2;
+            let byte_start = folded_text[search_index].1;
 
-            matches.push((byte_start, byte_end));
+            let byte_end = folded_text[search_index + folded_query.len() - 1].2;
+
+            ranges.push((byte_start, byte_end));
 
             search_index += folded_query.len();
         } else {
             search_index += 1;
         }
     }
-
-    if matches.is_empty() {
-        return vec![Span::styled(
-            name.to_string(),
-            Style::default().fg(normal_color),
-        )];
-    }
-
-    let mut spans = Vec::new();
-    let mut previous_end = 0;
-
-    for (match_start, match_end) in matches {
-        if previous_end < match_start {
-            spans.push(Span::styled(
-                name[previous_end..match_start].to_string(),
-                Style::default().fg(normal_color),
-            ));
-        }
-
-        spans.push(Span::styled(
-            name[match_start..match_end].to_string(),
-            Style::default().fg(COLOR_MATCH),
-        ));
-
-        previous_end = match_end;
-    }
-
-    if previous_end < name.len() {
-        spans.push(Span::styled(
-            name[previous_end..].to_string(),
-            Style::default().fg(normal_color),
-        ));
-    }
-
-    spans
 }
 
 fn fold_with_source_ranges(text: &str) -> Vec<(char, usize, usize)> {
@@ -1811,20 +1996,7 @@ fn render_selection(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rec
     let selected_classification = app.selected_classification();
 
     let content = if let Some(message) = &app.error_message {
-        let is_remote_index_status = message.starts_with("Building remote index")
-            || message.starts_with("Loading persistent remote index")
-            || message.starts_with("Remote index loaded")
-            || message.starts_with("Remote index ready")
-            || message.starts_with("Remote index is still building")
-            || message.starts_with("Remote index is still loading");
-
-        let color = if is_remote_index_status {
-            theme.ui.status
-        } else {
-            theme.ui.error
-        };
-
-        Line::styled(message.clone(), Style::default().fg(color))
+        Line::styled(message.clone(), Style::default().fg(theme.ui.error))
     } else if let Some(status) = &app.status_message {
         Line::styled(status.clone(), Style::default().fg(theme.ui.status))
     } else if let Some(entry) = app.selected_entry() {
@@ -1868,6 +2040,383 @@ fn render_selection(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rec
     );
 
     frame.render_widget(paragraph, area);
+}
+
+fn render_file_info_overlay(frame: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
+    let state = app.file_info.as_ref()?;
+
+    let info = &state.info;
+
+    let theme = &app.theme;
+
+    /*
+     * Prefer a broad landscape window without allowing it to consume the
+     * complete terminal.
+     *
+     * On very wide displays the 124-column cap preserves substantial browser
+     * context around the popup. On smaller displays, four terminal cells remain
+     * visible on each side whenever possible.
+     */
+    let popup_width = area
+        .width
+        .saturating_mul(86)
+        .saturating_div(100)
+        .clamp(72, 124)
+        .min(area.width.saturating_sub(4).max(1));
+
+    /*
+     * The ordinary landscape layout needs twenty-two rows.
+     *
+     * Very short terminals surrender only a small outer margin rather than
+     * producing invalid geometry.
+     */
+    let popup_height = 22_u16.min(area.height.saturating_sub(2).max(1));
+
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(" File Information ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.frames.details));
+
+    let inner = block.inner(popup_area);
+
+    frame.render_widget(block, popup_area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    /*
+     * Layout:
+     *
+     *     Path
+     *     blank
+     *     two-column information body
+     *     blank
+     *     optional directory/cache/link line
+     *     status
+     *     close button
+     */
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(12),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    render_file_info_path(frame, rows[0], &info.path.display().to_string(), theme);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[2]);
+
+    render_file_info_left_column(frame, columns[0], info, theme);
+
+    render_file_info_right_column(frame, columns[1], info, theme);
+
+    render_file_info_context_line(frame, rows[4], info, theme);
+
+    render_file_info_status(frame, rows[5], state, theme);
+
+    let close_width = 11_u16.min(rows[6].width);
+
+    let close_area = Rect {
+        x: rows[6]
+            .x
+            .saturating_add(rows[6].width.saturating_sub(close_width) / 2),
+
+        y: rows[6].y,
+
+        width: close_width,
+
+        height: 1,
+    };
+
+    let close = Paragraph::new(Line::from(vec![
+        Span::styled("[ ", Style::default().fg(theme.frames.parent_brackets)),
+        Span::styled(
+            "Close",
+            Style::default()
+                .fg(theme.frames.parent_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ]", Style::default().fg(theme.frames.parent_brackets)),
+    ]))
+    .alignment(Alignment::Center);
+
+    frame.render_widget(close, close_area);
+
+    Some(close_area)
+}
+
+fn render_file_info_path(frame: &mut Frame, area: Rect, path: &str, theme: &Theme) {
+    let value_width = area.width.saturating_sub(8) as usize;
+
+    let path = truncate_with_ellipsis(path, value_width);
+
+    let line = Line::from(vec![
+        Span::styled(" Path: ", Style::default().fg(theme.ui.muted)),
+        Span::styled(path, Style::default().fg(theme.ui.file)),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_file_info_left_column(
+    frame: &mut Frame,
+    area: Rect,
+    info: &crate::file_info::FileInfo,
+    theme: &Theme,
+) {
+    let lines = vec![
+        file_info_section_line("Identity", theme),
+        file_info_value_line("Name", info.name.clone(), theme.ui.file, theme),
+        file_info_value_line(
+            "Classification",
+            info.classification.label().to_string(),
+            theme.ui.classification,
+            theme,
+        ),
+        file_info_value_line(
+            "Entry kind",
+            info.kind_label().to_string(),
+            theme.ui.classification,
+            theme,
+        ),
+        file_info_value_line("Extension", info.extension(), theme.ui.query, theme),
+        Line::raw(""),
+        file_info_section_line("Filesystem", theme),
+        file_info_value_line("Size", info.human_size(), theme.ui.size, theme),
+        file_info_value_line("Exact size", info.exact_size(), theme.ui.size, theme),
+        file_info_permissions_line("Permissions", &info.symbolic_permissions(), theme),
+        file_info_value_line(
+            "Octal mode",
+            info.octal_permissions(),
+            theme.permissions.special,
+            theme,
+        ),
+        file_info_value_line("Owner", info.owner(), theme.ui.user, theme),
+        file_info_value_line("Group", info.group(), theme.ui.user, theme),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_file_info_right_column(
+    frame: &mut Frame,
+    area: Rect,
+    info: &crate::file_info::FileInfo,
+    theme: &Theme,
+) {
+    let mut lines = vec![
+        file_info_section_line("Times", theme),
+        file_info_value_line("Modified", info.modified(), theme.ui.date, theme),
+        file_info_value_line("Accessed", info.accessed(), theme.ui.date, theme),
+        file_info_value_line("Created", info.created(), theme.ui.date, theme),
+        file_info_value_line("Age", info.age(), theme.ui.query, theme),
+        Line::raw(""),
+        file_info_section_line("Status", theme),
+        file_info_value_line(
+            "Executable",
+            info.executable().to_string(),
+            theme.ui.query,
+            theme,
+        ),
+        file_info_value_line("Hidden", info.hidden().to_string(), theme.ui.query, theme),
+        file_info_value_line(
+            "Source",
+            info.source_label.clone(),
+            if info.is_remote {
+                theme.ui.symlink
+            } else {
+                theme.ui.file
+            },
+            theme,
+        ),
+        file_info_value_line(
+            "Link target",
+            info.symlink_target_display(),
+            theme.ui.symlink,
+            theme,
+        ),
+        file_info_value_line(
+            "Target exists",
+            info.symlink_target_exists_display().to_string(),
+            theme.ui.query,
+            theme,
+        ),
+    ];
+
+    if let Some(cache_info) = &info.cache_info {
+        lines.push(file_info_value_line(
+            "Cached copy",
+            cache_info.cached_status().to_string(),
+            theme.ui.query,
+            theme,
+        ));
+
+        lines.push(file_info_value_line(
+            "Cached size",
+            cache_info.cached_size(),
+            theme.ui.size,
+            theme,
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_file_info_context_line(
+    frame: &mut Frame,
+    area: Rect,
+    info: &crate::file_info::FileInfo,
+    theme: &Theme,
+) {
+    let (label, value, color) = if let Some(summary) = info.directory_summary {
+        ("Contents", summary.display_line(), theme.ui.directory)
+    } else if let Some(cache_info) = &info.cache_info {
+        (
+            "Cache path",
+            cache_info.cache_path.display().to_string(),
+            theme.ui.symlink,
+        )
+    } else if info.kind == crate::entry::EntryKind::Symlink {
+        (
+            "Resolved link",
+            info.symlink_target_display(),
+            theme.ui.symlink,
+        )
+    } else {
+        (
+            "Location",
+            if info.is_remote {
+                "Remote filesystem entry".to_string()
+            } else {
+                "Local filesystem entry".to_string()
+            },
+            theme.ui.muted,
+        )
+    };
+
+    /*
+     * file_info_value_line() reserves:
+     *
+     *     two leading spaces
+     *     fifteen cells for the label
+     *
+     * The remainder belongs to the displayed value.
+     */
+    let value_width = area.width.saturating_sub(17) as usize;
+
+    let value = truncate_with_ellipsis(&value, value_width);
+
+    frame.render_widget(
+        Paragraph::new(file_info_value_line(label, value, color, theme)),
+        area,
+    );
+}
+
+fn render_file_info_status(
+    frame: &mut Frame,
+    area: Rect,
+    state: &crate::file_info::FileInfoState,
+    theme: &Theme,
+) {
+    let color = if state.error.is_some() {
+        COLOR_ERROR
+    } else if state.loading {
+        theme.ui.query
+    } else if state.info.notes.is_empty() {
+        theme.ui.query
+    } else {
+        theme.ui.muted
+    };
+
+    frame.render_widget(
+        Paragraph::new(file_info_value_line(
+            "Status",
+            state.status_line(),
+            color,
+            theme,
+        )),
+        area,
+    );
+}
+
+fn file_info_section_line(title: &str, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {} ", title),
+            Style::default()
+                .fg(theme.frames.details)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "────────────────────────",
+            Style::default().fg(theme.ui.muted),
+        ),
+    ])
+}
+
+fn file_info_value_line(
+    label: &str,
+    value: String,
+    value_color: Color,
+    theme: &Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {:<15}", format!("{}:", label)),
+            Style::default().fg(theme.ui.muted),
+        ),
+        Span::styled(value, Style::default().fg(value_color)),
+    ])
+}
+
+fn truncate_with_ellipsis(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+
+    let visible_width = width - 3;
+
+    let mut result: String = value.chars().take(visible_width).collect();
+
+    result.push_str("...");
+
+    result
+}
+
+fn file_info_permissions_line(label: &str, permissions: &str, theme: &Theme) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("  {:<15}", format!("{}:", label)),
+        Style::default().fg(theme.ui.muted),
+    )];
+
+    if permissions == "Loading…" {
+        spans.push(Span::styled(
+            permissions.to_string(),
+            Style::default().fg(theme.ui.query),
+        ));
+    } else {
+        spans.extend(permission_spans(permissions, theme));
+    }
+
+    Line::from(spans)
 }
 
 fn render_remote_index_setup_overlay(
@@ -2296,7 +2845,6 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
         connection_help_line("Backspace", "Delete from the focused field"),
         connection_help_line("Ctrl+U", "Clear the focused field"),
         connection_help_line("F4 / Esc", "Close the connection window"),
-        Line::raw(""),
         if let Some(message) = &app.connection_dialog.error_message {
             Line::styled(
                 message.clone(),
@@ -2312,6 +2860,12 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
         } else {
             Line::raw("")
         },
+        Line::styled(
+            "[ Close ]",
+            Style::default().fg(COLOR_FILE).add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center),
+        Line::raw(""),
     ];
 
     let popup = Paragraph::new(lines)
@@ -2357,6 +2911,17 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
     let button_start = popup_area
         .x
         .saturating_add(popup_area.width.saturating_sub(button_total_width) / 2);
+
+    /*
+     * The Close button occupies the final centered content row.
+     */
+    let close_width: u16 = 9;
+
+    let close_row = popup_area.y.saturating_add(22);
+
+    let close_start = popup_area
+        .x
+        .saturating_add(popup_area.width.saturating_sub(close_width) / 2);
 
     ConnectionUiRegions {
         profiles: Rect {
@@ -2417,6 +2982,16 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             y: button_row,
 
             width: 14,
+
+            height: 1,
+        },
+
+        close: Rect {
+            x: close_start,
+
+            y: close_row,
+
+            width: close_width,
 
             height: 1,
         },
@@ -2534,20 +3109,32 @@ fn connection_help_line(shortcut: &str, description: &str) -> Line<'static> {
 }
 
 fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> TransferUiRegions {
-    const POPUP_WIDTH: u16 = 64;
+    const POPUP_WIDTH: u16 = 68;
 
-    const POPUP_HEIGHT: u16 = 14;
+    /*
+     * Batch results need two additional rows for the file counts and
+     * destination directory.
+     */
+    const SINGLE_POPUP_HEIGHT: u16 = 14;
+
+    const BATCH_POPUP_HEIGHT: u16 = 16;
 
     /*
      * The popup has two border cells and the bar line has one leading space.
      */
-    const BAR_WIDTH: usize = 59;
-
-    let popup_area = centered_rect(POPUP_WIDTH, POPUP_HEIGHT, area);
+    const BAR_WIDTH: usize = 63;
 
     let Some(transfer) = app.transfer.as_ref() else {
         return TransferUiRegions::default();
     };
+
+    let popup_height = if transfer.is_batch {
+        BATCH_POPUP_HEIGHT
+    } else {
+        SINGLE_POPUP_HEIGHT
+    };
+
+    let popup_area = centered_rect(POPUP_WIDTH, popup_height, area);
 
     let elapsed = app.transfer_elapsed();
 
@@ -2563,7 +3150,11 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
 
     let finished = transfer.finished_elapsed.is_some();
 
-    let failed = transfer.error.is_some();
+    let single_failed = transfer.error.is_some();
+
+    let batch_failed = transfer.is_batch && transfer.failed_count > 0;
+
+    let failed = single_failed || batch_failed;
 
     let cancelling = transfer.cancel_requested && !finished;
 
@@ -2571,9 +3162,8 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
         if finished && !failed { 100.0 } else { 0.0 }
     } else {
         transferred_bytes as f64 * 100.0 / total_bytes as f64
-    };
-
-    let percentage = percentage.clamp(0.0, 100.0);
+    }
+    .clamp(0.0, 100.0);
 
     let filled_cells = if total_bytes == 0 {
         if finished && !failed { BAR_WIDTH } else { 0 }
@@ -2585,7 +3175,7 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
     let bar = format!(
         "{}{}",
         "█".repeat(filled_cells),
-        "░".repeat(BAR_WIDTH.saturating_sub(filled_cells,),),
+        "░".repeat(BAR_WIDTH.saturating_sub(filled_cells)),
     );
 
     let seconds = elapsed.as_secs_f64();
@@ -2598,33 +3188,7 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
 
     let speed_text = format_transfer_speed(speed_bytes_per_second);
 
-    let (title, status, status_color) = if failed {
-        (
-            " Transfer failed ",
-            "The remote file could not be prepared.",
-            COLOR_ERROR,
-        )
-    } else if finished {
-        (
-            " Transfer complete ",
-            "The file is ready to open.",
-            COLOR_QUERY,
-        )
-    } else if cancelling {
-        (
-            " Cancelling transfer ",
-            "Stopping safely and removing the unfinished download…",
-            COLOR_MUTED,
-        )
-    } else {
-        (" Remote transfer ", "Transferring remote file…", COLOR_FILE)
-    };
-
-    let transferred_line = if failed {
-        format!("{} / {}", transferred_size_text, total_text,)
-    } else {
-        format!("{} / {}", transferred_size_text, total_text,)
-    };
+    let transferred_line = format!("{} / {}", transferred_size_text, total_text);
 
     let speed_label = if finished {
         " Average speed: "
@@ -2632,44 +3196,161 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
         " Speed: "
     };
 
-    let lines = vec![
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(" File: ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(
-                transfer.filename.clone(),
-                Style::default().fg(COLOR_FILE).add_modifier(Modifier::BOLD),
+    let popup_content = if transfer.is_batch {
+        let title = if batch_failed {
+            " Batch download completed with errors "
+        } else if finished {
+            " Batch download complete "
+        } else if cancelling {
+            " Cancelling batch download "
+        } else {
+            " Batch download "
+        };
+
+        let status = if batch_failed {
+            format!(
+                "{} file{} downloaded; {} file{} failed.",
+                transfer.completed_count,
+                if transfer.completed_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                transfer.failed_count,
+                if transfer.failed_count == 1 { "" } else { "s" },
+            )
+        } else if finished {
+            format!(
+                "All {} files were downloaded successfully.",
+                transfer.completed_count,
+            )
+        } else if cancelling {
+            "Stopping safely and removing the unfinished download…".to_string()
+        } else {
+            format!(
+                "Downloading file {} of {}…",
+                transfer
+                    .item_index
+                    .saturating_add(1)
+                    .min(transfer.item_count),
+                transfer.item_count,
+            )
+        };
+
+        let status_color = if batch_failed {
+            COLOR_ERROR
+        } else if finished {
+            COLOR_QUERY
+        } else if cancelling {
+            COLOR_MUTED
+        } else {
+            COLOR_FILE
+        };
+
+        let destination = transfer
+            .destination_root
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "—".to_string());
+
+        /*
+         * Keep the destination readable without allowing a long path to
+         * distort the popup.
+         */
+        let destination = truncate_with_ellipsis(&destination, 52);
+
+        let file_progress = if finished {
+            format!(
+                "{} / {} files",
+                transfer.completed_count, transfer.item_count,
+            )
+        } else {
+            format!(
+                "{} / {}",
+                transfer
+                    .item_index
+                    .saturating_add(1)
+                    .min(transfer.item_count),
+                transfer.item_count,
+            )
+        };
+
+        let mut lines = vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(" Files: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    file_progress,
+                    Style::default()
+                        .fg(COLOR_QUERY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("    Elapsed: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(elapsed_text.clone(), Style::default().fg(COLOR_QUERY)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Destination: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(destination, Style::default().fg(COLOR_FILE)),
+            ]),
+            Line::raw(""),
+            Line::styled(format!(" {}", status), Style::default().fg(status_color)),
+            Line::from(vec![
+                Span::styled(" Transferred: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(transferred_line.clone(), Style::default().fg(COLOR_QUERY)),
+                Span::styled(
+                    format!("    {:.1}%", percentage),
+                    Style::default()
+                        .fg(COLOR_FRAME)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(speed_label, Style::default().fg(COLOR_MUTED)),
+                Span::styled(speed_text.clone(), Style::default().fg(COLOR_QUERY)),
+            ]),
+            Line::raw(""),
+            Line::styled(
+                format!(" {}", bar),
+                Style::default().fg(if batch_failed {
+                    COLOR_ERROR
+                } else {
+                    COLOR_FRAME
+                }),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled(" Size: ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(total_text, Style::default().fg(COLOR_QUERY)),
-            Span::styled("    Elapsed: ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(elapsed_text, Style::default().fg(COLOR_QUERY)),
-        ]),
-        Line::raw(""),
-        Line::styled(format!(" {}", status), Style::default().fg(status_color)),
-        Line::from(vec![
-            Span::styled(" Transferred: ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(transferred_line, Style::default().fg(COLOR_QUERY)),
-            Span::styled(
-                format!("    {:.1}%", percentage,),
-                Style::default()
-                    .fg(COLOR_FRAME)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(speed_label, Style::default().fg(COLOR_MUTED)),
-            Span::styled(speed_text, Style::default().fg(COLOR_QUERY)),
-        ]),
-        Line::raw(""),
-        Line::styled(
-            format!(" {}", bar),
-            Style::default().fg(if failed { COLOR_ERROR } else { COLOR_FRAME }),
-        ),
-        Line::raw(""),
-        if finished || failed {
+            Line::raw(""),
+        ];
+
+        if finished && batch_failed {
+            lines.push(
+                Line::styled(
+                    format!(
+                        " {} failed file{} remain{} marked for retry.",
+                        transfer.failed_count,
+                        if transfer.failed_count == 1 { "" } else { "s" },
+                        if transfer.failed_count == 1 { "s" } else { "" },
+                    ),
+                    Style::default().fg(COLOR_ERROR),
+                )
+                .alignment(Alignment::Center),
+            );
+        } else if finished {
+            lines.push(
+                Line::styled(
+                    "The batch download directory is ready.",
+                    Style::default().fg(COLOR_QUERY),
+                )
+                .alignment(Alignment::Center),
+            );
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(" Current file: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(transfer.filename.clone(), Style::default().fg(COLOR_FILE)),
+            ]));
+        }
+
+        lines.push(Line::raw(""));
+
+        let button = if finished || failed {
             Line::styled(
                 "[ OK ]",
                 Style::default()
@@ -2690,8 +3371,105 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
                     .add_modifier(Modifier::BOLD),
             )
             .alignment(Alignment::Center)
-        },
-    ];
+        };
+
+        lines.push(button);
+
+        (title, lines)
+    } else {
+        let (title, status, status_color) = if single_failed {
+            (
+                " Transfer failed ",
+                "The remote file could not be prepared.",
+                COLOR_ERROR,
+            )
+        } else if finished {
+            (
+                " Transfer complete ",
+                "The file is ready to open.",
+                COLOR_QUERY,
+            )
+        } else if cancelling {
+            (
+                " Cancelling transfer ",
+                "Stopping safely and removing the unfinished download…",
+                COLOR_MUTED,
+            )
+        } else {
+            (" Remote transfer ", "Transferring remote file…", COLOR_FILE)
+        };
+
+        let lines = vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(" File: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    transfer.filename.clone(),
+                    Style::default().fg(COLOR_FILE).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" Size: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(total_text, Style::default().fg(COLOR_QUERY)),
+                Span::styled("    Elapsed: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(elapsed_text, Style::default().fg(COLOR_QUERY)),
+            ]),
+            Line::raw(""),
+            Line::styled(format!(" {}", status), Style::default().fg(status_color)),
+            Line::from(vec![
+                Span::styled(" Transferred: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(transferred_line, Style::default().fg(COLOR_QUERY)),
+                Span::styled(
+                    format!("    {:.1}%", percentage),
+                    Style::default()
+                        .fg(COLOR_FRAME)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(speed_label, Style::default().fg(COLOR_MUTED)),
+                Span::styled(speed_text, Style::default().fg(COLOR_QUERY)),
+            ]),
+            Line::raw(""),
+            Line::styled(
+                format!(" {}", bar),
+                Style::default().fg(if single_failed {
+                    COLOR_ERROR
+                } else {
+                    COLOR_FRAME
+                }),
+            ),
+            Line::raw(""),
+            if finished || single_failed {
+                Line::styled(
+                    "[ OK ]",
+                    Style::default()
+                        .fg(app.theme.selection.text)
+                        .bg(app.theme.selection.background)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center)
+            } else if cancelling {
+                Line::styled("[ Cancelling… ]", Style::default().fg(COLOR_MUTED))
+                    .alignment(Alignment::Center)
+            } else {
+                Line::styled(
+                    "[ Cancel ]",
+                    Style::default()
+                        .fg(app.theme.selection.text)
+                        .bg(app.theme.selection.background)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center)
+            },
+        ];
+
+        (title, lines)
+    };
+
+    let title = popup_content.0;
+
+    let lines = popup_content.1;
 
     let popup = Paragraph::new(lines)
         .block(
@@ -2723,10 +3501,12 @@ fn render_transfer_overlay(frame: &mut Frame, app: &App, area: Rect) -> Transfer
                 .saturating_add(popup_area.width.saturating_sub(button_width) / 2),
 
             /*
-             * The action is the eleventh content line. The popup border occupies
-             * the preceding outer row.
+             * The action button always occupies the final content row above
+             * the lower popup border.
              */
-            y: popup_area.y.saturating_add(11),
+            y: popup_area
+                .y
+                .saturating_add(popup_area.height.saturating_sub(3)),
 
             width: button_width,
 
@@ -3011,7 +3791,7 @@ fn about_information_line(label: &str, value: &str) -> Line<'static> {
 }
 
 fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
-    const POPUP_MAX_WIDTH: u16 = 62;
+    const POPUP_MAX_WIDTH: u16 = 70;
 
     const HORIZONTAL_MARGIN: u16 = 4;
 
@@ -3030,7 +3810,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
 
     let popup_area = centered_rect(popup_width, popup_height, area);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
 
     let deletion_binding = if app.enable_deletion {
         ("Delete", "Delete the selected local entry")
@@ -3038,6 +3818,13 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
         ("Delete", "Delete sel. entry (enable via scry.toml)")
     };
 
+    /*
+     * Normal Mode contains the controls that form Scry's ordinary browsing
+     * interface and the global controls that remain useful in every view.
+     *
+     * The conditional Delete entry must remain at index 6, immediately after
+     * Enter and before Ctrl+T.
+     */
     let mut normal_bindings = vec![
         ("↑ / ↓", "Move the selection"),
         ("PgUp / PgDn", "Move one visible page"),
@@ -3053,6 +3840,12 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
         ("Ctrl+D", "Show or hide Details"),
         ("Ctrl+S", "Show or hide Selection"),
         ("Alt+M", "Show or hide metadata"),
+        ("F7", "Toggle Permissions column"),
+        ("F8", "Toggle Size column"),
+        ("F9", "Toggle Date column"),
+        ("F10", "Toggle User column"),
+        ("Ctrl+Y", "Copy the selected entry's full path"),
+        ("F2", "Show detailed file information"),
         ("F4", "Open SSH connections manager"),
         ("Ctrl+!", "Open or close this window"),
         ("Alt+A", "Open the About window"),
@@ -3063,56 +3856,70 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
 
     push_shortcut_section(&mut lines, "Normal Mode", &normal_bindings);
 
-    let mut tree_bindings = vec![
-        ("↑ / ↓", "Move through visible nodes"),
-        ("PgUp / PgDn", "Move one visible page"),
-        ("Home / End", "Select first or last node"),
-        ("→", "Expand the selected directory"),
-        ("← / Esc", "Collapse or select the parent"),
-        ("Enter", "Make directory the new root"),
-        ("Ctrl+T", "Return to List mode"),
-        ("Alt+H", "Show or hide hidden entries"),
-        ("Ctrl+O", "Cycle through sort modes"),
-        ("Alt+R", "Toggle recursive mode"),
-        ("Ctrl+R", "Reverse the sort direction"),
-        ("Ctrl+D", "Show or hide Details"),
-        ("Ctrl+S", "Show or hide Selection"),
-        ("Alt+M", "Show or hide metadata"),
-        ("F4", "Open SSH connections manager"),
-        ("Ctrl+!", "Open or close this window"),
-        ("Alt+A", "Open the About window"),
-        ("Ctrl+C", "Exit Scry"),
-    ];
+    /*
+     * Tree Mode lists only the controls whose meaning changes when the
+     * hierarchical view is active. All ordinary and global controls remain
+     * documented once under Normal Mode above.
+     */
+    push_shortcut_section(
+        &mut lines,
+        "Tree Mode",
+        &[
+            ("↑ / ↓", "Move through visible nodes"),
+            ("→", "Expand the selected directory"),
+            ("← / Esc", "Collapse or select the parent"),
+            ("Enter", "Make directory the new root"),
+            ("Ctrl+T", "Return to List mode"),
+        ],
+    );
 
-    tree_bindings.insert(6, deletion_binding);
+    /*
+     * Search Mode lists only controls specifically concerned with query editing,
+     * search policy, committing modifiers, and returning from search results.
+     *
+     * Backspace edits the query only and never navigates to the parent directory.
+     */
+    push_shortcut_section(
+        &mut lines,
+        "Search Mode",
+        &[
+            ("Type", "Filter or search entries"),
+            ("Backspace", "Delete the character before the caret"),
+            ("Ctrl+H", "Delete the character before the caret"),
+            ("Ctrl+U", "Clear the complete search"),
+            ("Ctrl+←", "Move left in the search field"),
+            ("Ctrl+→", "Move right in the search field"),
+            ("Ctrl+Home", "Move to the beginning of the search field"),
+            ("Ctrl+End", "Move to the end of the search field"),
+            ("Ctrl+F", "Toggle Fuzzy search"),
+            ("Alt+R", "Toggle Recursive search"),
+            ("Enter", "Commit a pending modifier or activate the result"),
+            ("← / Esc", "Return to parent or previous search state"),
+        ],
+    );
 
-    push_shortcut_section(&mut lines, "Tree Mode", &tree_bindings);
+    /*
+     * Query syntax and type names come directly from query.rs.
+     *
+     * The parser and this reference therefore cannot drift apart.
+     */
+    push_shortcut_section(&mut lines, "Query Modifiers", QUERY_SYNTAX_REFERENCE);
 
-    let mut search_bindings = vec![
-        ("Type", "Filter or search entries"),
-        ("↑ / ↓", "Move through results"),
-        ("PgUp / PgDn", "Move one visible page"),
-        ("Home / End", "Select first or last result"),
-        ("Backspace", "Delete one search character"),
-        ("Ctrl+H", "Delete one character"),
-        ("Alt+H", "Show or hide hidden entries"),
-        ("Ctrl+U", "Clear the complete search"),
-        ("Enter", "Open or locate the result"),
-        ("← / Esc", "Enter the parent directory"),
-        ("Alt+R", "Toggle recursive mode"),
-        ("Ctrl+R", "Reverse the sort direction"),
-        ("Ctrl+D", "Show or hide Details"),
-        ("Ctrl+S", "Show or hide Selection"),
-        ("Alt+M", "Show or hide metadata"),
-        ("F4", "Open SSH connections manager"),
-        ("Ctrl+!", "Open or close this window"),
-        ("Alt+A", "Open the About window"),
-        ("Ctrl+C", "Exit Scry"),
-    ];
+    push_query_type_reference(&mut lines);
 
-    search_bindings.insert(9, deletion_binding);
-
-    push_shortcut_section(&mut lines, "Search Mode", &search_bindings);
+    /*
+     * SSH controls apply regardless of whether the remote listing is currently
+     * shown in List, Tree, or Search mode.
+     */
+    push_shortcut_section(
+        &mut lines,
+        "SSH",
+        &[
+            ("Ctrl+Space", "Mark or unmark the selected file"),
+            ("Alt+U", "Clear all marked files"),
+            ("Alt+D", "Download all marked files"),
+        ],
+    );
 
     push_shortcut_section(
         &mut lines,
@@ -3142,31 +3949,27 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
     let content_area = block.inner(popup_area);
 
     /*
-     * Keep one free column beside the text so it does not collide with the
-     * scrollbar.
+     * The shortcut lines were assembled above specifically for this compact
+     * legend. Do not replace them with the full Help document.
      */
-    let text_width = content_area.width.saturating_sub(2) as usize;
-
-    let lines = help::content(&app.theme, text_width);
-
     let viewport_height = content_area.height as usize;
 
     let content_height = lines.len();
 
-    app.help_max_scroll = content_height.saturating_sub(viewport_height) as u16;
+    app.legend_max_scroll = content_height.saturating_sub(viewport_height) as u16;
 
-    app.help_scroll = app.help_scroll.min(app.help_max_scroll);
+    app.legend_scroll = app.legend_scroll.min(app.legend_max_scroll);
 
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .scroll((app.help_scroll, 0))
+        .scroll((app.legend_scroll, 0))
         .style(Style::default().bg(Color::Rgb(15, 16, 22)));
 
     frame.render_widget(Clear, popup_area);
 
     frame.render_widget(paragraph, popup_area);
 
-    if app.help_max_scroll > 0 && content_area.height > 0 {
+    if app.legend_max_scroll > 0 && content_area.height > 0 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
@@ -3175,11 +3978,11 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             .track_style(Style::default().fg(app.theme.scrollbar.track))
             .thumb_style(Style::default().fg(app.theme.scrollbar.thumb));
 
-        let scrollbar_position = if app.help_max_scroll == 0 {
+        let scrollbar_position = if app.legend_max_scroll == 0 {
             0
         } else {
-            app.help_scroll as usize * content_height.saturating_sub(1)
-                / app.help_max_scroll as usize
+            app.legend_scroll as usize * content_height.saturating_sub(1)
+                / app.legend_max_scroll as usize
         };
 
         let mut scrollbar_state = ScrollbarState::new(content_height)
@@ -3189,7 +3992,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
         frame.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
     }
 
-    if app.help_max_scroll == 0 || content_area.height == 0 {
+    if app.legend_max_scroll == 0 || content_area.height == 0 {
         None
     } else {
         Some(Rect {
@@ -3206,8 +4009,50 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
     }
 }
 
+fn push_query_type_reference(lines: &mut Vec<Line<'static>>) {
+    if lines.iter().any(|line| !line.spans.is_empty()) {
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::styled(
+        "  Type Values",
+        Style::default()
+            .fg(COLOR_FRAME)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    lines.push(Line::styled(
+        "  Use these values after type:. Aliases are shown on the right.",
+        Style::default().fg(COLOR_MUTED),
+    ));
+
+    lines.push(Line::raw(""));
+
+    for reference in QUERY_TYPE_REFERENCES {
+        let aliases = if reference.aliases.is_empty() {
+            "—".to_string()
+        } else {
+            format!("aliases: {}", reference.aliases.join(", "))
+        };
+
+        lines.push(query_type_reference_line(reference.canonical, &aliases));
+    }
+}
+
+fn query_type_reference_line(canonical: &str, aliases: &str) -> Line<'static> {
+    const TYPE_WIDTH: usize = 16;
+
+    Line::from(vec![
+        Span::styled(
+            format!("  {:<width$}", canonical, width = TYPE_WIDTH),
+            Style::default().fg(COLOR_QUERY),
+        ),
+        Span::styled(aliases.to_string(), Style::default().fg(COLOR_MUTED)),
+    ])
+}
+
 fn push_shortcut_section(lines: &mut Vec<Line<'static>>, title: &str, bindings: &[(&str, &str)]) {
-    if !lines.is_empty() {
+    if lines.iter().any(|line| !line.spans.is_empty()) {
         lines.push(Line::raw(""));
     }
 
@@ -3389,27 +4234,30 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         "Hidden:off"
     };
 
+    #[allow(unused)]
     let details_state = if app.show_details {
-        "Details:on"
+        "details:on"
     } else {
-        "Details:off"
+        "details:off"
     };
 
+    #[allow(unused)]
     let selection_state = if app.show_selection {
-        "Select:on"
+        "delect:on"
     } else {
-        "Select:off"
+        "delect:off"
     };
 
     let any_columns_enabled =
         app.show_permissions || app.show_size || app.show_date || app.show_user;
 
+    #[allow(unused)]
     let columns_state = if !app.show_columns {
-        "Meta:off"
+        "meta:off"
     } else if any_columns_enabled {
-        "Meta:on"
+        "meta:on"
     } else {
-        "Meta:empty"
+        "meta:empty"
     };
 
     let recursive_state = if app.recursive_mode {
@@ -3418,32 +4266,50 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         "recursive:off"
     };
 
+    let tree_state = if app.view_mode == ViewMode::Tree {
+        "Tree:on"
+    } else {
+        "Tree:off"
+    };
+
+    let fuzzy_state = if app.search_mode == SearchMode::Fuzzy {
+        "Fuzzy:on"
+    } else {
+        "Fuzzy:off"
+    };
+
+    #[allow(unused)]
     let delete_hint = if app.enable_deletion {
         " Del Delete "
     } else {
         ""
     };
 
-    let footer = if app.view_mode == ViewMode::Tree {
-        // Tree View Help Text
-        format!(
-            " ^? More  F4 SSH  ↑/↓ Move  ← Collapse  → Expand  Alt+H ({})  Enter Select/open {} ^C Exit ",
-            hidden_state, delete_hint,
-        )
-    } else if app.query.is_empty() {
-        // Normal View Help Text
-        format!(
-            " ^? More  F4 SSH  Enter Select/open {} Alt+H ({})  ^D {} ^S {}  Alt+M {}  ^C Exit ",
-            delete_hint, hidden_state, details_state, selection_state, columns_state,
-        )
-    } else {
+    let footer = if !app.query.is_empty() {
         // Active Search Help Text
         format!(
-            " ^? More  ↑/↓ Move  PgUp ↑  PgDn ↓  Enter Select/open {} Alt+R {}  ^U Clear  ^C Exit ",
-            delete_hint, recursive_state,
+            " ↑/↓/←/→ Move  Enter Open  Alt+R {}  ^F {}  ^U Clear  ^O Sort Mode  F2 Info  ^Y Copy",
+            recursive_state, fuzzy_state,
+        )
+    } else if app.view_mode == ViewMode::Tree {
+        // Tree View Help Text
+        format!(
+            " ^? Help  ^! Legend  ↑/↓/←/→ Move  Enter Open  F4 SSH  ^T {}  Alt+H {}  Alt+M Meta  ^C Exit",
+            tree_state, hidden_state,
+        )
+    } else if app.source_is_remote() {
+        // SSH Normal View Help Text
+        format!(
+            " ^! Legend  ^Space Select  Alt+U Clear Select  Enter Open  Alt+D Download  F4 SSH  ^T {}  ^C Exit",
+            tree_state,
+        )
+    } else {
+        // Normal View Help Text
+        format!(
+            " ^? Help  ^! Legend  ↑/↓/←/→ Move  Enter Open  F4 SSH  ^T {}  Alt+H {}  Alt+M Meta  ^C Exit",
+            tree_state, hidden_state,
         )
     };
-
     let paragraph = Paragraph::new(footer).style(Style::default().fg(COLOR_MUTED));
 
     frame.render_widget(paragraph, area);

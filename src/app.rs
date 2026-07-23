@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+use chrono::Local;
+use cli_clipboard::{ClipboardContext, ClipboardProvider};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
@@ -16,20 +18,45 @@ use users::get_user_by_uid;
 use crate::classify::{FileClass, inspect_file};
 use crate::config::{ScryConfig, SshConfig};
 use crate::connection::{ConnectionDialogState, ConnectionStore};
-use crate::fuzzy::{FuzzyWorkerResult, start_fuzzy_worker};
-use crate::query::{entry_matches_query, has_pending_trailing_modifier, parse_query};
+use crate::file_info::{FileInfo, FileInfoMessage, FileInfoState};
+use crate::fuzzy::{FuzzyWorkerResult, WorkerEntryFilter, start_exact_worker, start_fuzzy_worker};
+use crate::query::{entry_matches_query, parse_query};
 use crate::remote_index::{
     LoadedRemoteIndex, RemoteIndexBuildMessage, RemoteIndexIdentity, load_remote_index,
 };
 use crate::scan::{FileEntry, RecursiveScanMode, ScanMessage, SortMode, sort_entries};
 use crate::search_index::SearchIndex;
+use crate::session::{SESSION_FORMAT_VERSION, SessionMarkedFile, SessionSource, SessionState};
 use crate::source::{FileSource, LocalSource, TransferControl, TransferProgress};
 use crate::ssh::{SftpSource, SshTarget};
 use crate::themes::Theme;
 
+const INFO_NOTIFICATION_DURATION: Duration = Duration::from_secs(5);
+
+const ERROR_NOTIFICATION_DURATION: Duration = Duration::from_secs(7);
+
+/*
+ * Recursive indexes may contain millions of records.
+ *
+ * Query text is drawn immediately, but background searching waits briefly for
+ * a natural typing pause so one rapid word does not launch one complete worker
+ * generation per character.
+ */
+const RECURSIVE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(75);
+
+/*
+ * Exact List mode remains unlimited.
+ *
+ * Exact Tree mode is a navigational representation and therefore retains only
+ * a bounded number of direct matches before connecting their ancestors.
+ */
+pub(crate) const EXACT_TREE_MATCH_LIMIT: usize = 5_000;
+
 #[derive(Debug, Clone)]
 struct LocalSessionState {
     directory: PathBuf,
+
+    home_directory: PathBuf,
 
     selected_path: Option<PathBuf>,
 
@@ -99,6 +126,31 @@ pub enum SearchMode {
     Exact,
 
     Fuzzy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryFilter {
+    All,
+
+    FilesOnly,
+
+    DirectoriesOnly,
+}
+
+impl EntryFilter {
+    fn matches(self, entry: &FileEntry) -> bool {
+        match self {
+            Self::All => true,
+
+            /*
+             * Symlinks remain file-like results unless they were classified as
+             * directories by the source itself.
+             */
+            Self::FilesOnly => !entry.is_directory,
+
+            Self::DirectoriesOnly => entry.is_directory,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,11 +271,14 @@ pub struct TreeRow {
 struct ConnectionWorkerSuccess {
     source: Box<dyn FileSource>,
 
+    target: SshTarget,
+
     directory: PathBuf,
+
+    home_directory: PathBuf,
 
     entries: Vec<FileEntry>,
 }
-
 #[derive(Debug)]
 struct ConnectionWorkerResult {
     result: Result<ConnectionWorkerSuccess, String>,
@@ -237,10 +292,44 @@ struct TransferWorkerResult {
 }
 
 #[derive(Debug)]
+struct BatchTransferFailure {
+    remote_path: PathBuf,
+
+    message: String,
+}
+
+#[derive(Debug)]
+struct BatchTransferWorkerResult {
+    source: Box<dyn FileSource>,
+
+    completed_paths: Vec<PathBuf>,
+
+    failures: Vec<BatchTransferFailure>,
+
+    cancelled: bool,
+}
+
+#[derive(Debug)]
 enum TransferWorkerMessage {
     Progress(TransferProgress),
 
+    BatchProgress {
+        item_index: usize,
+
+        item_count: usize,
+
+        filename: String,
+
+        item_transferred_bytes: u64,
+
+        item_total_bytes: u64,
+
+        completed_bytes: u64,
+    },
+
     Finished(TransferWorkerResult),
+
+    BatchFinished(BatchTransferWorkerResult),
 }
 
 #[derive(Debug)]
@@ -263,6 +352,29 @@ pub struct TransferState {
 
     local_path: Option<PathBuf>,
 
+    /*
+     * Batch-transfer information.
+     *
+     * Single-file Enter leaves destination_root as None and item_count as one.
+     */
+    pub destination_root: Option<PathBuf>,
+
+    pub item_index: usize,
+
+    pub item_count: usize,
+
+    pub item_transferred_bytes: u64,
+
+    pub item_total_bytes: u64,
+
+    pub completed_count: usize,
+
+    pub failed_count: usize,
+
+    pub failures: Vec<String>,
+
+    pub is_batch: bool,
+
     receiver: Receiver<TransferWorkerMessage>,
 
     cancel_signal: Arc<AtomicBool>,
@@ -270,7 +382,13 @@ pub struct TransferState {
 
 /*
  * The real source temporarily lives inside the transfer worker.
- *
+ *struct AppClipboard(ClipboardContext);
+
+impl fmt::Debug for AppClipboard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AppClipboard")
+    }
+}
  * This placeholder keeps App structurally valid while the worker owns the
  * SSH/SFTP source. The transfer popup is modal, so filesystem operations are
  * not permitted while this placeholder is installed.
@@ -332,18 +450,89 @@ impl FileSource for TransferPlaceholderSource {
         Err(Self::unavailable())
     }
 
+    fn download_file_to(
+        &mut self,
+        _source_path: &Path,
+        _destination_path: &Path,
+        _progress: &mut dyn FnMut(TransferProgress) -> io::Result<TransferControl>,
+    ) -> io::Result<PathBuf> {
+        Err(Self::unavailable())
+    }
+
     fn is_remote(&self) -> bool {
         true
     }
+}
+
+struct AppClipboard(ClipboardContext);
+
+impl fmt::Debug for AppClipboard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AppClipboard")
+    }
+}
+
+/*
+ * Persistent information retained for every marked file.
+ *
+ * Directory listings are replaced as the user navigates, so retaining only
+ * the path would lose the original filename and byte size needed to construct
+ * a truthful multi-file transfer queue later.
+ */
+#[derive(Debug, Clone)]
+struct MarkedFile {
+    path: PathBuf,
+
+    filename: String,
+
+    size_bytes: u64,
+}
+
+/*
+ * One immutable file operation inside a marked SSH batch.
+ *
+ * The destination path is calculated before the worker starts. Depending on
+ * configuration, it either preserves the remote hierarchy or places the file
+ * directly beneath the batch root with safe collision disambiguation.
+ */
+#[derive(Debug, Clone)]
+struct BatchTransferItem {
+    remote_path: PathBuf,
+
+    destination_path: PathBuf,
+
+    filename: String,
+
+    expected_size: u64,
 }
 
 #[derive(Debug)]
 pub struct App {
     source: Box<dyn FileSource>,
 
+    /*
+     * Complete identity of the active SSH source.
+     *
+     * This remains available even while the real source temporarily lives in a
+     * transfer worker and App contains TransferPlaceholderSource.
+     */
+    active_ssh_target: Option<SshTarget>,
+
     pub current_directory: PathBuf,
 
+    pub home_directory: PathBuf,
+
     pub entries: Vec<FileEntry>,
+
+    /*
+     * Files explicitly marked for a future batch operation.
+     *
+     * Full paths allow marks to survive filtering, directory navigation,
+     * and switching between List and Tree modes.
+     *
+     * Directories are not markable during the first implementation stage.
+     */
+    marked_files: HashMap<PathBuf, MarkedFile>,
 
     pub recursive_entries: Vec<FileEntry>,
 
@@ -356,6 +545,17 @@ pub struct App {
      * every worker update.
      */
     recursive_path_indices: HashMap<PathBuf, usize>,
+
+    /*
+     * Direct-child lookup for the resident recursive corpus.
+     *
+     * Each value contains indices into recursive_entries for entries whose
+     * immediate parent is the corresponding directory.
+     *
+     * Recursive Tree branch expansion can therefore inspect only the selected
+     * directory's children instead of scanning the complete corpus.
+     */
+    recursive_child_indices: HashMap<PathBuf, Vec<usize>>,
 
     search_index: Arc<SearchIndex>,
 
@@ -371,6 +571,17 @@ pub struct App {
     pub query_cursor: usize,
 
     pub search_mode: SearchMode,
+
+    pub entry_filter: EntryFilter,
+
+    pub allow_file_opening: bool,
+
+    /*
+     * Close Scry only after an external opener has been launched successfully.
+     *
+     * Failed opens and directory navigation leave the application running.
+     */
+    pub exit_on_open: bool,
 
     pub theme: Theme,
 
@@ -398,7 +609,23 @@ pub struct App {
 
     pub selected: usize,
 
-    pub opened_file_path: Option<PathBuf>,
+    /*
+     * True only while the entries scrollbar is actively being dragged.
+     *
+     * The renderer may use this to hide the ordinary selection highlight while
+     * the viewport itself is moving.
+     */
+    pub scrollbar_drag_active: bool,
+
+    clipboard: Option<AppClipboard>,
+
+    last_copied_path: Option<String>,
+
+    pub file_info: Option<FileInfoState>,
+
+    file_info_generation: u64,
+
+    file_info_receiver: Option<Receiver<FileInfoMessage>>,
 
     pub transfer: Option<TransferState>,
 
@@ -412,14 +639,22 @@ pub struct App {
 
     pending_selection_path: Option<PathBuf>,
 
+    /*
+     * Viewport offset waiting for an asynchronous recursive scan or remote-index
+     * load to make the restored selection visible.
+     */
+    pending_session_list_offset: Option<usize>,
+
     pub error_message: Option<String>,
+
+    error_message_expires_at: Option<Instant>,
 
     /*
      * Non-error operational information shown in amber.
-     *
-     * Examples include remote-index loading, building, and successful completion.
      */
     pub status_message: Option<String>,
+
+    status_message_expires_at: Option<Instant>,
 
     pub should_quit: bool,
 
@@ -473,6 +708,10 @@ pub struct App {
 
     pub help_max_scroll: u16,
 
+    pub legend_scroll: u16,
+
+    pub legend_max_scroll: u16,
+
     pub tree_rows: Vec<TreeRow>,
 
     pub filtered_tree_indices: Vec<usize>,
@@ -511,11 +750,24 @@ pub struct App {
 
     active_fuzzy_request: Option<FuzzyRequestIdentity>,
 
+    /*
+     * Deadline for the newest recursive query edit.
+     *
+     * None means no debounced search is waiting to launch.
+     */
+    pending_recursive_search_at: Option<Instant>,
+
     pub fuzzy_filter_in_progress: bool,
 
     pub fuzzy_examined: usize,
 
     pub fuzzy_total: usize,
+
+    /*
+     * True when the completed Exact Recursive Tree result exceeded the configured
+     * direct-match cap.
+     */
+    pub exact_tree_limit_reached: bool,
 
     navigation_states: HashMap<PathBuf, NavigationState>,
 
@@ -524,14 +776,46 @@ pub struct App {
     pub search_navigation_active: bool,
 }
 
+/*
+ * Decide whether an entry is hidden relative to the current search root.
+ *
+ * Recursive results must hide the complete subtree beneath a dot-directory,
+ * not merely entries whose own filename starts with a dot.
+ *
+ * Example beneath /home/ferusx:
+ *
+ *     .cache                         hidden
+ *     .cache/chromium                hidden
+ *     .cache/chromium/Default        hidden
+ */
+fn entry_is_hidden_below(entry: &FileEntry, root: &Path) -> bool {
+    let relative_path = entry.path.strip_prefix(root).unwrap_or(&entry.path);
+
+    relative_path.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy();
+
+        component != "." && component != ".." && component.starts_with('.')
+    })
+}
+
 impl App {
     pub fn new(start_path: PathBuf) -> io::Result<Self> {
         let current_directory = normalize_start_path(start_path)?;
 
-        Self::with_source(current_directory, Box::new(LocalSource::new()))
+        let home_directory = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| current_directory.clone());
+
+        Self::with_source_and_home(
+            current_directory,
+            home_directory,
+            Box::new(LocalSource::new()),
+        )
     }
-    pub fn with_source(
+
+    pub fn with_source_and_home(
         current_directory: PathBuf,
+        home_directory: PathBuf,
         mut source: Box<dyn FileSource>,
     ) -> io::Result<Self> {
         let sort_mode = SortMode::Name;
@@ -547,13 +831,21 @@ impl App {
         let mut app = Self {
             source,
 
+            active_ssh_target: None,
+
             current_directory,
 
+            home_directory,
+
             entries,
+
+            marked_files: HashMap::new(),
 
             recursive_entries: Vec::new(),
 
             recursive_path_indices: HashMap::new(),
+
+            recursive_child_indices: HashMap::new(),
 
             search_index: Arc::new(SearchIndex::new()),
 
@@ -564,6 +856,12 @@ impl App {
             query_cursor: 0,
 
             search_mode: SearchMode::Exact,
+
+            entry_filter: EntryFilter::All,
+
+            allow_file_opening: true,
+
+            exit_on_open: false,
 
             theme: Theme::default(),
 
@@ -589,7 +887,15 @@ impl App {
 
             sort_descending,
 
-            opened_file_path: None,
+            clipboard: None,
+
+            last_copied_path: None,
+
+            file_info: None,
+
+            file_info_generation: 0,
+
+            file_info_receiver: None,
 
             transfer: None,
 
@@ -599,15 +905,23 @@ impl App {
 
             selected: 0,
 
+            scrollbar_drag_active: false,
+
             list_offset: 0,
 
             viewport_rows: 1,
 
             pending_selection_path: None,
 
+            pending_session_list_offset: None,
+
             error_message: None,
 
+            error_message_expires_at: None,
+
             status_message: None,
+
+            status_message_expires_at: None,
 
             should_quit: false,
 
@@ -655,6 +969,10 @@ impl App {
 
             help_max_scroll: 0,
 
+            legend_scroll: 0,
+
+            legend_max_scroll: 0,
+
             tree_rows: Vec::new(),
 
             filtered_tree_indices: Vec::new(),
@@ -693,11 +1011,15 @@ impl App {
 
             active_fuzzy_request: None,
 
+            pending_recursive_search_at: None,
+
             fuzzy_filter_in_progress: false,
 
             fuzzy_examined: 0,
 
             fuzzy_total: 0,
+
+            exact_tree_limit_reached: false,
 
             navigation_states: HashMap::new(),
 
@@ -709,6 +1031,16 @@ impl App {
         app.refresh_filter();
 
         Ok(app)
+    }
+
+    /*
+     * Record the SSH identity associated with a source installed outside App.
+     *
+     * Direct --ssh startup constructs the source in main.rs, whereas connections
+     * opened through F4 receive their target through ConnectionWorkerSuccess.
+     */
+    pub fn set_active_ssh_target(&mut self, target: SshTarget) {
+        self.active_ssh_target = Some(target);
     }
 
     pub fn apply_startup_config(&mut self, config: &ScryConfig) {
@@ -727,6 +1059,12 @@ impl App {
         self.ssh_config = config.ssh;
 
         self.enable_deletion = config.features.enable_deletion;
+
+        self.allow_file_opening = config.features.allow_file_opening;
+
+        self.exit_on_open = config.features.exit_on_open;
+
+        self.show_icons = config.display.show_icons;
 
         self.show_details = config.display.show_details;
 
@@ -771,17 +1109,143 @@ impl App {
         self.apply_sort();
 
         /*
+         * Establish startup search policy before recursive or Tree mode is enabled.
+         *
+         * These can be assigned directly because startup begins with an empty query
+         * and no active background fuzzy worker.
+         */
+        self.search_mode = if config.browser.fuzzy {
+            SearchMode::Fuzzy
+        } else {
+            SearchMode::Exact
+        };
+
+        self.entry_filter = match config.browser.entry_filter.as_str() {
+            "files" => EntryFilter::FilesOnly,
+
+            "directories" => EntryFilter::DirectoriesOnly,
+
+            _ => EntryFilter::All,
+        };
+
+        /*
          * Recursive mode must be established before Tree mode. That allows
          * toggle_tree_mode() to choose the recursive-tree startup route when both
          * settings are enabled.
          */
-        if config.browser.recursive && !self.recursive_mode {
-            self.enable_recursive_mode();
+        if config.browser.recursive {
+            self.request_recursive_mode();
         }
 
         if config.browser.view == "tree" && self.view_mode != ViewMode::Tree {
             self.toggle_tree_mode();
         }
+    }
+
+    pub fn set_entry_filter(&mut self, entry_filter: EntryFilter) {
+        if self.entry_filter == entry_filter {
+            return;
+        }
+
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+
+        self.entry_filter = entry_filter;
+
+        match self.view_mode {
+            ViewMode::List => {
+                self.refresh_filter();
+            }
+
+            ViewMode::Tree if self.recursive_search_active() => {
+                if self.search_mode == SearchMode::Fuzzy
+                    && !self.query.is_empty()
+                    && self.query != "."
+                {
+                    self.start_current_fuzzy_filter();
+                } else {
+                    self.rebuild_recursive_search_tree(selected_path.clone());
+                }
+            }
+
+            ViewMode::Tree => {
+                self.refresh_tree_filter();
+            }
+        }
+
+        if let Some(path) = selected_path {
+            self.select_visible_path(&path);
+        }
+
+        self.ensure_selection_visible(self.viewport_rows);
+    }
+
+    pub fn disable_file_opening(&mut self) {
+        self.allow_file_opening = false;
+    }
+
+    pub fn enable_exit_on_open(&mut self) {
+        self.exit_on_open = true;
+    }
+
+    pub fn enable_preserved_download_hierarchy(&mut self) {
+        self.ssh_config.preserve_hierarchy = true;
+    }
+
+    pub fn set_startup_query(&mut self, query: String) {
+        self.search_navigation_active = false;
+
+        self.search_return_state = None;
+
+        self.query = query;
+
+        self.query_cursor = self.query.len();
+        self.selected = 0;
+
+        self.list_offset = 0;
+
+        if self.recursive_search_active() {
+            self.ensure_recursive_scan();
+        }
+
+        match self.view_mode {
+            ViewMode::List => {
+                self.refresh_filter();
+            }
+
+            ViewMode::Tree if self.recursive_search_active() => {
+                if !self.scan_in_progress {
+                    match self.search_mode {
+                        SearchMode::Exact => {
+                            self.start_current_exact_filter();
+                        }
+
+                        SearchMode::Fuzzy => {
+                            self.start_current_fuzzy_filter();
+                        }
+                    }
+                }
+            }
+
+            ViewMode::Tree => {
+                self.refresh_tree_filter();
+            }
+        }
+    }
+
+    pub fn enable_fuzzy_mode(&mut self) {
+        if self.search_mode == SearchMode::Fuzzy {
+            return;
+        }
+
+        self.toggle_search_mode();
+    }
+
+    fn effective_query_is_active(&self) -> bool {
+        if self.query == "." {
+            return false;
+        }
+
+        !parse_query(&self.query).is_effectively_empty()
     }
 
     pub fn recursive_search_active(&self) -> bool {
@@ -796,8 +1260,283 @@ impl App {
         self.source.source_label()
     }
 
+    /*
+     * Timed informational and success notification.
+     *
+     * These messages are displayed in the normal amber status color and disappear
+     * automatically after five seconds.
+     */
+    pub fn show_info_message(&mut self, message: impl Into<String>) {
+        self.error_message = None;
+
+        self.error_message_expires_at = None;
+
+        self.status_message = Some(message.into());
+
+        self.status_message_expires_at = Some(Instant::now() + INFO_NOTIFICATION_DURATION);
+    }
+
+    /*
+     * Timed error notification.
+     *
+     * Errors remain visible slightly longer than ordinary information because they
+     * generally require more attention from the user.
+     */
+    pub fn show_error_message(&mut self, message: impl Into<String>) {
+        self.status_message = None;
+
+        self.status_message_expires_at = None;
+
+        self.error_message = Some(message.into());
+
+        self.error_message_expires_at = Some(Instant::now() + ERROR_NOTIFICATION_DURATION);
+    }
+
+    /*
+     * Persistent informational state.
+     *
+     * Examples:
+     *
+     *     Building remote index…
+     *     Loading persistent remote index…
+     *
+     * These remain until the operation replaces or explicitly clears them.
+     */
+    pub fn show_persistent_info_message(&mut self, message: impl Into<String>) {
+        self.error_message = None;
+
+        self.error_message_expires_at = None;
+
+        self.status_message = Some(message.into());
+
+        self.status_message_expires_at = None;
+    }
+
+    pub fn clear_messages(&mut self) {
+        self.error_message = None;
+
+        self.error_message_expires_at = None;
+
+        self.status_message = None;
+
+        self.status_message_expires_at = None;
+    }
+
+    /*
+     * Called by the event loop even when no keyboard or mouse input occurs.
+     *
+     * Returning true requests a redraw so the expired notification disappears
+     * immediately rather than waiting for the next user action.
+     */
+    pub fn process_notification_timeouts(&mut self) -> bool {
+        let now = Instant::now();
+
+        let mut changed = false;
+
+        if self
+            .error_message_expires_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.error_message = None;
+
+            self.error_message_expires_at = None;
+
+            changed = true;
+        }
+
+        if self
+            .status_message_expires_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.status_message = None;
+
+            self.status_message_expires_at = None;
+
+            changed = true;
+        }
+
+        changed
+    }
+
     pub fn source_is_remote(&self) -> bool {
         self.source.is_remote()
+    }
+
+    /*
+     * Build a serializable snapshot of the stable browser state.
+     *
+     * Transient overlays, workers, transfers, notifications, and confirmation
+     * dialogs are deliberately excluded by the SessionState schema.
+     */
+    pub fn session_state(&self) -> io::Result<SessionState> {
+        let source = match self.active_ssh_target.as_ref() {
+            Some(target) => SessionSource::Ssh {
+                host: target.host.clone(),
+
+                user: target.user.clone(),
+
+                port: target.port,
+
+                identity_file: target.identity_file.clone(),
+
+                directory: self.current_directory.clone(),
+
+                home_directory: self.home_directory.clone(),
+            },
+
+            None => SessionSource::Local {
+                directory: self.current_directory.clone(),
+
+                home_directory: self.home_directory.clone(),
+            },
+        };
+
+        let mut marked_files: Vec<SessionMarkedFile> = self
+            .marked_files
+            .values()
+            .map(|marked| SessionMarkedFile {
+                path: marked.path.clone(),
+
+                filename: marked.filename.clone(),
+
+                size_bytes: marked.size_bytes,
+            })
+            .collect();
+
+        /*
+         * HashMap order is undefined. Stable ordering makes session files easier to
+         * inspect, compare, and test.
+         */
+        marked_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        Ok(SessionState {
+            version: SESSION_FORMAT_VERSION,
+
+            source,
+
+            selected_path: self.selected_entry().map(|entry| entry.path.clone()),
+
+            list_offset: self.list_offset,
+
+            query: self.query.clone(),
+
+            view_mode: match self.view_mode {
+                ViewMode::List => "list",
+
+                ViewMode::Tree => "tree",
+            }
+            .to_string(),
+
+            search_mode: match self.search_mode {
+                SearchMode::Exact => "exact",
+
+                SearchMode::Fuzzy => "fuzzy",
+            }
+            .to_string(),
+
+            recursive: self.recursive_mode,
+
+            entry_filter: match self.entry_filter {
+                EntryFilter::All => "all",
+
+                EntryFilter::FilesOnly => "files",
+
+                EntryFilter::DirectoriesOnly => "directories",
+            }
+            .to_string(),
+
+            sort_mode: match self.sort_mode {
+                SortMode::Name => "name",
+
+                SortMode::Size => "size",
+
+                SortMode::Modified => "date",
+
+                SortMode::Type => "type",
+            }
+            .to_string(),
+
+            reverse: self.sort_descending,
+
+            show_hidden: self.show_hidden,
+
+            show_icons: self.show_icons,
+
+            show_details: self.show_details,
+
+            show_selection: self.show_selection,
+
+            show_columns: self.show_columns,
+
+            show_permissions: self.show_permissions,
+
+            show_size: self.show_size,
+
+            show_date: self.show_date,
+
+            show_user: self.show_user,
+
+            marked_files,
+        })
+    }
+
+    /*
+     * Restore state that depends on App's already constructed filesystem source.
+     *
+     * Source construction itself belongs in main.rs because an SSH session may fail
+     * before App exists. This method restores only stable browser and selection state.
+     */
+    pub fn restore_session_state(&mut self, state: &SessionState) {
+        /*
+         * Marked files are meaningful only while the restored source is remote.
+         *
+         * A failed SSH restoration must never expose remote marks inside a local
+         * fallback session.
+         */
+        self.marked_files.clear();
+
+        if self.source.is_remote() {
+            for marked in &state.marked_files {
+                self.marked_files.insert(
+                    marked.path.clone(),
+                    MarkedFile {
+                        path: marked.path.clone(),
+
+                        filename: marked.filename.clone(),
+
+                        size_bytes: marked.size_bytes,
+                    },
+                );
+            }
+        }
+
+        self.pending_selection_path = state.selected_path.clone();
+
+        self.pending_session_list_offset = Some(state.list_offset);
+
+        /*
+         * The startup configuration has already established view, search, recursive,
+         * sorting, filtering, hidden-entry, and panel state.
+         *
+         * Install the query afterward so it is evaluated using those final modes.
+         */
+        self.set_startup_query(state.query.clone());
+
+        /*
+         * Non-recursive and already-loaded states can restore immediately.
+         *
+         * Recursive scans and remote-index loads retain the pending values and call
+         * restore_pending_selection_if_available() when their results arrive.
+         */
+        self.restore_pending_selection_if_available();
+
+        if self.pending_selection_path.is_none() {
+            if let Some(saved_offset) = self.pending_session_list_offset.take() {
+                self.list_offset = saved_offset;
+
+                self.ensure_selection_visible(self.viewport_rows);
+            }
+        }
     }
 
     fn persistent_remote_index_available(&self) -> bool {
@@ -830,6 +1569,450 @@ impl App {
             ViewMode::Tree => self
                 .tree_row_at_filtered_position(self.selected)
                 .map(|row| &row.entry),
+        }
+    }
+
+    fn prepare_marked_transfer_batch(&self) -> io::Result<(PathBuf, Vec<BatchTransferItem>, u64)> {
+        if !self.source.is_remote() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "marked downloads are available only while browsing through SSH",
+            ));
+        }
+
+        if self.marked_files.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no files are marked",
+            ));
+        }
+
+        /*
+         * An SSH session entered through Scry's F4 dialog retains the complete local
+         * browser session.
+         *
+         * A session started directly with `scry --ssh ...` has no earlier App-local
+         * session, so its natural download destination is the process directory from
+         * which Scry was launched.
+         */
+        let local_directory = match self.saved_local_session.as_ref() {
+            Some(session) => session.directory.clone(),
+
+            None => std::env::current_dir().map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "unable to determine the local batch-download directory: {}",
+                        error,
+                    ),
+                )
+            })?,
+        };
+
+        let destination_root = create_batch_download_directory(&local_directory)?;
+
+        let mut marked_files: Vec<&MarkedFile> = self.marked_files.values().collect();
+
+        /*
+         * HashMap order is deliberately undefined. Sort by full remote path so the
+         * queue order and popup progression remain stable and predictable.
+         */
+        marked_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut items = Vec::with_capacity(marked_files.len());
+
+        let mut total_bytes = 0_u64;
+
+        /*
+         * Used only by flattened downloads to prevent two marked files with the same
+         * basename from receiving the same destination.
+         */
+        let mut reserved_flat_paths = HashSet::new();
+
+        for marked_file in marked_files {
+            let destination_path = if self.ssh_config.preserve_hierarchy {
+                let relative_path = match safe_batch_relative_path(&marked_file.path) {
+                    Ok(relative_path) => relative_path,
+
+                    Err(error) => {
+                        /*
+                         * Nothing has been downloaded yet. Remove the newly created empty
+                         * batch root before returning the validation error.
+                         */
+                        let _ = std::fs::remove_dir(&destination_root);
+
+                        return Err(error);
+                    }
+                };
+
+                destination_root.join(relative_path)
+            } else {
+                match unique_flat_batch_destination(
+                    &destination_root,
+                    &marked_file.filename,
+                    &mut reserved_flat_paths,
+                ) {
+                    Ok(destination_path) => destination_path,
+
+                    Err(error) => {
+                        let _ = std::fs::remove_dir(&destination_root);
+
+                        return Err(error);
+                    }
+                }
+            };
+
+            total_bytes = match total_bytes.checked_add(marked_file.size_bytes) {
+                Some(total_bytes) => total_bytes,
+
+                None => {
+                    let _ = std::fs::remove_dir(&destination_root);
+
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the marked transfer size exceeded the supported byte range",
+                    ));
+                }
+            };
+
+            items.push(BatchTransferItem {
+                remote_path: marked_file.path.clone(),
+
+                destination_path,
+
+                filename: marked_file.filename.clone(),
+
+                expected_size: marked_file.size_bytes,
+            });
+        }
+
+        Ok((destination_root, items, total_bytes))
+    }
+
+    /*
+     * Mark or unmark the file beneath the cursor.
+     *
+     * The ordinary cursor selection remains independent from this persistent
+     * batch-selection state.
+     */
+    /*
+     * Mark or unmark one remote file for a future SSH batch download.
+     *
+     * Local marking is deliberately unavailable because marks exist only to build
+     * a remote download queue. The ordinary cursor selection remains independent
+     * from this persistent batch-selection state.
+     */
+    pub fn toggle_mark_selected(&mut self) {
+        if !self.source.is_remote() {
+            self.show_info_message(
+                "Selecting files can only be done via SSH when downloading files",
+            );
+
+            return;
+        }
+
+        let Some(entry) = self.selected_entry().cloned() else {
+            self.show_error_message("No filesystem entry is selected");
+
+            return;
+        };
+
+        if entry.is_directory {
+            self.show_info_message("Directory marking is not supported yet");
+
+            return;
+        }
+
+        if self.marked_files.remove(&entry.path).is_none() {
+            let path = entry.path.clone();
+
+            self.marked_files.insert(
+                path.clone(),
+                MarkedFile {
+                    path,
+
+                    filename: entry.name,
+
+                    size_bytes: entry.size_bytes,
+                },
+            );
+        }
+    }
+
+    pub fn is_path_marked(&self, path: &Path) -> bool {
+        self.marked_files.contains_key(path)
+    }
+
+    pub fn marked_count(&self) -> usize {
+        self.marked_files.len()
+    }
+
+    pub fn clear_marks(&mut self) {
+        if !self.source.is_remote() {
+            self.show_info_message("Deselection is available only while browsing through SSH");
+
+            return;
+        }
+
+        let marked_count = self.marked_files.len();
+
+        if marked_count == 0 {
+            self.show_info_message("No files are marked");
+
+            return;
+        }
+
+        self.marked_files.clear();
+
+        self.show_info_message(format!(
+            "Cleared {} marked file{}",
+            marked_count,
+            if marked_count == 1 { "" } else { "s" },
+        ));
+    }
+
+    pub fn copy_selected_path(&mut self) {
+        let Some(path) = self.selected_entry().map(|entry| entry.path.clone()) else {
+            self.show_error_message("No filesystem entry is selected");
+
+            return;
+        };
+
+        let path_text = path.to_string_lossy().into_owned();
+
+        if self.clipboard.is_none() {
+            match ClipboardContext::new() {
+                Ok(context) => {
+                    self.clipboard = Some(AppClipboard(context));
+                }
+
+                Err(error) => {
+                    self.show_error_message(format!(
+                        "Unable to access the system clipboard: {}",
+                        error,
+                    ));
+
+                    return;
+                }
+            }
+        }
+
+        let result = self
+            .clipboard
+            .as_mut()
+            .expect("clipboard was initialized above")
+            .0
+            .set_contents(path_text.clone());
+
+        match result {
+            Ok(()) => {
+                self.last_copied_path = Some(path_text.clone());
+
+                self.show_info_message(format!("Copied path: {}", path_text));
+            }
+
+            Err(error) => {
+                self.clipboard = None;
+
+                self.show_error_message(format!("Unable to copy path to clipboard: {}", error,));
+            }
+        }
+    }
+
+    pub fn clipboard_handoff_text(&mut self) -> Option<String> {
+        let expected_text = self.last_copied_path.as_ref()?;
+
+        /*
+         * Do not restore an old Scry path if the user copied something else before
+         * closing Scry.
+         */
+        let current_text = self.clipboard.as_mut()?.0.get_contents().ok()?;
+
+        if current_text == *expected_text {
+            Some(expected_text.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn file_info_visible(&self) -> bool {
+        self.file_info.is_some()
+    }
+
+    pub fn open_file_info(&mut self) {
+        /*
+         * Opening File Information again while it is already visible behaves
+         * like a toggle.
+         */
+        if self.file_info_visible() {
+            self.close_file_info();
+
+            return;
+        }
+
+        /*
+         * Copy everything needed from the selected entry before mutably
+         * borrowing the active source.
+         */
+        let Some(entry) = self.selected_entry().cloned() else {
+            self.show_error_message("No filesystem entry is selected");
+
+            return;
+        };
+
+        let kind = if entry.is_symlink {
+            crate::entry::EntryKind::Symlink
+        } else if entry.is_directory {
+            crate::entry::EntryKind::Directory
+        } else {
+            crate::entry::EntryKind::File
+        };
+
+        let source_label = self.source.source_label();
+
+        let is_remote = self.source.is_remote();
+
+        let initial_info = FileInfo::from_entry(&entry, kind, source_label, is_remote);
+
+        self.file_info_generation = self.file_info_generation.wrapping_add(1);
+
+        let generation = self.file_info_generation;
+
+        /*
+         * Install the initial popup state before starting the worker.
+         *
+         * Even when the source cannot provide extended information, the window
+         * can still display everything already stored in FileEntry.
+         */
+        self.file_info = Some(FileInfoState::loading(initial_info.clone()));
+
+        match self.source.start_file_info(initial_info, generation) {
+            Ok(receiver) => {
+                self.file_info_receiver = Some(receiver);
+            }
+
+            Err(error) => {
+                self.file_info_receiver = None;
+
+                if let Some(state) = self.file_info.as_mut() {
+                    state.fail(format!(
+                        "Unable to load extended file information: {}",
+                        error,
+                    ));
+                }
+            }
+        }
+    }
+
+    pub fn close_file_info(&mut self) {
+        /*
+         * Advancing the generation makes any late worker result obsolete.
+         */
+        self.file_info_generation = self.file_info_generation.wrapping_add(1);
+
+        self.file_info_receiver = None;
+
+        self.file_info = None;
+    }
+
+    pub fn process_file_info_messages(&mut self) -> bool {
+        let message = match self.file_info_receiver.as_ref() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(message) => message,
+
+                Err(TryRecvError::Empty) => {
+                    return false;
+                }
+
+                Err(TryRecvError::Disconnected) => {
+                    self.file_info_receiver = None;
+
+                    if let Some(state) = self.file_info.as_mut() {
+                        if state.loading {
+                            state.fail(
+                                "The file-information worker stopped unexpectedly".to_string(),
+                            );
+                        }
+                    }
+
+                    return true;
+                }
+            },
+
+            None => {
+                return false;
+            }
+        };
+
+        match message {
+            FileInfoMessage::Finished { generation, info } => {
+                if generation != self.file_info_generation {
+                    return false;
+                }
+
+                self.file_info_receiver = None;
+
+                if let Some(state) = self.file_info.as_mut() {
+                    state.finish(info);
+                }
+            }
+
+            FileInfoMessage::Failed {
+                generation,
+                message,
+            } => {
+                if generation != self.file_info_generation {
+                    return false;
+                }
+
+                self.file_info_receiver = None;
+
+                if let Some(state) = self.file_info.as_mut() {
+                    state.fail(message);
+                }
+            }
+        }
+
+        true
+    }
+
+    pub fn scroll_file_info_up(&mut self) {
+        if let Some(state) = self.file_info.as_mut() {
+            state.scroll_up();
+        }
+    }
+
+    pub fn scroll_file_info_down(&mut self) {
+        if let Some(state) = self.file_info.as_mut() {
+            state.scroll_down();
+        }
+    }
+
+    pub fn page_file_info_up(&mut self) {
+        let amount = self.viewport_rows.saturating_sub(1).max(1) as u16;
+
+        if let Some(state) = self.file_info.as_mut() {
+            state.page_up(amount);
+        }
+    }
+
+    pub fn page_file_info_down(&mut self) {
+        let amount = self.viewport_rows.saturating_sub(1).max(1) as u16;
+
+        if let Some(state) = self.file_info.as_mut() {
+            state.page_down(amount);
+        }
+    }
+
+    pub fn file_info_scroll_to_start(&mut self) {
+        if let Some(state) = self.file_info.as_mut() {
+            state.scroll_to_start();
+        }
+    }
+
+    pub fn file_info_scroll_to_end(&mut self) {
+        if let Some(state) = self.file_info.as_mut() {
+            state.scroll_to_end();
         }
     }
 
@@ -914,8 +2097,7 @@ impl App {
 
                     self.remote_index_load_in_progress = false;
 
-                    self.error_message =
-                        Some("Remote index loader stopped unexpectedly".to_string());
+                    self.show_error_message("Remote index loader stopped unexpectedly");
 
                     return true;
                 }
@@ -968,7 +2150,7 @@ impl App {
 
                 self.error_message = None;
 
-                self.error_message = Some(format!(
+                self.show_info_message(format!(
                     "Remote index loaded — {} entries",
                     loaded.info.entry_count,
                 ));
@@ -993,7 +2175,7 @@ impl App {
             Err(message) => {
                 self.remote_index_loaded = false;
 
-                self.error_message = Some(format!("Unable to load remote index: {}", message,));
+                self.show_error_message(format!("Unable to load remote index: {}", message,));
             }
         }
 
@@ -1018,8 +2200,7 @@ impl App {
                         if self.remote_index_build_in_progress {
                             self.remote_index_build_in_progress = false;
 
-                            self.error_message =
-                                Some("Remote index worker stopped unexpectedly".to_string());
+                            self.show_error_message("Remote index worker stopped unexpectedly");
 
                             changed = true;
                         }
@@ -1037,9 +2218,7 @@ impl App {
                 RemoteIndexBuildMessage::Progress { entries_written } => {
                     self.remote_index_entries_written = entries_written;
 
-                    self.error_message = None;
-
-                    self.error_message = Some(format!(
+                    self.show_persistent_info_message(format!(
                         "Building remote index from / — {} entries written…",
                         entries_written,
                     ));
@@ -1056,9 +2235,7 @@ impl App {
 
                     self.pending_remote_index_hidden_policy = None;
 
-                    self.error_message = None;
-
-                    self.error_message = Some(format!(
+                    self.show_info_message(format!(
                         "Remote index ready — {} entries saved",
                         info.entry_count,
                     ));
@@ -1075,7 +2252,7 @@ impl App {
 
                     self.pending_remote_index_hidden_policy = None;
 
-                    self.error_message = Some(message);
+                    self.show_error_message(message);
 
                     changed = true;
 
@@ -1136,12 +2313,19 @@ impl App {
                      * The batch is appended unchanged immediately below, so
                      * base_entry_index + offset is the exact resulting vector index.
                      */
-                    self.recursive_path_indices.extend(
-                        entries
-                            .iter()
-                            .enumerate()
-                            .map(|(offset, entry)| (entry.path.clone(), base_entry_index + offset)),
-                    );
+                    for (offset, entry) in entries.iter().enumerate() {
+                        let future_index = base_entry_index + offset;
+
+                        self.recursive_path_indices
+                            .insert(entry.path.clone(), future_index);
+
+                        if let Some(parent) = entry.path.parent() {
+                            self.recursive_child_indices
+                                .entry(parent.to_path_buf())
+                                .or_default()
+                                .push(future_index);
+                        }
+                    }
 
                     self.recursive_entries.append(&mut entries);
 
@@ -1195,7 +2379,7 @@ impl App {
                         continue;
                     }
 
-                    self.error_message = Some(message);
+                    self.show_error_message(message);
 
                     self.scan_in_progress = false;
 
@@ -1213,16 +2397,17 @@ impl App {
         }
 
         if changed {
-            let text_filter_active = !self.query.is_empty() && self.query != ".";
+            let text_filter_active = self.effective_query_is_active();
 
-            if self.view_mode == ViewMode::Tree && self.recursive_search_active() {
+            if self.view_mode == ViewMode::Tree
+                && self.recursive_search_active()
+                && text_filter_active
+            {
                 /*
-                 * Recursive Tree construction is intentionally deferred until the
-                 * scanner has finished.
+                 * Only a genuine effective query owns the recursive search Tree.
                  *
-                 * Rebuilding the hierarchy for every incoming batch would repeatedly
-                 * disturb selection and would become prohibitively expensive on large
-                 * filesystems.
+                 * Directive-only and incomplete queries such as `type:` remain visible in
+                 * the search field but continue displaying the ordinary browsing Tree.
                  */
                 if scan_finished {
                     let selected_path = self
@@ -1230,12 +2415,16 @@ impl App {
                         .clone()
                         .or_else(|| self.selected_entry().map(|entry| entry.path.clone()));
 
-                    if self.search_mode == SearchMode::Fuzzy && text_filter_active {
-                        self.start_current_fuzzy_filter();
-                    } else {
-                        self.rebuild_recursive_search_tree(selected_path);
+                    match self.search_mode {
+                        SearchMode::Fuzzy => {
+                            self.start_current_fuzzy_filter();
+                        }
 
-                        self.restore_pending_selection_if_available();
+                        SearchMode::Exact => {
+                            self.rebuild_recursive_search_tree(selected_path);
+
+                            self.restore_pending_selection_if_available();
+                        }
                     }
                 }
             } else if !text_filter_active {
@@ -1282,6 +2471,16 @@ impl App {
     }
 
     pub fn move_query_cursor_left(&mut self) {
+        /*
+         * Query-clearing and restored-navigation paths may replace the query while
+         * an older caret position still exists. Normalize it before slicing.
+         */
+        self.query_cursor = self.query_cursor.min(self.query.len());
+
+        while !self.query.is_char_boundary(self.query_cursor) {
+            self.query_cursor = self.query_cursor.saturating_sub(1);
+        }
+
         if self.query_cursor == 0 {
             return;
         }
@@ -1361,29 +2560,6 @@ impl App {
         true
     }
 
-    pub fn commit_pending_query_modifier(&mut self) -> bool {
-        /*
-         * Enter commits only a modifier being edited at the end.
-         *
-         * When the caret is in the middle of the query, Enter retains
-         * its ordinary activation behavior.
-         */
-        if self.query_cursor != self.query.len() || !has_pending_trailing_modifier(&self.query) {
-            return false;
-        }
-
-        /*
-         * A separating space is both visible and structurally useful:
-         *
-         * - it commits the current modifier;
-         * - it leaves the caret ready for another query term;
-         * - Backspace can naturally make the modifier pending again.
-         */
-        self.push_query_character(' ');
-
-        true
-    }
-
     pub fn push_query_character(&mut self, character: char) {
         self.search_navigation_active = false;
 
@@ -1396,10 +2572,14 @@ impl App {
         self.search_return_state = None;
 
         if self.view_mode == ViewMode::Tree {
-            let search_was_active = self.recursive_search_active();
+            let search_was_active = self.effective_query_is_active();
 
             let selected_path = self.selected_entry().map(|entry| entry.path.clone());
 
+            /*
+             * Save the ordinary manually expanded Tree at the moment a genuine search
+             * begins. Directive-only and incomplete queries do not count as searches.
+             */
             if !search_was_active {
                 self.tree_search_saved_selection = selected_path.clone();
 
@@ -1410,36 +2590,50 @@ impl App {
 
             self.insert_query_character_at_cursor(character);
 
-            if !search_was_active && self.recursive_search_active() {
-                self.ensure_recursive_scan();
+            let search_is_active = self.effective_query_is_active();
+
+            /*
+             * An effective query has just become inactive.
+             *
+             * Examples:
+             *
+             *     type:dir  -> type:
+             *     README    -> type:sensitive
+             *
+             * Discard the automatically expanded search hierarchy and restore the
+             * ordinary manual Tree immediately.
+             */
+            if search_was_active && !search_is_active {
+                self.pending_recursive_search_at = None;
+
+                self.cancel_fuzzy_filter();
+
+                self.restore_manual_tree();
+
+                return;
             }
 
-            if self.recursive_search_active() {
-                /*
-                 * Fuzzy Tree mode shares the same bounded background worker as List.
-                 *
-                 * Exact Tree mode retains its existing synchronous hierarchy builder for
-                 * now. While the recursive scanner is running, both routes wait until its
-                 * current index is ready.
-                 */
-                if !self.scan_in_progress {
-                    match self.search_mode {
-                        SearchMode::Fuzzy => {
-                            self.start_current_fuzzy_filter();
-                        }
+            if search_is_active {
+                if !search_was_active {
+                    self.ensure_recursive_scan();
+                }
 
-                        SearchMode::Exact => {
-                            self.rebuild_recursive_search_tree(selected_path);
-                        }
-                    }
+                if !self.scan_in_progress {
+                    self.pending_selection_path = selected_path;
+
+                    self.schedule_current_recursive_search();
                 }
             } else {
+                /*
+                 * The query remains ineffective, such as while typing `type:`.
+                 *
+                 * Keep displaying the ordinary Tree.
+                 */
                 self.refresh_tree_filter();
             }
 
             return;
         }
-
         let search_was_active = self.recursive_search_active();
 
         self.insert_query_character_at_cursor(character);
@@ -1452,7 +2646,13 @@ impl App {
 
         self.list_offset = 0;
 
-        self.refresh_filter();
+        if self.recursive_search_active() && !self.query.is_empty() && self.query != "." {
+            self.schedule_current_recursive_search();
+        } else {
+            self.pending_recursive_search_at = None;
+
+            self.refresh_filter();
+        }
     }
 
     pub fn pop_query_character(&mut self) {
@@ -1467,31 +2667,52 @@ impl App {
         self.search_return_state = None;
 
         if self.view_mode == ViewMode::Tree {
-            let search_was_active = self.recursive_search_active();
+            let search_was_active = self.effective_query_is_active();
 
             let selected_path = self.selected_entry().map(|entry| entry.path.clone());
 
             self.remove_query_character_before_cursor();
 
-            if search_was_active && !self.recursive_search_active() {
+            let search_is_active = self.effective_query_is_active();
+
+            /*
+             * A real search has just become directive-only, incomplete, or empty.
+             *
+             * Restore the manually browsed Tree instead of preserving the expanded
+             * recursive search hierarchy.
+             */
+            if search_was_active && !search_is_active {
+                self.pending_recursive_search_at = None;
+
+                self.cancel_fuzzy_filter();
+
                 self.restore_manual_tree();
 
                 return;
             }
 
-            if self.recursive_search_active() {
+            /*
+             * Deleting a character can also make an ineffective query effective:
+             *
+             *     type:  -> type
+             *
+             * Capture the current manual Tree before starting that new search.
+             */
+            if !search_was_active && search_is_active {
+                self.tree_search_saved_selection = selected_path.clone();
+
+                self.tree_search_saved_offset = self.list_offset;
+
+                self.search_collapsed_directories.clear();
+
                 self.ensure_recursive_scan();
+            }
 
+            if search_is_active {
                 if !self.scan_in_progress {
-                    match self.search_mode {
-                        SearchMode::Fuzzy => {
-                            self.start_current_fuzzy_filter();
-                        }
+                    self.pending_selection_path = selected_path;
 
-                        SearchMode::Exact => {
-                            self.rebuild_recursive_search_tree(selected_path);
-                        }
-                    }
+                    self.schedule_current_recursive_search();
                 }
             } else {
                 self.refresh_tree_filter();
@@ -1499,7 +2720,6 @@ impl App {
 
             return;
         }
-
         self.remove_query_character_before_cursor();
 
         if self.recursive_search_active() {
@@ -1510,7 +2730,13 @@ impl App {
 
         self.list_offset = 0;
 
-        self.refresh_filter();
+        if self.recursive_search_active() && !self.query.is_empty() && self.query != "." {
+            self.schedule_current_recursive_search();
+        } else {
+            self.pending_recursive_search_at = None;
+
+            self.refresh_filter();
+        }
     }
 
     pub fn clear_query(&mut self) {
@@ -1518,17 +2744,33 @@ impl App {
 
         self.search_return_state = None;
 
-        if self.view_mode == ViewMode::Tree {
-            let search_was_active = self.recursive_search_active();
+        self.pending_recursive_search_at = None;
 
+        self.cancel_fuzzy_filter();
+
+        if self.view_mode == ViewMode::Tree {
             self.query.clear();
 
             self.query_cursor = 0;
 
-            if search_was_active {
-                self.restore_manual_tree();
+            self.selected = 0;
+
+            self.list_offset = 0;
+
+            if self.recursive_search_active() {
+                self.ensure_recursive_scan();
+
+                if !self.scan_in_progress {
+                    self.rebuild_recursive_search_tree(None);
+                } else {
+                    self.tree_rows.clear();
+
+                    self.filtered_tree_indices.clear();
+
+                    self.search_tree_children.clear();
+                }
             } else {
-                self.refresh_tree_filter();
+                self.restore_manual_tree();
             }
 
             return;
@@ -1696,6 +2938,43 @@ impl App {
         }
     }
 
+    /*
+     * Enable recursive mode through the correct source-specific startup route.
+     *
+     * Local sources can enter recursive mode immediately.
+     *
+     * Remote sources must first inspect and load their persistent index. A valid
+     * index begins loading asynchronously; a missing or invalid index opens the
+     * normal setup dialog.
+     *
+     * This method is safe for configuration startup, command-line startup, and
+     * interactive activation. It never disables an already-enabled mode.
+     */
+    pub fn request_recursive_mode(&mut self) {
+        if self.recursive_mode {
+            return;
+        }
+
+        if !self.source.supports_recursive_scan() {
+            self.show_error_message("Recursive mode is not available for the current source");
+
+            return;
+        }
+
+        if self.source.is_remote() && !self.prepare_remote_recursive_mode() {
+            /*
+             * false means that preparation has started an asynchronous index load,
+             * opened the setup dialog, or reported a preparation error.
+             *
+             * process_remote_index_load_messages() enables recursive mode after a
+             * successful load.
+             */
+            return;
+        }
+
+        self.enable_recursive_mode();
+    }
+
     pub fn enable_recursive_mode(&mut self) {
         if self.recursive_mode {
             return;
@@ -1731,12 +3010,17 @@ impl App {
             }
 
             ViewMode::Tree => {
-                if self.search_mode == SearchMode::Fuzzy
-                    && !self.query.is_empty()
-                    && self.query != "."
-                {
+                if !self.query.is_empty() && self.query != "." {
                     if !self.scan_in_progress {
-                        self.start_current_fuzzy_filter();
+                        match self.search_mode {
+                            SearchMode::Exact => {
+                                self.start_current_exact_filter();
+                            }
+
+                            SearchMode::Fuzzy => {
+                                self.start_current_fuzzy_filter();
+                            }
+                        }
                     }
                 } else {
                     self.rebuild_recursive_search_tree(selected_path.clone());
@@ -1755,9 +3039,7 @@ impl App {
          * a part file while the existing build is still active.
          */
         if self.remote_index_build_in_progress {
-            self.error_message = None;
-
-            self.error_message = Some(format!(
+            self.show_info_message(format!(
                 "Remote index is still building — {} entries written",
                 self.remote_index_entries_written,
             ));
@@ -1770,10 +3052,8 @@ impl App {
          *
          * Repeated Alt+R presses while loading must not start duplicate loaders.
          */
-        self.error_message = None;
-
         if self.remote_index_load_in_progress {
-            self.error_message = Some("Remote index is still loading…".to_string());
+            self.show_info_message("Remote index is still loading…");
 
             return false;
         }
@@ -1795,7 +3075,7 @@ impl App {
             Ok(status) => status,
 
             Err(error) => {
-                self.error_message = Some(format!(
+                self.show_error_message(format!(
                     "Unable to inspect the remote index for {}: {}",
                     identity.display_label(),
                     error,
@@ -1833,7 +3113,7 @@ impl App {
                 Ok(_) => {}
 
                 Err(error) => {
-                    self.error_message = Some(format!(
+                    self.show_error_message(format!(
                         "Unable to inspect the compatible remote index for {}: {}",
                         legacy_identity.display_label(),
                         error,
@@ -1906,7 +3186,7 @@ impl App {
 
         self.remote_index_load_in_progress = true;
 
-        self.error_message = Some("Loading persistent remote index, please wait...".to_string());
+        self.show_persistent_info_message("Loading persistent remote index, please wait...");
     }
 
     pub fn toggle_recursive_mode(&mut self) {
@@ -1947,11 +3227,7 @@ impl App {
         }
 
         if !self.recursive_mode {
-            if self.source.is_remote() && !self.prepare_remote_recursive_mode() {
-                return;
-            }
-
-            self.enable_recursive_mode();
+            self.request_recursive_mode();
 
             return;
         }
@@ -1974,6 +3250,8 @@ impl App {
         self.recursive_mode = false;
 
         self.error_message = None;
+
+        self.pending_recursive_search_at = None;
 
         self.cancel_fuzzy_filter();
 
@@ -2021,22 +3299,40 @@ impl App {
 
                 self.list_offset = 0;
 
-                if self.recursive_mode {
+                let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+
+                if self.recursive_mode && self.effective_query_is_active() {
                     /*
-                     * Startup recursive mode already represents the complete descendant
-                     * set, so Tree mode should display that same set hierarchically.
+                     * A genuine recursive query becomes a recursive result Tree.
                      */
                     self.ensure_recursive_scan();
 
-                    self.rebuild_recursive_search_tree(None);
+                    if !self.scan_in_progress {
+                        match self.search_mode {
+                            SearchMode::Exact => {
+                                self.rebuild_recursive_search_tree(selected_path);
+                            }
+
+                            SearchMode::Fuzzy => {
+                                self.pending_selection_path = selected_path;
+
+                                self.start_current_fuzzy_filter();
+                            }
+                        }
+                    }
                 } else {
                     /*
-                     * Ordinary Tree mode represents the current directory hierarchy
-                     * rather than an active text search.
+                     * Empty, incomplete, and directive-only queries are ordinary browsing.
+                     *
+                     * Keep the visible query text, but do not treat it as a Tree search.
                      */
-                    self.query.clear();
-
                     self.reset_tree();
+
+                    self.refresh_tree_filter();
+
+                    if let Some(path) = selected_path {
+                        self.select_visible_path(&path);
+                    }
                 }
             }
 
@@ -2154,9 +3450,7 @@ impl App {
 
         self.selected = position;
 
-        self.error_message = None;
-
-        self.status_message = None;
+        self.clear_messages();
     }
 
     pub fn scroll_selection(&mut self, amount: isize) {
@@ -2325,26 +3619,37 @@ impl App {
 
         let entry_is_directory = entry.is_directory;
 
-        /*
-         * Ask the active filesystem source whether the path resolves to a
-         * directory. This preserves directory-symlink behavior for both local
-         * and future remote sources.
-         */
         let is_directory = self.path_is_directory(&path, entry_is_directory);
 
         if !is_directory {
             return;
         }
 
+        /*
+         * Directive-only and incomplete queries remain visible while ordinary Tree
+         * navigation continues.
+         *
+         * change_directory() normally clears the query, so preserve it explicitly.
+         */
+        let preserve_inactive_query = !self.query.is_empty() && !self.effective_query_is_active();
+
+        let preserved_query = preserve_inactive_query.then(|| self.query.clone());
+
+        let preserved_query_cursor = self.query_cursor;
+
         if !self.change_directory(path, None) {
             return;
         }
 
+        if let Some(query) = preserved_query {
+            self.query = query;
+
+            self.query_cursor = preserved_query_cursor.min(self.query.len());
+        }
+
         /*
-         * change_directory() deliberately returns to List mode.
-         *
-         * Enter originated in Tree mode, so establish the selected directory as
-         * a completely new Tree root. All former ancestors disappear.
+         * Enter originated in Tree mode, so the selected directory becomes the new
+         * Tree root.
          */
         self.view_mode = ViewMode::Tree;
 
@@ -2352,22 +3657,68 @@ impl App {
 
         self.list_offset = 0;
 
-        if self.recursive_mode {
+        if self.recursive_mode && self.effective_query_is_active() {
             /*
-             * change_directory() has already started the new recursive scan.
-             *
-             * Usually the tree remains in its scanning state until the worker
-             * finishes. If a complete cache is already available, construct it
-             * immediately.
+             * A genuine query owns the recursive result Tree.
              */
             self.ensure_recursive_scan();
 
             if !self.scan_in_progress {
-                self.rebuild_recursive_search_tree(None);
+                match self.search_mode {
+                    SearchMode::Exact => {
+                        self.rebuild_recursive_search_tree(None);
+                    }
+
+                    SearchMode::Fuzzy => {
+                        self.start_current_fuzzy_filter();
+                    }
+                }
+            } else {
+                self.tree_rows.clear();
+
+                self.filtered_tree_indices.clear();
+
+                self.search_tree_children.clear();
             }
         } else {
+            /*
+             * Empty, directive-only, and incomplete queries use the ordinary Tree.
+             *
+             * Build it immediately from the new root's already loaded entries.
+             */
             self.reset_tree();
         }
+    }
+
+    pub fn enter_home_directory(&mut self) {
+        let home_directory = self.home_directory.clone();
+
+        if self.current_directory == home_directory {
+            return;
+        }
+
+        /*
+         * During an active search, Home changes only the search root.
+         *
+         * The query, Exact/Fuzzy mode, recursive mode, and result view remain
+         * active—matching the behavior of Left-arrow search-root navigation.
+         */
+        if !self.query.is_empty() && self.query != "." {
+            let previous_root = self.current_directory.clone();
+
+            self.change_search_root(home_directory, Some(previous_root));
+
+            return;
+        }
+
+        /*
+         * Without an active query, Home behaves as ordinary directory navigation.
+         */
+        self.search_return_state = None;
+
+        self.search_navigation_active = false;
+
+        self.change_directory(home_directory, None);
     }
 
     pub fn enter_parent_directory(&mut self) {
@@ -2538,11 +3889,28 @@ impl App {
                 self.view_mode = ViewMode::Tree;
 
                 /*
-                 * The recursive tree is rebuilt once the restored scan completes.
-                 * If a complete result is already available, this builds it now.
+                 * Restore the search through the same parsed worker route used by a
+                 * live recursive Tree query.
+                 *
+                 * Structured queries such as:
+                 *
+                 *     type:dir
+                 *     ext:rs
+                 *     +rust
+                 *     -java
+                 *
+                 * must not be rebuilt as literal path substrings.
                  */
                 if !self.scan_in_progress {
-                    self.rebuild_recursive_search_tree(state.selected_path.clone());
+                    match self.search_mode {
+                        SearchMode::Exact => {
+                            self.start_current_exact_filter();
+                        }
+
+                        SearchMode::Fuzzy => {
+                            self.start_current_fuzzy_filter();
+                        }
+                    }
                 }
             }
         }
@@ -2577,9 +3945,8 @@ impl App {
 
         self.rebuild_tree_rows(None);
     }
-
     fn expand_selected_tree_directory(&mut self) {
-        if self.recursive_search_active() {
+        if self.recursive_search_active() && self.effective_query_is_active() {
             self.expand_selected_recursive_branch();
 
             return;
@@ -2629,7 +3996,7 @@ impl App {
          * while hidden files are disabled.
          */
         if self.current_visible_entry_count() == 0 {
-            if self.recursive_search_active() {
+            if self.effective_query_is_active() {
                 self.move_recursive_tree_root_to_parent();
             } else {
                 self.move_tree_root_to_parent();
@@ -2638,7 +4005,7 @@ impl App {
             return;
         }
 
-        if self.recursive_search_active() {
+        if self.effective_query_is_active() {
             let Some(row) = self.tree_row_at_filtered_position(self.selected).cloned() else {
                 return;
             };
@@ -2768,89 +4135,112 @@ impl App {
             return;
         };
 
-        if !row.entry.is_directory || row.entry.is_symlink || row.expanded {
+        if !row.entry.is_directory || row.entry.is_symlink {
             return;
         }
 
         let path = row.entry.path.clone();
 
         /*
-         * A bounded fuzzy-result tree initially contains only:
+         * The search hierarchy may contain only a partial contextual child list:
          *
-         * - the best matching entries;
-         * - the ancestors required to connect them.
+         * - direct matches;
+         * - ancestors required to connect those matches.
          *
-         * A directory may therefore have real filesystem content without yet having
-         * contextual children in search_tree_children. When the user explicitly
-         * presses Right, lazily load that directory's immediate children instead of
-         * pretending that the branch cannot expand.
+         * Right Arrow is an explicit request to expose this directory's complete
+         * immediate matching branch. Recover those children from the resident
+         * recursive corpus even when search_tree_children already contains one or
+         * more contextual children.
          */
-        if !self
-            .search_tree_children
+        let mut recovered_children: Vec<FileEntry> = self
+            .recursive_child_indices
             .get(&path)
-            .is_some_and(|children| !children.is_empty())
-        {
-            let children =
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.recursive_entries.get(*index))
+            .filter(|entry| self.show_hidden || !entry.name.starts_with('.'))
+            .filter(|entry| self.entry_filter.matches(entry))
+            .cloned()
+            .collect();
+
+        /*
+         * A partial local recursive scan may not contain this directory's immediate
+         * children yet. In that case, fall back to one ordinary source read.
+         *
+         * A loaded remote persistent index should normally satisfy the resident
+         * lookup above without an SFTP request.
+         */
+        if recovered_children.is_empty() {
+            recovered_children =
                 match self
                     .source
                     .read_directory(&path, self.sort_mode, self.sort_descending)
                 {
-                    Ok(children) => children
+                    Ok(entries) => entries
                         .into_iter()
                         .filter(|entry| self.show_hidden || !entry.name.starts_with('.'))
-                        .collect::<Vec<_>>(),
+                        .filter(|entry| self.entry_filter.matches(entry))
+                        .collect(),
 
                     Err(error) => {
-                        self.error_message =
-                            Some(format!("Unable to expand {}: {}", path.display(), error,));
+                        self.show_error_message(format!(
+                            "Unable to expand {}: {}",
+                            path.display(),
+                            error,
+                        ));
 
                         return;
                     }
                 };
-
-            if children.is_empty() {
-                return;
-            }
-
-            self.search_tree_children.insert(path.clone(), children);
-
-            self.error_message = None;
         }
 
-        self.recursive_expanded_directories.insert(path.clone());
+        if recovered_children.is_empty() {
+            return;
+        }
 
-        let mut child_ancestor_has_more = row.ancestor_has_more.clone();
-
-        child_ancestor_has_more.push(!row.is_last);
-
-        let mut inserted_rows = Vec::new();
+        sort_entries(
+            &mut recovered_children,
+            self.sort_mode,
+            self.sort_descending,
+        );
 
         /*
-         * Insert only this directory's immediate children.
-         *
-         * Their descendants remain indexed but are not turned into TreeRows
-         * until those child directories are explicitly expanded.
+         * Replace any bounded contextual child list with the complete immediate
+         * matching branch recovered above.
          */
-        Self::append_recursive_direct_children(
-            path,
-            child_ancestor_has_more,
+        self.search_tree_children
+            .insert(path.clone(), recovered_children);
+
+        /*
+         * Search Tree visibility is governed by search_collapsed_directories.
+         *
+         * Removing the selected path from that set is the authoritative expansion
+         * operation. Do not mix this with recursive_expanded_directories and manual
+         * row splicing.
+         */
+        self.search_collapsed_directories.remove(&path);
+
+        let fallback_position = self.selected;
+
+        let mut rows = Vec::new();
+
+        Self::append_recursive_search_children(
+            self.current_directory.clone(),
+            Vec::new(),
             &self.search_tree_children,
-            &self.recursive_expanded_directories,
-            &mut inserted_rows,
+            &self.search_collapsed_directories,
+            &mut rows,
         );
 
-        if let Some(row) = self.tree_rows.get_mut(tree_index) {
-            row.expanded = true;
-        }
+        self.tree_rows = rows;
 
-        self.tree_rows.splice(
-            tree_index.saturating_add(1)..tree_index.saturating_add(1),
-            inserted_rows,
-        );
+        self.filtered_tree_indices = (0..self.tree_rows.len()).collect();
 
-        self.refresh_recursive_tree_indices();
+        self.restore_search_tree_selection(Some(path), fallback_position);
 
         self.ensure_selection_visible(self.viewport_rows);
+
+        self.error_message = None;
     }
 
     fn move_recursive_tree_root_to_parent(&mut self) {
@@ -2897,24 +4287,36 @@ impl App {
         let parent = parent.to_path_buf();
 
         /*
-         * At the filesystem root, parent and current path are the same.
+         * At the filesystem root, parent and current path are identical.
          */
         if parent == previous_root {
             return;
         }
 
+        /*
+         * change_directory() normally clears the query because ordinary directory
+         * navigation begins a fresh browsing session.
+         *
+         * This operation originated from Tree rerooting, so preserve the visible
+         * directive-only or incomplete query across that directory change.
+         */
+        let preserved_query = self.query.clone();
+
+        let preserved_query_cursor = self.query_cursor;
+
         if !self.change_directory(parent, Some(previous_root.clone())) {
             return;
         }
 
+        self.query = preserved_query;
+
+        self.query_cursor = preserved_query_cursor.min(self.query.len());
+
         /*
-         * change_directory() normally returns Wraith to List mode.
-         * This action originated in Tree mode, so construct a new tree rooted
-         * one directory higher instead.
+         * change_directory() returns to List mode. Restore Tree mode and construct
+         * a new ordinary Tree rooted one directory higher.
          */
         self.view_mode = ViewMode::Tree;
-
-        self.query.clear();
 
         self.selected = 0;
 
@@ -2923,7 +4325,7 @@ impl App {
         self.reset_tree();
 
         /*
-         * Select the former root in the newly created parent tree.
+         * Select the former root in the newly created parent Tree.
          */
         if let Some(position) = self.filtered_tree_indices.iter().position(|tree_index| {
             self.tree_rows
@@ -2932,6 +4334,8 @@ impl App {
         }) {
             self.selected = position;
         }
+
+        self.ensure_selection_visible(self.viewport_rows);
     }
 
     fn rebuild_tree_rows(&mut self, preserve_selection: Option<PathBuf>) {
@@ -3122,6 +4526,214 @@ impl App {
             receiver,
 
             cancel_signal,
+
+            destination_root: None,
+
+            item_index: 0,
+
+            item_count: 1,
+
+            item_transferred_bytes: 0,
+
+            item_total_bytes: total_bytes,
+
+            completed_count: 0,
+
+            failed_count: 0,
+
+            failures: Vec::new(),
+
+            is_batch: false,
+        });
+    }
+
+    pub fn begin_marked_transfer_batch(&mut self) {
+        if self.transfer.is_some() {
+            return;
+        }
+
+        let (destination_root, items, total_bytes) = match self.prepare_marked_transfer_batch() {
+            Ok(batch) => batch,
+
+            Err(error) => {
+                self.show_error_message(error.to_string());
+
+                return;
+            }
+        };
+
+        let item_count = items.len();
+
+        let first_filename = items
+            .first()
+            .map(|item| item.filename.clone())
+            .unwrap_or_else(|| "Marked files".to_string());
+
+        let label = self.source.source_label();
+
+        let placeholder: Box<dyn FileSource> = Box::new(TransferPlaceholderSource::new(label));
+
+        let mut source = std::mem::replace(&mut self.source, placeholder);
+
+        let (sender, receiver) = mpsc::channel();
+
+        let cancel_signal = Arc::new(AtomicBool::new(false));
+
+        let worker_cancel_signal = Arc::clone(&cancel_signal);
+
+        thread::spawn(move || {
+            let mut completed_paths = Vec::new();
+
+            let mut completed_bytes = 0_u64;
+
+            let mut failures = Vec::new();
+
+            let mut cancelled = false;
+
+            for (item_index, item) in items.into_iter().enumerate() {
+                if worker_cancel_signal.load(Ordering::Relaxed) {
+                    cancelled = true;
+
+                    break;
+                }
+
+                let progress_sender = sender.clone();
+
+                let progress_filename = item.filename.clone();
+
+                let item_total_bytes = item.expected_size;
+
+                let worker_cancel_signal_for_item = Arc::clone(&worker_cancel_signal);
+
+                let mut report_progress =
+                    move |progress: TransferProgress| -> io::Result<TransferControl> {
+                        if worker_cancel_signal_for_item.load(Ordering::Relaxed) {
+                            return Ok(TransferControl::Cancel);
+                        }
+
+                        let message = TransferWorkerMessage::BatchProgress {
+                            item_index,
+
+                            item_count,
+
+                            filename: progress_filename.clone(),
+
+                            item_transferred_bytes: progress.transferred_bytes,
+
+                            item_total_bytes: if progress.total_bytes > 0 {
+                                progress.total_bytes
+                            } else {
+                                item_total_bytes
+                            },
+
+                            completed_bytes,
+                        };
+
+                        match progress_sender.send(message) {
+                            Ok(()) => {
+                                if worker_cancel_signal_for_item.load(Ordering::Relaxed) {
+                                    Ok(TransferControl::Cancel)
+                                } else {
+                                    Ok(TransferControl::Continue)
+                                }
+                            }
+
+                            Err(_) => Ok(TransferControl::Cancel),
+                        }
+                    };
+
+                let result = source.download_file_to(
+                    &item.remote_path,
+                    &item.destination_path,
+                    &mut report_progress,
+                );
+
+                match result {
+                    Ok(_) => {
+                        completed_bytes = completed_bytes.saturating_add(item.expected_size);
+
+                        completed_paths.push(item.remote_path);
+                    }
+
+                    Err(error)
+                        if error.kind() == io::ErrorKind::Interrupted
+                            && worker_cancel_signal.load(Ordering::Relaxed) =>
+                    {
+                        cancelled = true;
+
+                        break;
+                    }
+
+                    Err(error) => {
+                        failures.push(BatchTransferFailure {
+                            remote_path: item.remote_path,
+
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+
+            let _ = sender.send(TransferWorkerMessage::BatchFinished(
+                BatchTransferWorkerResult {
+                    source,
+
+                    completed_paths,
+
+                    failures,
+
+                    cancelled,
+                },
+            ));
+        });
+
+        self.clear_messages();
+
+        self.transfer = Some(TransferState {
+            filename: first_filename,
+
+            total_bytes,
+
+            transferred_bytes: 0,
+
+            started_at: Instant::now(),
+
+            finished_elapsed: None,
+
+            error: None,
+
+            cancel_requested: false,
+
+            /*
+             * Batch acknowledgement does not open one remote path.
+             *
+             * The destination root is the meaningful final result.
+             */
+            remote_path: PathBuf::new(),
+
+            local_path: None,
+
+            destination_root: Some(destination_root),
+
+            item_index: 0,
+
+            item_count,
+
+            item_transferred_bytes: 0,
+
+            item_total_bytes: 0,
+
+            completed_count: 0,
+
+            failed_count: 0,
+
+            failures: Vec::new(),
+
+            is_batch: true,
+
+            receiver,
+
+            cancel_signal,
         });
     }
 
@@ -3175,6 +4787,35 @@ impl App {
                 true
             }
 
+            TransferWorkerMessage::BatchProgress {
+                item_index,
+                item_count,
+                filename,
+                item_transferred_bytes,
+                item_total_bytes,
+                completed_bytes,
+            } => {
+                let Some(transfer) = self.transfer.as_mut() else {
+                    return false;
+                };
+
+                transfer.item_index = item_index;
+
+                transfer.item_count = item_count;
+
+                transfer.filename = filename;
+
+                transfer.item_transferred_bytes = item_transferred_bytes.min(item_total_bytes);
+
+                transfer.item_total_bytes = item_total_bytes;
+
+                transfer.transferred_bytes = completed_bytes
+                    .saturating_add(transfer.item_transferred_bytes)
+                    .min(transfer.total_bytes);
+
+                true
+            }
+
             TransferWorkerMessage::Finished(message) => {
                 /*
                  * The worker always returns ownership of the real source, regardless of
@@ -3197,7 +4838,7 @@ impl App {
                          */
                         self.transfer = None;
 
-                        self.error_message = None;
+                        self.clear_messages();
 
                         true
                     }
@@ -3225,6 +4866,55 @@ impl App {
                     }
                 }
             }
+
+            TransferWorkerMessage::BatchFinished(message) => {
+                /*
+                 * As with a single transfer, the worker always returns the real source.
+                 */
+                self.source = message.source;
+
+                /*
+                 * Every successfully downloaded file leaves the persistent marked set.
+                 *
+                 * Failed or unattempted files remain marked so the user can retry them.
+                 */
+                for path in &message.completed_paths {
+                    self.marked_files.remove(path);
+                }
+
+                if message.cancelled {
+                    self.transfer = None;
+
+                    self.clear_messages();
+
+                    return true;
+                }
+
+                let Some(transfer) = self.transfer.as_mut() else {
+                    return false;
+                };
+
+                transfer.finished_elapsed = Some(transfer.started_at.elapsed());
+
+                transfer.completed_count = message.completed_paths.len();
+
+                transfer.failed_count = message.failures.len();
+
+                transfer.failures = message
+                    .failures
+                    .into_iter()
+                    .map(|failure| {
+                        format!("{}: {}", failure.remote_path.display(), failure.message,)
+                    })
+                    .collect();
+
+                /*
+                 * Do not force transferred_bytes to total_bytes when files failed.
+                 *
+                 * The aggregate byte display should remain truthful.
+                 */
+                true
+            }
         }
     }
     pub fn acknowledge_transfer(&mut self) {
@@ -3236,8 +4926,44 @@ impl App {
             return;
         };
 
+        if transfer.is_batch {
+            let destination = transfer
+                .destination_root
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "the batch download directory".to_string());
+
+            if transfer.failed_count == 0 {
+                self.show_info_message(format!(
+                    "Downloaded {} file{} to {}",
+                    transfer.completed_count,
+                    if transfer.completed_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    destination,
+                ));
+            } else {
+                self.show_error_message(format!(
+                    "Downloaded {} file{} to {}; {} file{} failed",
+                    transfer.completed_count,
+                    if transfer.completed_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    destination,
+                    transfer.failed_count,
+                    if transfer.failed_count == 1 { "" } else { "s" },
+                ));
+            }
+
+            return;
+        }
+
         if let Some(error) = transfer.error {
-            self.error_message = Some(format!(
+            self.show_error_message(format!(
                 "Unable to prepare {} for opening: {}",
                 transfer.remote_path.display(),
                 error,
@@ -3247,21 +4973,22 @@ impl App {
         }
 
         let Some(local_path) = transfer.local_path else {
-            self.error_message =
-                Some("Remote transfer completed without producing a local file".to_string());
+            self.show_error_message("Remote transfer completed without producing a local file");
 
             return;
         };
 
         match crate::open::open_file(&local_path) {
             Ok(()) => {
-                self.opened_file_path = Some(transfer.remote_path);
-
-                self.should_quit = true;
+                if self.exit_on_open {
+                    self.should_quit = true;
+                } else {
+                    self.show_info_message(format!("Opened {}", transfer.remote_path.display(),));
+                }
             }
 
             Err(error) => {
-                self.error_message = Some(error);
+                self.show_error_message(error);
             }
         }
     }
@@ -3287,8 +5014,7 @@ impl App {
          * accidentally act on Scry's downloaded cache copy.
          */
         if self.source.is_remote() {
-            self.error_message =
-                Some("Deletion is not available while browsing through SSH".to_string());
+            self.show_info_message("Deletion is not available while browsing through SSH");
 
             return;
         }
@@ -3315,7 +5041,7 @@ impl App {
          * them again here keeps the destructive boundary self-contained.
          */
         if !path.is_absolute() {
-            self.error_message = Some(format!(
+            self.show_error_message(format!(
                 "Refusing to delete a non-absolute path: {}",
                 path.display(),
             ));
@@ -3324,20 +5050,19 @@ impl App {
         }
 
         if path == Path::new("/") {
-            self.error_message = Some("Refusing to delete the filesystem root".to_string());
+            self.show_error_message("Refusing to delete the filesystem root");
 
             return;
         }
 
         if path == self.current_directory {
-            self.error_message =
-                Some("Refusing to delete Scry's current browsing root".to_string());
+            self.show_error_message("Refusing to delete Scry's current browsing root");
 
             return;
         }
 
         if !path.starts_with(&self.current_directory) {
-            self.error_message = Some(format!(
+            self.show_error_message(format!(
                 "Refusing to delete a path outside the current browsing root: {}",
                 path.display(),
             ));
@@ -3346,7 +5071,7 @@ impl App {
         }
 
         if path.file_name().is_none() {
-            self.error_message = Some(format!(
+            self.show_error_message(format!(
                 "Refusing to delete a path without a filename: {}",
                 path.display(),
             ));
@@ -3359,7 +5084,7 @@ impl App {
          * following it to some other filesystem object.
          */
         if let Err(error) = std::fs::symlink_metadata(&path) {
-            self.error_message = Some(format!(
+            self.show_error_message(format!(
                 "Unable to validate {} for deletion: {}",
                 path.display(),
                 error,
@@ -3371,7 +5096,7 @@ impl App {
         let directory_has_content =
             entry.is_directory && !entry.is_symlink && self.directory_has_content(&path);
 
-        self.error_message = None;
+        self.clear_messages();
 
         self.deletion = Some(DeletionState {
             path,
@@ -3491,7 +5216,7 @@ impl App {
             Ok(metadata) => metadata,
 
             Err(error) => {
-                self.error_message = Some(format!(
+                self.show_error_message(format!(
                     "Unable to validate {} for deletion: {}",
                     path.display(),
                     error,
@@ -3512,10 +5237,19 @@ impl App {
         };
 
         if let Err(error) = deletion_result {
-            self.error_message = Some(format!("Unable to delete {}: {}", path.display(), error,));
+            self.show_error_message(format!("Unable to delete {}: {}", path.display(), error,));
 
             return;
         }
+
+        /*
+         * A successfully deleted file must not remain in the persistent batch
+         * selection.
+         *
+         * This occurs before refreshing the directory because the filesystem removal
+         * has already succeeded even if the subsequent refresh happens to fail.
+         */
+        self.marked_files.remove(&path);
 
         /*
          * Remember the current visible position rather than a path.
@@ -3538,7 +5272,7 @@ impl App {
             Ok(entries) => entries,
 
             Err(error) => {
-                self.error_message = Some(format!(
+                self.show_error_message(format!(
                     "{} was deleted, but Scry could not refresh {}: {}",
                     path.display(),
                     self.current_directory.display(),
@@ -3583,8 +5317,6 @@ impl App {
 
         self.pending_selection_path = None;
 
-        self.error_message = None;
-
         self.selected = previous_selected;
 
         self.list_offset = previous_offset;
@@ -3622,6 +5354,8 @@ impl App {
             .min(self.current_visible_entry_count().saturating_sub(1));
 
         self.ensure_selection_visible(self.viewport_rows);
+
+        self.show_info_message(format!("Deleted {}", path.display(),));
     }
 
     pub fn activate_selected(&mut self) {
@@ -3654,7 +5388,7 @@ impl App {
                     Some(parent) => parent.to_path_buf(),
 
                     None => {
-                        self.error_message = Some(format!(
+                        self.show_error_message(format!(
                             "Unable to determine the containing directory of {}",
                             path.display(),
                         ));
@@ -3670,7 +5404,7 @@ impl App {
         /*
          * Enter on a directory:
          *
-         * Works as → (right) and will enter the directory inside Wraith.
+         * Works as → (right) and will enter the directory inside Scry.
          */
         if is_directory {
             if self.view_mode == ViewMode::Tree {
@@ -3683,16 +5417,27 @@ impl App {
         }
 
         /*
+         * --no-open blocks only external file activation.
+         *
+         * Directory navigation remains fully functional.
+         */
+        if !self.allow_file_opening {
+            self.show_info_message(format!("File opening is disabled — {}", path.display(),));
+
+            return;
+        }
+
+        /*
          * First Enter on a recursive file result:
          *
-         * Keep Wraith open, move internally to the file's containing directory,
+         * Keep Scry open, move internally to the file's containing directory,
          * clear the recursive query, and select that exact file.
          *
          * A second Enter then opens the now-local file normally.
          */
         if self.recursive_search_active() && !self.query.is_empty() && self.query != "." {
             let Some(parent) = path.parent() else {
-                self.error_message = Some(format!(
+                self.show_error_message(format!(
                     "Unable to determine the containing directory of {}",
                     path.display(),
                 ));
@@ -3721,7 +5466,7 @@ impl App {
          * Enter on a normal file, including the second Enter after landing on a
          * recursive result:
          *
-         * Open it, exit Wraith, and remember the path for the post-exit summary.
+         * Open it, exit Scry, and remember the path for the post-exit summary.
          */
         if self.source.is_remote() {
             let total_bytes = self
@@ -3745,7 +5490,7 @@ impl App {
             Ok(local_path) => local_path,
 
             Err(error) => {
-                self.error_message = Some(format!(
+                self.show_error_message(format!(
                     "Unable to prepare {} for opening: {}",
                     path.display(),
                     error,
@@ -3757,13 +5502,15 @@ impl App {
 
         match crate::open::open_file(&local_open_path) {
             Ok(()) => {
-                self.opened_file_path = Some(path);
-
-                self.should_quit = true;
+                if self.exit_on_open {
+                    self.should_quit = true;
+                } else {
+                    self.show_info_message(format!("Opened {}", path.display()));
+                }
             }
 
             Err(error) => {
-                self.error_message = Some(error);
+                self.show_error_message(error);
             }
         }
     }
@@ -3829,7 +5576,7 @@ impl App {
             Err(error) => {
                 self.pending_remote_index_hidden_policy = None;
 
-                self.error_message = Some(format!("Unable to start remote indexing: {}", error,));
+                self.show_error_message(format!("Unable to start remote indexing: {}", error,));
 
                 return;
             }
@@ -3841,15 +5588,17 @@ impl App {
 
         self.remote_index_build_receiver = Some(receiver);
 
-        self.error_message = Some("Building remote index from /…".to_string());
+        self.show_persistent_info_message("Building remote index from /…");
     }
 
     pub fn open_remote_index_builder(&mut self) {
         if !self.source.is_remote() {
             self.error_message = None;
 
-            self.status_message =
-                Some("Remote indexes are available only for SSH connections".to_string());
+            self.show_info_message(format!(
+                "Remote index is already building — {} entries written",
+                self.remote_index_entries_written,
+            ));
 
             return;
         }
@@ -3857,7 +5606,7 @@ impl App {
         if self.remote_index_build_in_progress {
             self.error_message = None;
 
-            self.status_message = Some(format!(
+            self.show_info_message(format!(
                 "Remote index is already building — {} entries written",
                 self.remote_index_entries_written,
             ));
@@ -3868,8 +5617,7 @@ impl App {
         if self.remote_index_load_in_progress {
             self.error_message = None;
 
-            self.status_message =
-                Some("Wait for the current remote index to finish loading".to_string());
+            self.show_info_message("Wait for the current remote index to finish loading");
 
             return;
         }
@@ -3877,8 +5625,7 @@ impl App {
         let Some(identity) = self.source.remote_index_identity() else {
             self.error_message = None;
 
-            self.error_message =
-                Some("The current SSH source has no remote-index identity".to_string());
+            self.show_error_message("The current SSH source has no remote-index identity");
 
             return;
         };
@@ -3912,9 +5659,7 @@ impl App {
 
         self.overlay = Overlay::RemoteIndexSetup;
 
-        self.error_message = None;
-
-        self.status_message = None;
+        self.clear_messages();
     }
 
     pub fn close_remote_index_setup(&mut self) {
@@ -4294,6 +6039,8 @@ impl App {
                 self.install_connected_source(success);
 
                 self.overlay = Overlay::None;
+
+                self.show_info_message(format!("Connected — {}", self.source_label(),));
             }
 
             Err(message) => {
@@ -4305,7 +6052,17 @@ impl App {
     }
 
     fn install_connected_source(&mut self, success: ConnectionWorkerSuccess) {
+        let ConnectionWorkerSuccess {
+            source,
+            target,
+            directory,
+            home_directory,
+            entries,
+        } = success;
+
         self.search_return_state = None;
+
+        self.marked_files.clear();
 
         /*
          * Preserve the local browser position only when leaving a local source.
@@ -4316,6 +6073,8 @@ impl App {
         if !self.source.is_remote() && self.saved_local_session.is_none() {
             self.saved_local_session = Some(LocalSessionState {
                 directory: self.current_directory.clone(),
+
+                home_directory: self.home_directory.clone(),
 
                 selected_path: self.selected_entry().map(|entry| entry.path.clone()),
 
@@ -4333,25 +6092,33 @@ impl App {
 
         self.invalidate_recursive_cache();
 
-        self.source = success.source;
+        self.source = source;
+
+        self.active_ssh_target = Some(target);
 
         /*
-         * A future filesystem source may support ordinary browsing without
-         * supporting recursive traversal.
+         * A newly connected filesystem source must begin outside recursive mode.
+         *
+         * Recursive state belongs to the previous source and must never be inherited
+         * after its corpus has been invalidated. In particular, an SSH connection must
+         * pass through prepare_remote_recursive_mode() when the user next enables
+         * Recursive mode so its persistent index can be located and loaded.
          */
-        if !self.source.supports_recursive_scan() {
-            self.recursive_mode = false;
-        }
+        self.recursive_mode = false;
 
-        self.current_directory = success.directory;
+        self.current_directory = directory;
 
-        self.entries = success.entries;
+        self.home_directory = home_directory;
+
+        self.entries = entries;
 
         self.query.clear();
 
+        self.query_cursor = 0;
+
         self.search_mode = SearchMode::Exact;
 
-        self.error_message = None;
+        self.clear_messages();
 
         self.selected = 0;
 
@@ -4389,6 +6156,8 @@ impl App {
             return;
         }
 
+        self.marked_files.clear();
+
         let saved_session = self.saved_local_session.take();
 
         let fallback_directory = match std::env::current_dir() {
@@ -4404,8 +6173,20 @@ impl App {
             }
         };
 
+        /*
+         * If no saved local session exists, use the real local HOME as the
+         * destination of the new Go Home control.
+         *
+         * Fall back to the current working directory only when HOME is unavailable.
+         */
+        let fallback_home_directory = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| fallback_directory.clone());
+
         let session = saved_session.unwrap_or(LocalSessionState {
             directory: fallback_directory,
+
+            home_directory: fallback_home_directory,
 
             selected_path: None,
 
@@ -4449,7 +6230,15 @@ impl App {
          */
         self.source = Box::new(local_source);
 
+        self.active_ssh_target = None;
+
         self.invalidate_recursive_cache();
+
+        /*
+         * Restore the local meaning of Home before restoring the local
+         * working directory.
+         */
+        self.home_directory = session.home_directory;
 
         self.current_directory = session.directory;
 
@@ -4538,6 +6327,8 @@ impl App {
         self.overlay = Overlay::None;
 
         self.connection_dialog.error_message = None;
+
+        self.show_info_message("Disconnected — local browsing restored");
     }
 
     pub fn close_connection_dialog(&mut self) {
@@ -4579,10 +6370,12 @@ impl App {
             return;
         }
 
-        self.help_scroll = 0;
-
-        self.help_max_scroll = 0;
-
+        /*
+         * Preserve the Legend's previous scroll position.
+         *
+         * The renderer clamps it if the terminal size or content height changed
+         * while the window was closed.
+         */
         self.overlay = Overlay::Legend;
     }
 
@@ -4605,10 +6398,12 @@ impl App {
             | Overlay::About
             | Overlay::Connection
             | Overlay::RemoteIndexSetup => {
-                self.help_scroll = 0;
-
-                self.help_max_scroll = 0;
-
+                /*
+                 * Preserve the Help document's previous scroll position.
+                 *
+                 * render_help_overlay() clamps it against the current content and
+                 * viewport dimensions whenever the window is drawn.
+                 */
                 Overlay::Help
             }
         };
@@ -4645,6 +6440,36 @@ impl App {
         self.help_scroll = self.help_max_scroll;
     }
 
+    pub fn scroll_legend_up(&mut self) {
+        self.legend_scroll = self.legend_scroll.saturating_sub(1);
+    }
+
+    pub fn scroll_legend_down(&mut self) {
+        self.legend_scroll = self
+            .legend_scroll
+            .saturating_add(1)
+            .min(self.legend_max_scroll);
+    }
+
+    pub fn page_legend_up(&mut self) {
+        let amount = self.viewport_rows.saturating_sub(4).max(1) as u16;
+
+        self.legend_scroll = self.legend_scroll.saturating_sub(amount);
+    }
+
+    pub fn page_legend_down(&mut self) {
+        let amount = self.viewport_rows.saturating_sub(4).max(1) as u16;
+
+        self.legend_scroll = self
+            .legend_scroll
+            .saturating_add(amount)
+            .min(self.legend_max_scroll);
+    }
+
+    pub fn legend_scroll_to_end(&mut self) {
+        self.legend_scroll = self.legend_max_scroll;
+    }
+
     fn active_entries(&self) -> &[FileEntry] {
         /*
          * An empty query is ordinary filesystem browsing.
@@ -4653,9 +6478,9 @@ impl App {
          * flat List must continue to display only the current directory until the
          * user enters actual search text.
          */
-        let text_filter_active = !self.query.is_empty() && self.query != ".";
+        let query_active = self.effective_query_is_active();
 
-        if text_filter_active && self.recursive_search_active() {
+        if query_active && self.recursive_search_active() {
             &self.recursive_entries
         } else {
             &self.entries
@@ -4680,8 +6505,7 @@ impl App {
         }
 
         if !self.source.supports_recursive_scan() {
-            self.error_message =
-                Some("Recursive scanning is not available for the current source".to_string());
+            self.show_error_message("Recursive scanning is not available for the current source");
 
             self.scan_in_progress = false;
 
@@ -4700,6 +6524,8 @@ impl App {
 
         self.recursive_path_indices.clear();
 
+        self.recursive_child_indices.clear();
+
         Arc::make_mut(&mut self.search_index).clear();
 
         let receiver = match self.source.start_recursive_scan(
@@ -4711,7 +6537,7 @@ impl App {
             Ok(receiver) => receiver,
 
             Err(error) => {
-                self.error_message = Some(format!(
+                self.show_error_message(format!(
                     "Unable to start recursive scan of {}: {}",
                     self.current_directory.display(),
                     error,
@@ -4729,7 +6555,7 @@ impl App {
 
         self.scan_in_progress = true;
 
-        self.error_message = None;
+        self.clear_messages();
     }
 
     fn invalidate_recursive_cache(&mut self) {
@@ -4753,6 +6579,8 @@ impl App {
 
         self.recursive_path_indices.clear();
 
+        self.recursive_child_indices.clear();
+
         Arc::make_mut(&mut self.search_index).clear();
 
         self.search_tree_children.clear();
@@ -4763,12 +6591,30 @@ impl App {
     fn rebuild_recursive_path_indices(&mut self) {
         self.recursive_path_indices.clear();
 
-        self.recursive_path_indices.extend(
-            self.recursive_entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| (entry.path.clone(), index)),
-        );
+        self.recursive_child_indices.clear();
+
+        /*
+         * Reserve the path lookup at its final approximate size.
+         *
+         * The child map cannot know its directory count in advance, but every
+         * recursive entry receives exactly one numeric child index.
+         */
+        self.recursive_path_indices
+            .reserve(self.recursive_entries.len());
+
+        for (index, entry) in self.recursive_entries.iter().enumerate() {
+            self.recursive_path_indices
+                .insert(entry.path.clone(), index);
+
+            let Some(parent) = entry.path.parent() else {
+                continue;
+            };
+
+            self.recursive_child_indices
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(index);
+        }
     }
 
     pub fn current_visible_entry_count(&self) -> usize {
@@ -4831,8 +6677,11 @@ impl App {
                 Ok(entries) => entries,
 
                 Err(error) => {
-                    self.error_message =
-                        Some(format!("Unable to open {}: {}", target.display(), error));
+                    self.show_error_message(format!(
+                        "Unable to open {}: {}",
+                        target.display(),
+                        error,
+                    ));
 
                     return false;
                 }
@@ -4889,7 +6738,7 @@ impl App {
 
         self.search_navigation_active = true;
 
-        self.error_message = None;
+        self.clear_messages();
 
         self.selected = 0;
 
@@ -4933,8 +6782,11 @@ impl App {
                 Ok(entries) => entries,
 
                 Err(error) => {
-                    self.error_message =
-                        Some(format!("Unable to open {}: {}", target.display(), error,));
+                    self.show_error_message(format!(
+                        "Unable to open {}: {}",
+                        target.display(),
+                        error,
+                    ));
 
                     return false;
                 }
@@ -4974,7 +6826,9 @@ impl App {
 
         self.query.clear();
 
-        self.error_message = None;
+        self.query_cursor = 0;
+
+        self.clear_messages();
 
         self.selected = 0;
 
@@ -5080,17 +6934,18 @@ impl App {
         if let Some(position) = position {
             self.selected = position;
 
-            /*
-             * Exact recursive scans and fuzzy workers both rebuild their result sets
-             * asynchronously.
-             *
-             * Keep the intended path pinned until neither operation is still capable of
-             * moving entries around beneath the numeric selection row.
-             */
-            if !self.scan_in_progress && !self.fuzzy_filter_in_progress {
-                self.pending_selection_path = None;
+            self.pending_selection_path = None;
+
+            if let Some(saved_offset) = self.pending_session_list_offset.take() {
+                self.list_offset = saved_offset;
             }
 
+            /*
+             * A changed terminal height may make the exact old offset invalid.
+             *
+             * Keep it whenever possible, but always leave the restored selection
+             * visible inside the current viewport.
+             */
             self.ensure_selection_visible(self.viewport_rows);
         }
     }
@@ -5111,12 +6966,229 @@ impl App {
         self.fuzzy_total = 0;
 
         self.fuzzy_generation = self.fuzzy_generation.wrapping_add(1);
+
+        self.exact_tree_limit_reached = false;
+    }
+
+    fn schedule_current_recursive_search(&mut self) {
+        if !self.recursive_search_active() || !self.effective_query_is_active() {
+            self.pending_recursive_search_at = None;
+
+            self.cancel_fuzzy_filter();
+
+            /*
+             * Directive-only and incomplete queries are equivalent to an empty
+             * search. Immediately discard stale recursive results and restore
+             * ordinary browsing.
+             */
+            self.refresh_filter();
+
+            return;
+        }
+
+        /*
+         * Stop the worker for the previous query immediately.
+         *
+         * The visible result list remains in place while the newest query waits for
+         * its deadline. Only the obsolete computation disappears.
+         */
+        self.cancel_fuzzy_filter();
+
+        self.pending_recursive_search_at = Some(Instant::now() + RECURSIVE_SEARCH_DEBOUNCE);
+
+        self.fuzzy_examined = 0;
+
+        self.fuzzy_total = self.search_index.len();
+
+        /*
+         * This represents a pending live search as well as a running worker.
+         *
+         * The interface can therefore continue to indicate that the result set is
+         * being updated during the short debounce interval.
+         */
+        self.fuzzy_filter_in_progress = true;
+    }
+
+    pub fn process_pending_recursive_search(&mut self) -> bool {
+        let Some(deadline) = self.pending_recursive_search_at else {
+            return false;
+        };
+
+        if Instant::now() < deadline {
+            return false;
+        }
+
+        self.pending_recursive_search_at = None;
+
+        let parsed_query = parse_query(&self.query);
+
+        if parsed_query.is_effectively_empty() {
+            self.cancel_fuzzy_filter();
+
+            self.fuzzy_filter_in_progress = false;
+
+            return true;
+        }
+
+        /*
+         * A scan may still be preparing the stable recursive index.
+         *
+         * Scanner completion already re-enters the normal filtering route, so do
+         * not start a worker against an incomplete corpus.
+         */
+        if self.scan_in_progress {
+            self.fuzzy_filter_in_progress = false;
+
+            return true;
+        }
+
+        match self.search_mode {
+            SearchMode::Exact => {
+                self.start_current_exact_filter();
+            }
+
+            SearchMode::Fuzzy => {
+                self.start_current_fuzzy_filter();
+            }
+        }
+
+        true
+    }
+
+    fn start_current_exact_filter(&mut self) {
+        /*
+         * Exact background searching is required only for a completed recursive
+         * corpus.
+         *
+         * Ordinary single-directory filtering remains synchronous because that
+         * entry set is small and avoids unnecessary worker overhead.
+         */
+        self.pending_recursive_search_at = None;
+
+        self.exact_tree_limit_reached = false;
+
+        if !self.recursive_search_active() {
+            return;
+        }
+
+        let query_active = self.effective_query_is_active();
+
+        if !query_active {
+            self.cancel_fuzzy_filter();
+
+            self.filtered_indices = self
+                .active_entries()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    if !self.show_hidden && entry_is_hidden_below(entry, &self.current_directory) {
+                        return None;
+                    }
+
+                    if !self.entry_filter.matches(entry) {
+                        return None;
+                    }
+
+                    if self.source.is_remote() && !entry.path.starts_with(&self.current_directory) {
+                        return None;
+                    }
+
+                    Some(index)
+                })
+                .collect();
+
+            self.normalize_filtered_selection();
+
+            return;
+        }
+
+        /*
+         * Wait for a stable recursive index.
+         *
+         * The scanner completion path starts the search again automatically.
+         */
+        if self.scan_in_progress {
+            self.cancel_fuzzy_filter();
+
+            self.fuzzy_examined = 0;
+
+            self.fuzzy_total = self.search_index.len();
+
+            return;
+        }
+
+        self.cancel_fuzzy_filter();
+
+        let generation = self.fuzzy_generation;
+
+        let index = Arc::clone(&self.search_index);
+
+        let parsed_query = parse_query(&self.query);
+
+        let worker_entry_filter = match self.entry_filter {
+            EntryFilter::All => WorkerEntryFilter::All,
+
+            EntryFilter::FilesOnly => WorkerEntryFilter::FilesOnly,
+
+            EntryFilter::DirectoriesOnly => WorkerEntryFilter::DirectoriesOnly,
+        };
+
+        let scope_prefix = if self.source.is_remote() {
+            Some(
+                self.current_directory
+                    .strip_prefix("/")
+                    .unwrap_or(&self.current_directory)
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
+        } else {
+            None
+        };
+
+        let result_limit = match self.view_mode {
+            ViewMode::List => None,
+
+            ViewMode::Tree => Some(EXACT_TREE_MATCH_LIMIT),
+        };
+
+        let cancel_signal = Arc::new(AtomicBool::new(false));
+
+        self.fuzzy_examined = 0;
+
+        self.fuzzy_total = index.len();
+
+        self.fuzzy_receiver = Some(start_exact_worker(
+            index,
+            parsed_query,
+            generation,
+            self.show_hidden,
+            scope_prefix,
+            worker_entry_filter,
+            result_limit,
+            Arc::clone(&cancel_signal),
+        ));
+
+        self.fuzzy_cancel_signal = Some(cancel_signal);
+
+        self.active_fuzzy_request = None;
+
+        self.fuzzy_filter_in_progress = true;
+
+        /*
+         * Keep the previous result visible until the first preview or final result
+         * arrives. The query field can therefore redraw immediately without a
+         * distracting empty-list flash.
+         */
     }
 
     fn start_current_fuzzy_filter(&mut self) {
-        let text_filter_active = !self.query.is_empty() && self.query != ".";
+        self.pending_recursive_search_at = None;
 
-        if !text_filter_active {
+        self.exact_tree_limit_reached = false;
+
+        let query_active = self.effective_query_is_active();
+
+        if !query_active {
             self.cancel_fuzzy_filter();
 
             self.fuzzy_examined = 0;
@@ -5128,11 +7200,15 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
-                    if !self.show_hidden && entry.name.starts_with('.') {
-                        None
-                    } else {
-                        Some(index)
+                    if !self.show_hidden && entry_is_hidden_below(entry, &self.current_directory) {
+                        return None;
                     }
+
+                    if !self.entry_filter.matches(entry) {
+                        return None;
+                    }
+
+                    Some(index)
                 })
                 .collect();
 
@@ -5229,12 +7305,29 @@ impl App {
             None
         };
 
+        /*
+         * Parse the query once for this worker generation.
+         *
+         * Structured modifiers decide which entries may participate. Only
+         * ordinary unsigned text is sent to the fuzzy scorer.
+         */
+        let parsed_query = parse_query(&self.query);
+
+        let worker_entry_filter = match self.entry_filter {
+            EntryFilter::All => WorkerEntryFilter::All,
+
+            EntryFilter::FilesOnly => WorkerEntryFilter::FilesOnly,
+
+            EntryFilter::DirectoriesOnly => WorkerEntryFilter::DirectoriesOnly,
+        };
+
         self.fuzzy_receiver = Some(start_fuzzy_worker(
             index,
-            self.query.clone(),
+            parsed_query,
             generation,
             self.show_hidden,
             scope_prefix,
+            worker_entry_filter,
             Arc::clone(&cancel_signal),
         ));
 
@@ -5321,18 +7414,34 @@ impl App {
 
                 ViewMode::Tree => {
                     /*
-                     * Tree consumes the same bounded, ranked worker result as List mode.
+                     * Tree hierarchy construction is substantially heavier than replacing a
+                     * flat List result.
                      *
-                     * rebuild_fuzzy_search_tree_from_indices() adds only the best matches
-                     * and the ancestors required to connect them to the current root.
+                     * Progressive worker snapshots are useful in List mode, but rebuilding
+                     * parent-child maps, ancestors, sorted siblings, and TreeRows for every
+                     * snapshot can monopolize the event thread. Tree therefore waits for the
+                     * final stable result.
                      */
-                    self.rebuild_fuzzy_search_tree_from_indices(&message.indices, selected_path);
+                    if message.finished {
+                        /*
+                         * Only Exact Recursive Tree uses the configurable 5,000-match safety cap.
+                         */
+                        self.exact_tree_limit_reached =
+                            self.search_mode == SearchMode::Exact && message.limit_reached;
 
-                    self.restore_pending_selection_if_available();
+                        self.rebuild_fuzzy_search_tree_from_indices(
+                            &message.indices,
+                            selected_path,
+                        );
+
+                        self.restore_pending_selection_if_available();
+                    }
                 }
             }
 
-            changed = true;
+            if self.view_mode == ViewMode::List || message.finished {
+                changed = true;
+            }
 
             if message.finished {
                 self.fuzzy_receiver = None;
@@ -5371,6 +7480,29 @@ impl App {
     }
 
     fn refresh_filter(&mut self) {
+        /*
+         * Every recursive text search uses a background worker.
+         *
+         * Exact and Fuzzy therefore have identical input responsiveness even when
+         * the resident corpus contains millions of records.
+         */
+        if self.recursive_search_active() && self.effective_query_is_active() {
+            match self.search_mode {
+                SearchMode::Exact => {
+                    self.start_current_exact_filter();
+                }
+
+                SearchMode::Fuzzy => {
+                    self.start_current_fuzzy_filter();
+                }
+            }
+
+            return;
+        }
+
+        /*
+         * Non-recursive Fuzzy search retains its existing worker route.
+         */
         if self.search_mode == SearchMode::Fuzzy {
             self.start_current_fuzzy_filter();
 
@@ -5388,14 +7520,11 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                if !show_hidden && entry.name.starts_with('.') {
+                if !show_hidden && entry_is_hidden_below(entry, &self.current_directory) {
                     return None;
                 }
 
-                if self.source.is_remote()
-                    && self.recursive_search_active()
-                    && !entry.path.starts_with(&self.current_directory)
-                {
+                if !self.entry_filter.matches(entry) {
                     return None;
                 }
 
@@ -5418,15 +7547,10 @@ impl App {
         self.search_tree_children.clear();
 
         /*
-         * The fuzzy worker has already searched and ranked the complete compact
-         * index. Its result contains at most the best 500 recursive-entry indices.
+         * The worker has already searched the complete compact index.
          *
-         * Tree construction must therefore touch only:
-         *
-         * - those ranked matches;
-         * - the ancestors needed to connect them to the current root.
-         *
-         * It must never search the complete recursive corpus again.
+         * Tree construction therefore touches only the returned matches and the
+         * ancestors required to connect them to the current root.
          */
         let mut included_indices: HashSet<usize> = HashSet::new();
 
@@ -5453,8 +7577,8 @@ impl App {
         }
 
         /*
-         * Convert the bounded path set into the same parent → children structure
-         * already consumed by Scry's proven Tree-row renderer and navigation code.
+         * Convert the bounded included set into the parent → children structure
+         * consumed by the existing Tree-row builder.
          */
         for entry_index in included_indices {
             let Some(entry) = self.recursive_entries.get(entry_index).cloned() else {
@@ -5471,12 +7595,6 @@ impl App {
                 .push(entry);
         }
 
-        /*
-         * Preserve Scry's established sibling ordering and directory-first rule.
-         *
-         * Only small sibling groups belonging to the bounded contextual tree are
-         * sorted here—not the complete recursive population.
-         */
         for children in self.search_tree_children.values_mut() {
             sort_entries(children, self.sort_mode, self.sort_descending);
         }
@@ -5494,16 +7612,10 @@ impl App {
         self.search_tree_children.clear();
 
         /*
-         * Fast path for startup recursive mode.
+         * Fast path for plain recursive Tree mode.
          *
-         * With an empty query, every scanned entry belongs in the tree.
-         * Each FileEntry already carries its complete path, so it can be
-         * inserted directly beneath its parent without:
-         *
-         * - constructing a second path -> entry lookup;
-         * - collecting every included path;
-         * - walking every entry's ancestors;
-         * - looking every path up again afterward.
+         * The hierarchy contains every recursive entry, but visible TreeRows remain
+         * lazy and are created only for the root and explicitly expanded branches.
          */
         if query.is_empty() {
             for entry in &self.recursive_entries {
@@ -5522,19 +7634,14 @@ impl App {
             }
         } else {
             /*
-             * A text-filtered recursive tree must also include the ancestors of
-             * every matching entry so that each result remains connected to the
-             * current root.
+             * Fallback synchronous reconstruction.
+             *
+             * Normal live Exact and Fuzzy searches now arrive through their
+             * background workers and rebuild_fuzzy_search_tree_from_indices().
              */
-            let mut entries_by_path: HashMap<PathBuf, FileEntry> = HashMap::new();
+            let mut included_indices: HashSet<usize> = HashSet::new();
 
-            for entry in self.entries.iter().chain(self.recursive_entries.iter()) {
-                entries_by_path.insert(entry.path.clone(), entry.clone());
-            }
-
-            let mut included_paths: HashSet<PathBuf> = HashSet::new();
-
-            for entry in &self.recursive_entries {
+            for (entry_index, entry) in self.recursive_entries.iter().enumerate() {
                 if !entry.searchable_path.contains(&query) {
                     continue;
                 }
@@ -5543,7 +7650,7 @@ impl App {
                     continue;
                 }
 
-                included_paths.insert(entry.path.clone());
+                included_indices.insert(entry_index);
 
                 let mut ancestor = entry.path.parent();
 
@@ -5552,14 +7659,16 @@ impl App {
                         break;
                     }
 
-                    included_paths.insert(path.to_path_buf());
+                    if let Some(&ancestor_index) = self.recursive_path_indices.get(path) {
+                        included_indices.insert(ancestor_index);
+                    }
 
                     ancestor = path.parent();
                 }
             }
 
-            for path in included_paths {
-                let Some(entry) = entries_by_path.get(&path).cloned() else {
+            for entry_index in included_indices {
+                let Some(entry) = self.recursive_entries.get(entry_index).cloned() else {
                     continue;
                 };
 
@@ -5587,13 +7696,6 @@ impl App {
         let mut rows = Vec::new();
 
         if self.recursive_mode && self.query.is_empty() {
-            /*
-             * Plain recursive Tree mode is lazy.
-             *
-             * The complete hierarchy is already indexed in
-             * search_tree_children, but initially only the root's immediate
-             * children become visible TreeRows.
-             */
             Self::append_recursive_direct_children(
                 self.current_directory.clone(),
                 Vec::new(),
@@ -5602,10 +7704,6 @@ impl App {
                 &mut rows,
             );
         } else {
-            /*
-             * A text-search tree remains fully connected so every match and its
-             * ancestors are visible immediately.
-             */
             Self::append_recursive_search_children(
                 self.current_directory.clone(),
                 Vec::new(),
@@ -5658,12 +7756,6 @@ impl App {
                 expanded,
             });
 
-            /*
-             * Recreate only branches that the user had already expanded.
-             *
-             * This preserves the visible tree and selected path when sorting,
-             * without materializing every descendant in the recursive index.
-             */
             if expanded {
                 let mut child_ancestor_has_more = ancestor_has_more.clone();
 
@@ -5694,9 +7786,7 @@ impl App {
         let child_count = children.len();
 
         for (index, entry) in children.iter().cloned().enumerate() {
-            let is_last = index + 1 == child_count;
-
-            let is_directory = entry.is_directory;
+            let is_last = index.saturating_add(1) == child_count;
 
             let child_path = entry.path.clone();
 
@@ -5704,7 +7794,7 @@ impl App {
                 .get(&child_path)
                 .is_some_and(|children| !children.is_empty());
 
-            let expanded = is_directory
+            let expanded = entry.is_directory
                 && has_visible_children
                 && !collapsed_directories.contains(&child_path);
 
@@ -5763,15 +7853,17 @@ impl App {
     }
 
     fn restore_manual_tree(&mut self) {
-        self.search_collapsed_directories.clear();
-
-        self.search_tree_children.clear();
-
         let saved_selection = self.tree_search_saved_selection.take();
 
         let saved_offset = self.tree_search_saved_offset;
 
-        self.rebuild_tree_rows(None);
+        /*
+         * Reconstruct the ordinary browsing Tree from the current directory.
+         *
+         * rebuild_tree_rows() alone is insufficient when the recursive search
+         * hierarchy has replaced or cleared the ordinary tree_children map.
+         */
+        self.reset_tree();
 
         if let Some(saved_selection) = saved_selection {
             if let Some(position) = self
@@ -5787,7 +7879,6 @@ impl App {
 
         self.refresh_tree_filter();
     }
-
     fn select_parent_in_search_tree(&mut self) {
         let Some(row) = self.tree_row_at_filtered_position(self.selected).cloned() else {
             return;
@@ -5811,7 +7902,12 @@ impl App {
     }
 
     fn refresh_tree_filter(&mut self) {
-        self.filtered_tree_indices = (0..self.tree_rows.len()).collect();
+        self.filtered_tree_indices = self
+            .tree_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| self.entry_filter.matches(&row.entry).then_some(index))
+            .collect();
 
         if self.filtered_tree_indices.is_empty() {
             self.selected = 0;
@@ -5871,7 +7967,11 @@ fn connect_profile_worker(
     Ok(ConnectionWorkerSuccess {
         source: Box::new(source),
 
+        target,
+
         directory,
+
+        home_directory: remote_home,
 
         entries,
     })
@@ -5940,4 +8040,195 @@ fn normalize_start_path(start_path: PathBuf) -> io::Result<PathBuf> {
     };
 
     Ok(parent.to_path_buf())
+}
+
+/*
+ * Convert an absolute remote path into a safe relative path beneath the batch
+ * download directory.
+ *
+ * Example:
+ *
+ *     /home/ferusx/docs/report.pdf
+ *
+ * becomes:
+ *
+ *     home/ferusx/docs/report.pdf
+ *
+ * Parent-directory components are rejected so a malformed remote path can
+ * never escape the chosen destination root.
+ */
+fn safe_batch_relative_path(remote_path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+
+    let mut relative_path = PathBuf::new();
+
+    for component in remote_path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+
+            Component::Normal(component) => {
+                relative_path.push(component);
+            }
+
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "remote path contains a parent-directory component: {}",
+                        remote_path.display(),
+                    ),
+                ));
+            }
+
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "remote path contains an unsupported platform prefix: {}",
+                        remote_path.display(),
+                    ),
+                ));
+            }
+        }
+    }
+
+    if relative_path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "remote path does not contain a downloadable filename: {}",
+                remote_path.display(),
+            ),
+        ));
+    }
+
+    Ok(relative_path)
+}
+
+/*
+ * Choose a unique filename directly beneath the batch root.
+ *
+ * Files from different remote directories may share the same basename. Add a
+ * numeric suffix before the extension rather than overwriting an earlier item.
+ *
+ * Examples:
+ *
+ *     report.pdf
+ *     report-2.pdf
+ *     report-3.pdf
+ *
+ *     LICENSE
+ *     LICENSE-2
+ */
+fn unique_flat_batch_destination(
+    destination_root: &Path,
+    filename: &str,
+    reserved_paths: &mut HashSet<PathBuf>,
+) -> io::Result<PathBuf> {
+    let filename_path = Path::new(filename);
+
+    let stem = filename_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("remote file has no usable filename: {}", filename),
+            )
+        })?;
+
+    let extension = filename_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty());
+
+    for suffix in 1_u32..=100_000 {
+        let candidate_name = if suffix == 1 {
+            filename.to_string()
+        } else {
+            match extension {
+                Some(extension) => {
+                    format!("{}-{}.{}", stem, suffix, extension)
+                }
+
+                None => {
+                    format!("{}-{}", stem, suffix)
+                }
+            }
+        };
+
+        let candidate = destination_root.join(candidate_name);
+
+        /*
+         * Check both the precomputed queue and the filesystem. The latter
+         * protects retries or externally created files inside the batch root.
+         */
+        if !reserved_paths.contains(&candidate) && !candidate.exists() {
+            reserved_paths.insert(candidate.clone());
+
+            return Ok(candidate);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "unable to choose a unique download name for {} inside {}",
+            filename,
+            destination_root.display(),
+        ),
+    ))
+}
+
+/*
+ * Create a new visible batch directory inside the local directory from which
+ * the SSH session was entered.
+ *
+ * A numeric suffix protects against two batches starting during the same
+ * second or against an older directory already using the timestamp.
+ */
+fn create_batch_download_directory(local_directory: &Path) -> io::Result<PathBuf> {
+    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
+
+    let base_name = format!("scry-download-{}", timestamp);
+
+    for suffix in 0_u32..10_000 {
+        let directory_name = if suffix == 0 {
+            base_name.clone()
+        } else {
+            format!("{}-{}", base_name, suffix)
+        };
+
+        let candidate = local_directory.join(directory_name);
+
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                return Ok(candidate);
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "unable to create batch download directory {}: {}",
+                        candidate.display(),
+                        error,
+                    ),
+                ));
+            }
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "unable to create a unique batch download directory inside {}",
+            local_directory.display(),
+        ),
+    ))
 }

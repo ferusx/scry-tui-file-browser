@@ -20,13 +20,6 @@ pub struct HelpOption {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct KeyBindingHelp {
-    pub keys: &'static str,
-
-    pub description: &'static str,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct HelpExample {
     pub command: &'static str,
 
@@ -40,14 +33,34 @@ pub const OPTIONS: &[HelpOption] = &[
         description: "Print this help information",
     },
     HelpOption {
+        short: "",
+        long: "--manual",
+        description: "Print the complete explanatory manual",
+    },
+    HelpOption {
         short: "-V",
         long: "--version",
         description: "Print the Scry version",
     },
     HelpOption {
         short: "",
+        long: "--generate-config",
+        description: "Generate scry.toml.generated and exit",
+    },
+    HelpOption {
+        short: "",
+        long: "--restore-session",
+        description: "Restore the most recently saved browser session",
+    },
+    HelpOption {
+        short: "",
         long: "--ssh TARGET",
         description: "Browse a remote computer through SSH/SFTP",
+    },
+    HelpOption {
+        short: "",
+        long: "--preserve-hierarchy",
+        description: "Preserve remote paths during marked batch downloads",
     },
     HelpOption {
         short: "-a",
@@ -60,9 +73,39 @@ pub const OPTIONS: &[HelpOption] = &[
         description: "Start with a recursive listing",
     },
     HelpOption {
+        short: "",
+        long: "--fuzzy",
+        description: "Start in Fuzzy search mode",
+    },
+    HelpOption {
+        short: "",
+        long: "--query TEXT",
+        description: "Start with TEXT in the search field",
+    },
+    HelpOption {
+        short: "",
+        long: "--files-only",
+        description: "Show files and symlinks only",
+    },
+    HelpOption {
+        short: "",
+        long: "--dirs-only",
+        description: "Show directories only",
+    },
+    HelpOption {
         short: "-T",
         long: "--tree",
         description: "Start in Tree mode",
+    },
+    HelpOption {
+        short: "",
+        long: "--no-open",
+        description: "Do not open selected files externally",
+    },
+    HelpOption {
+        short: "",
+        long: "--exit-on-open",
+        description: "Exit after successfully opening a file",
     },
     HelpOption {
         short: "-p",
@@ -85,96 +128,6 @@ pub const OPTIONS: &[HelpOption] = &[
         description: "Show the owner column",
     },
 ];
-
-pub const KEY_BINDINGS: &[KeyBindingHelp] = &[
-    KeyBindingHelp {
-        keys: "↑ / ↓",
-        description: "Move the selection",
-    },
-    KeyBindingHelp {
-        keys: "PgUp / PgDn",
-        description: "Move one visible page",
-    },
-    KeyBindingHelp {
-        keys: "Home / End",
-        description: "Select the first or last entry",
-    },
-    KeyBindingHelp {
-        keys: "←",
-        description: "Collapse a branch or move to the parent",
-    },
-    KeyBindingHelp {
-        keys: "→",
-        description: "Expand the selected directory",
-    },
-    KeyBindingHelp {
-        keys: "Enter",
-        description: "Enter as new root or open the selected file",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+T",
-        description: "Switch between List and Tree modes",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+D",
-        description: "Show or hide the Details pane",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+S",
-        description: "Show or hide the Selection panel",
-    },
-    KeyBindingHelp {
-        keys: "Alt+M",
-        description: "Show or hide the metadata columns",
-    },
-    KeyBindingHelp {
-        keys: "Alt+H",
-        description: "Show or hide hidden entries",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+O",
-        description: "Cycle through the sort modes",
-    },
-    KeyBindingHelp {
-        keys: "Alt+R",
-        description: "Toggle recursive mode",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+R",
-        description: "Reverse the current sort order",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+U",
-        description: "Clear the current search",
-    },
-    KeyBindingHelp {
-        keys: "Ctrl+C",
-        description: "Quit Scry",
-    },
-    KeyBindingHelp {
-        keys: "Mouse wheel",
-        description: "Scroll through entries",
-    },
-    KeyBindingHelp {
-        keys: "Double-click",
-        description: "Activate the selected entry",
-    },
-    KeyBindingHelp {
-        keys: "Middle-click",
-        description: "Collapse or move to the parent",
-    },
-];
-
-pub const DELETION_KEY_BINDING: KeyBindingHelp = KeyBindingHelp {
-    keys: "Delete",
-    description: "Delete the selected local file or directory",
-};
-
-pub const DISABLED_DELETION_KEY_BINDING: KeyBindingHelp = KeyBindingHelp {
-    keys: "Delete",
-    description: "Delete sel. entry (enable via scry.toml)",
-};
-
 pub const EXAMPLES: &[HelpExample] = &[
     HelpExample {
         command: "scry -T -p -s ~/Projects",
@@ -191,6 +144,10 @@ pub const EXAMPLES: &[HelpExample] = &[
     HelpExample {
         command: "scry --ssh 192.168.1.50 -pT",
         description: "Browse remote directory in Tree mode with permissions",
+    },
+    HelpExample {
+        command: "scry --ssh example-host --preserve-hierarchy",
+        description: "Preserve remote directory paths during marked batch downloads",
     },
 ];
 
@@ -294,7 +251,7 @@ impl Palette {
     }
 }
 
-pub fn print_help(enable_deletion: bool) -> io::Result<()> {
+pub fn print_help() -> io::Result<()> {
     let palette = Palette::new();
 
     let options_widths = option_column_widths();
@@ -369,9 +326,13 @@ pub fn print_help(enable_deletion: bool) -> io::Result<()> {
 
     println!();
 
-    println!("{}", palette.section("Keyboard and mouse:"),);
-
-    print_key_table(palette, enable_deletion);
+    println!(
+        "{}",
+        palette.muted(
+            "Run `scry --manual` for the complete manual and use Ctrl+! inside Scry \
+         for the interactive shortcut legend.",
+        ),
+    );
 
     println!();
 
@@ -509,216 +470,16 @@ fn print_three_column_row(
     );
 }
 
-fn print_key_table(palette: Palette, enable_deletion: bool) {
-    let deletion_binding = if enable_deletion {
-        DELETION_KEY_BINDING
-    } else {
-        DISABLED_DELETION_KEY_BINDING
-    };
-
-    let bindings = KEY_BINDINGS
-        .iter()
-        .copied()
-        .chain(std::iter::once(deletion_binding))
-        .collect::<Vec<_>>();
-
-    let key_width = bindings
-        .iter()
-        .map(|binding| binding.keys.chars().count())
-        .chain(std::iter::once("keys".len()))
-        .max()
-        .unwrap_or(4);
-
-    let description_width = bindings
-        .iter()
-        .map(|binding| binding.description.chars().count())
-        .chain(std::iter::once("description".len()))
-        .max()
-        .unwrap_or(11);
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '┌',
-            '┬',
-            '┐',
-            &[key_width, description_width],
-        )),
-    );
-
-    print_two_column_row(
-        palette,
-        "keys",
-        "description",
-        key_width,
-        description_width,
-        true,
-    );
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '├',
-            '┼',
-            '┤',
-            &[key_width, description_width],
-        )),
-    );
-
-    for binding in bindings {
-        print_two_column_row(
-            palette,
-            binding.keys,
-            binding.description,
-            key_width,
-            description_width,
-            false,
-        );
-    }
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '└',
-            '┴',
-            '┘',
-            &[key_width, description_width],
-        )),
-    );
-}
-
 fn print_examples_table(palette: Palette) {
-    let command_width = EXAMPLES
-        .iter()
-        .map(|example| example.command.chars().count())
-        .chain(std::iter::once("command".len()))
-        .max()
-        .unwrap_or(7);
+    for (index, example) in EXAMPLES.iter().enumerate() {
+        println!("  {}", palette.command(example.command),);
 
-    let description_width = EXAMPLES
-        .iter()
-        .map(|example| example.description.chars().count())
-        .chain(std::iter::once("description".len()))
-        .max()
-        .unwrap_or(11);
+        println!("    {}", palette.text(example.description),);
 
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '┌',
-            '┬',
-            '┐',
-            &[command_width, description_width,],
-        ),),
-    );
-
-    print_example_row(
-        palette,
-        "command",
-        "description",
-        command_width,
-        description_width,
-        true,
-    );
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '├',
-            '┼',
-            '┤',
-            &[command_width, description_width,],
-        ),),
-    );
-
-    for example in EXAMPLES {
-        print_example_row(
-            palette,
-            example.command,
-            example.description,
-            command_width,
-            description_width,
-            false,
-        );
+        if index + 1 < EXAMPLES.len() {
+            println!();
+        }
     }
-
-    println!(
-        "{}",
-        palette.frame(&table_border(
-            '└',
-            '┴',
-            '┘',
-            &[command_width, description_width,],
-        ),),
-    );
-}
-
-fn print_example_row(
-    palette: Palette,
-    command: &str,
-    description: &str,
-    command_width: usize,
-    description_width: usize,
-    heading: bool,
-) {
-    let command = pad_right(command, command_width);
-
-    let description = pad_right(description, description_width);
-
-    let command = if heading {
-        palette.section(&command)
-    } else {
-        palette.accent(&command)
-    };
-
-    let description = if heading {
-        palette.section(&description)
-    } else {
-        palette.text(&description)
-    };
-
-    println!(
-        "{} {} {} {} {}",
-        palette.frame("│"),
-        command,
-        palette.frame("│"),
-        description,
-        palette.frame("│"),
-    );
-}
-
-fn print_two_column_row(
-    palette: Palette,
-    first: &str,
-    second: &str,
-    first_width: usize,
-    second_width: usize,
-    heading: bool,
-) {
-    let first = pad_right(first, first_width);
-
-    let second = pad_right(second, second_width);
-
-    let first = if heading {
-        palette.section(&first)
-    } else {
-        palette.accent(&first)
-    };
-
-    let second = if heading {
-        palette.section(&second)
-    } else {
-        palette.text(&second)
-    };
-
-    println!(
-        "{} {} {} {} {}",
-        palette.frame("│"),
-        first,
-        palette.frame("│"),
-        second,
-        palette.frame("│"),
-    );
 }
 
 fn table_border(left: char, junction: char, right: char, widths: &[usize]) -> String {

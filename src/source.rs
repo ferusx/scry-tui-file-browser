@@ -4,11 +4,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
+use crate::file_info::{FileInfo, FileInfoMessage, start_local_file_info};
+use crate::remote_index::{RemoteIndexBuildMessage, RemoteIndexIdentity};
 use crate::scan::{
     FileEntry, RecursiveScanMode, ScanMessage, SortMode, read_directory, start_recursive_scan,
 };
-
-use crate::remote_index::{RemoteIndexBuildMessage, RemoteIndexIdentity};
 
 #[derive(Debug, Clone, Copy)]
 pub struct TransferProgress {
@@ -36,6 +36,23 @@ pub trait FileSource: Debug + Send {
 
     fn path_is_directory(&mut self, path: &Path) -> io::Result<bool>;
 
+    /*
+     * Begin extended metadata inspection for one selected filesystem entry.
+     *
+     * Sources perform the potentially blocking work outside Scry's terminal
+     * event loop and return progress through a receiver.
+     */
+    fn start_file_info(
+        &mut self,
+        _initial_info: FileInfo,
+        _generation: u64,
+    ) -> io::Result<Receiver<FileInfoMessage>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file information is not supported by this filesystem source",
+        ))
+    }
+
     fn supports_recursive_scan(&self) -> bool;
 
     fn start_recursive_scan(
@@ -58,6 +75,25 @@ pub trait FileSource: Debug + Send {
         path: &Path,
         progress: &mut dyn FnMut(TransferProgress) -> io::Result<TransferControl>,
     ) -> io::Result<PathBuf>;
+
+    /*
+     * Copy one source file into an explicit user-owned destination.
+     *
+     * Unlike materialize_file(), this operation must not redirect the result into
+     * Scry's private cache. Batch SSH downloads use it to preserve the remote
+     * hierarchy beneath a visible local download directory.
+     */
+    fn download_file_to(
+        &mut self,
+        _source_path: &Path,
+        _destination_path: &Path,
+        _progress: &mut dyn FnMut(TransferProgress) -> io::Result<TransferControl>,
+    ) -> io::Result<PathBuf> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "explicit file downloads are not supported by this filesystem source",
+        ))
+    }
 
     fn is_remote(&self) -> bool {
         false
@@ -110,6 +146,14 @@ impl FileSource for LocalSource {
 
     fn path_is_directory(&mut self, path: &Path) -> io::Result<bool> {
         Ok(std::fs::metadata(path)?.is_dir())
+    }
+
+    fn start_file_info(
+        &mut self,
+        initial_info: FileInfo,
+        generation: u64,
+    ) -> io::Result<Receiver<FileInfoMessage>> {
+        Ok(start_local_file_info(initial_info, generation))
     }
 
     fn supports_recursive_scan(&self) -> bool {
