@@ -501,7 +501,7 @@ fn main() -> io::Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
 
-    let run_result = ratatui::run(|mut terminal| run_app(&mut terminal, &mut app));
+    let run_result = ratatui::run(|terminal| run_app(terminal, &mut app));
 
     let disable_result = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture,);
 
@@ -523,13 +523,13 @@ fn main() -> io::Result<()> {
         }
     }
 
-    if let Some(text) = app.clipboard_handoff_text() {
-        if let Err(error) = clipboard::spawn_owner(&text) {
-            eprintln!(
-                "scry: unable to preserve clipboard contents after exit: {}",
-                error,
-            );
-        }
+    if let Some(text) = app.clipboard_handoff_text()
+        && let Err(error) = clipboard::spawn_owner(&text)
+    {
+        eprintln!(
+            "scry: unable to preserve clipboard contents after exit: {}",
+            error,
+        );
     }
 
     Ok(())
@@ -703,14 +703,12 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
     if key_event
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && let KeyCode::Char(character) = key_event.code
+        && character.is_ascii_alphabetic()
     {
-        if let KeyCode::Char(character) = key_event.code {
-            if character.is_ascii_alphabetic() {
-                key_event.code = KeyCode::Char(character.to_ascii_lowercase());
+        key_event.code = KeyCode::Char(character.to_ascii_lowercase());
 
-                key_event.modifiers.remove(KeyModifiers::SHIFT);
-            }
-        }
+        key_event.modifiers.remove(KeyModifiers::SHIFT);
     }
 
     if app.file_info_visible() {
@@ -1198,15 +1196,25 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
         }
 
         /*
-         * Check whether Control is present rather than requiring it to be the
-         * only modifier. Enhanced keyboard protocols may attach additional
-         * modifier bits to Ctrl+Arrow events.
+         * Plain Left/Right edit the active query safely.
+         *
+         * Hold Control to perform structural navigation. This prevents an accidental
+         * arrow press while editing a query from leaving the current directory or
+         * changing the active Tree branch.
          */
         (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.move_query_cursor_left();
+            app.enter_parent_directory();
         }
 
         (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.enter_selected_directory();
+        }
+
+        (KeyCode::Left, _) => {
+            app.move_query_cursor_left();
+        }
+
+        (KeyCode::Right, _) => {
             app.move_query_cursor_right();
         }
 
@@ -1244,14 +1252,6 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
 
         (KeyCode::End, _) => {
             app.select_last();
-        }
-
-        (KeyCode::Left, _) => {
-            app.enter_parent_directory();
-        }
-
-        (KeyCode::Right, _) => {
-            app.enter_selected_directory();
         }
 
         (KeyCode::Delete, _) => {

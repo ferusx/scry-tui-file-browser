@@ -32,9 +32,8 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     searching immediately, while the current mode is shown in brackets beside \
     the field. Backspace deletes the character before the caret and never changes \
     the active directory. The visible caret may be moved one character at a time \
-    (Ctrl+Left and Ctrl+Right), sent to the beginning or end of the query \
-    (Ctrl+Home and Ctrl+End), or cleared together with the complete query \
-    (Ctrl+U).",
+    (Left and Right), sent to the beginning or end of the query (Ctrl+Home and \
+    Ctrl+End), or cleared together with the complete query (Ctrl+U).",
         text_width,
         theme,
     );
@@ -132,8 +131,8 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         &mut lines,
         "Tree mode displays directories as expandable branches and makes the \
         relationship between parents and descendants visible. It may be enabled or \
-        disabled at any time (Ctrl+T). Right expands the selected directory, while \
-        Left collapses an open branch or moves the selection to its parent. Enter \
+        disabled at any time (Ctrl+T). Ctrl+Right expands the selected directory, while \
+        Ctrl+Left collapses an open branch or moves the selection to its parent. Enter \
         makes the selected directory the new active root, closing the former \
         hierarchy behind it.",
         text_width,

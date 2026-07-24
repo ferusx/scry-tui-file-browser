@@ -377,27 +377,50 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         app.current_directory.display(),
     );
 
-    let mode_label = match (app.search_mode, app.recursive_mode) {
-        (SearchMode::Exact, false) => "Exact",
+    let mode_label = match (
+        app.search_mode,
+        app.recursive_mode,
+        app.sort_descending,
+    ) {
+        (SearchMode::Exact, false, false) => "Exact",
 
-        (SearchMode::Fuzzy, false) => "Fuzzy",
+        (SearchMode::Exact, false, true) => "Exact+Reverse",
 
-        (SearchMode::Exact, true) => "Recursive",
+        (SearchMode::Fuzzy, false, false) => "Fuzzy",
 
-        (SearchMode::Fuzzy, true) => "Fuzzy+Recursive",
+        (SearchMode::Fuzzy, false, true) => "Fuzzy+Reverse",
+
+        (SearchMode::Exact, true, false) => "Recursive",
+
+        (SearchMode::Exact, true, true) => "Recursive+Reverse",
+
+        (SearchMode::Fuzzy, true, false) => "Fuzzy+Recursive",
+
+        (SearchMode::Fuzzy, true, true) => "Fuzzy+Recursive+Reverse",
     };
 
     let placeholder = match (app.search_mode, app.recursive_mode) {
-        (SearchMode::Exact, false) => r#"type to filter — e.g. "hello", "world", "/etc""#,
+        (SearchMode::Exact, false) => {
+            r#"type to filter — e.g. "hello", "ext:rs", "type:source""#
+        }
 
-        (SearchMode::Fuzzy, false) => r#"type to search fuzzily — e.g. "help", "hlep", "hlp""#,
+        (SearchMode::Fuzzy, false) => {
+            r#"type to search fuzzily — e.g. "help", "hlep", "-java""#
+        }
 
-        (SearchMode::Exact, true) => r#"type to filter recursively — e.g. "config", ".rs", "/etc""#,
+        (SearchMode::Exact, true) => {
+            r#"type to filter recursively — e.g. "config", "type:dir", "+rust""#
+        }
 
-        (SearchMode::Fuzzy, true) => r#"type to search recursively — e.g. "help", "hlep", "hlp""#,
+        (SearchMode::Fuzzy, true) => {
+            r#"type to search recursively — e.g. "index", "ext:rs", "rust AND test""#
+        }
     };
 
-    let emphasized_mode = app.search_mode == SearchMode::Fuzzy || app.recursive_mode;
+    let emphasized_mode =
+        app.search_mode == SearchMode::Fuzzy
+            || app.recursive_mode
+            || app.sort_descending;
 
     let mode_color = if emphasized_mode {
         theme.ui.query
@@ -682,7 +705,7 @@ fn format_past_age(age: Duration) -> String {
     if age.as_secs() < 5 {
         "just now".to_string()
     } else {
-        format!("{}", format_age_duration(age,),)
+        format_age_duration(age)
     }
 }
 
@@ -1426,11 +1449,10 @@ fn render_entries_scrollbar(
      * Scale the viewport offset onto Ratatui's full position range so the thumb
      * can still reach both ends of the track.
      */
-    let scrollbar_position = if maximum_offset == 0 {
-        0
-    } else {
-        position.saturating_mul(content_length.saturating_sub(1)) / maximum_offset
-    };
+    let scrollbar_position = position
+        .saturating_mul(content_length.saturating_sub(1))
+        .checked_div(maximum_offset)
+        .unwrap_or(0);
 
     let mut scrollbar_state = ScrollbarState::new(content_length)
         .position(scrollbar_position)
@@ -2334,9 +2356,7 @@ fn render_file_info_status(
 ) {
     let color = if state.error.is_some() {
         COLOR_ERROR
-    } else if state.loading {
-        theme.ui.query
-    } else if state.info.notes.is_empty() {
+    } else if state.loading || state.info.notes.is_empty() {
         theme.ui.query
     } else {
         theme.ui.muted
@@ -3800,8 +3820,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
     let popup_width = area
         .width
         .saturating_sub(HORIZONTAL_MARGIN.saturating_mul(2))
-        .min(POPUP_MAX_WIDTH)
-        .max(34);
+        .clamp(34, POPUP_MAX_WIDTH);
 
     let popup_height = area
         .height
@@ -3829,8 +3848,8 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
         ("↑ / ↓", "Move the selection"),
         ("PgUp / PgDn", "Move one visible page"),
         ("Home / End", "Select first or last entry"),
-        ("← / Esc", "Enter the parent directory"),
-        ("→", "Open the selected directory"),
+        ("Ctrl+← / Esc", "Enter the parent directory"),
+        ("Ctrl+→", "Open the selected directory"),
         ("Enter", "Open or activate the selection"),
         ("Ctrl+T", "Enter Tree mode"),
         ("Alt+H", "Show or hide hidden entries"),
@@ -3866,8 +3885,8 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
         "Tree Mode",
         &[
             ("↑ / ↓", "Move through visible nodes"),
-            ("→", "Expand the selected directory"),
-            ("← / Esc", "Collapse or select the parent"),
+            ("Ctrl+→", "Expand the selected directory"),
+            ("Ctrl+← / Esc", "Collapse or select the parent"),
             ("Enter", "Make directory the new root"),
             ("Ctrl+T", "Return to List mode"),
         ],
@@ -3887,8 +3906,8 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             ("Backspace", "Delete the character before the caret"),
             ("Ctrl+H", "Delete the character before the caret"),
             ("Ctrl+U", "Clear the complete search"),
-            ("Ctrl+←", "Move left in the search field"),
-            ("Ctrl+→", "Move right in the search field"),
+            ("←", "Move left in the search field"),
+            ("→", "Move right in the search field"),
             ("Ctrl+Home", "Move to the beginning of the search field"),
             ("Ctrl+End", "Move to the end of the search field"),
             ("Ctrl+F", "Toggle Fuzzy search"),
@@ -4092,8 +4111,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
     let popup_width = area
         .width
         .saturating_sub(HORIZONTAL_MARGIN.saturating_mul(2))
-        .min(POPUP_MAX_WIDTH)
-        .max(34);
+        .clamp(34, POPUP_MAX_WIDTH);
 
     let popup_height = area
         .height
@@ -4251,6 +4269,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let any_columns_enabled =
         app.show_permissions || app.show_size || app.show_date || app.show_user;
 
+
+    let tree_state = if app.view_mode == ViewMode::Tree {
+        "Tree:on"
+    } else {
+        "Tree:off"
+    };
+
     #[allow(unused)]
     let columns_state = if !app.show_columns {
         "meta:off"
@@ -4260,18 +4285,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         "meta:empty"
     };
 
+    #[allow(unused)]
     let recursive_state = if app.recursive_mode {
         "recursive:on"
     } else {
         "recursive:off"
     };
 
-    let tree_state = if app.view_mode == ViewMode::Tree {
-        "Tree:on"
-    } else {
-        "Tree:off"
-    };
-
+    #[allow(unused)]
     let fuzzy_state = if app.search_mode == SearchMode::Fuzzy {
         "Fuzzy:on"
     } else {
@@ -4279,22 +4300,22 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     };
 
     #[allow(unused)]
-    let delete_hint = if app.enable_deletion {
-        " Del Delete "
+    let reverse_state = if app.sort_descending {
+        "reverse:on"
     } else {
-        ""
+        "reverse:off"
     };
 
     let footer = if !app.query.is_empty() {
         // Active Search Help Text
         format!(
-            " ↑/↓/←/→ Move  Enter Open  Alt+R {}  ^F {}  ^U Clear  ^O Sort Mode  F2 Info  ^Y Copy",
-            recursive_state, fuzzy_state,
+            " ←/→ Move Cursor  Enter Open  Alt+R {}  Alt+H {}  ^U Clear  ^O Sort Mode  F2 Info  ^Y Copy",
+            recursive_state, hidden_state,
         )
     } else if app.view_mode == ViewMode::Tree {
         // Tree View Help Text
         format!(
-            " ^? Help  ^! Legend  ↑/↓/←/→ Move  Enter Open  F4 SSH  ^T {}  Alt+H {}  Alt+M Meta  ^C Exit",
+            " ^? Help  ^! Legend  ↑/↓/^←/^→ Move  Enter Open  F4 SSH  ^T {}  Alt+H {}  Alt+M Meta  ^C Exit",
             tree_state, hidden_state,
         )
     } else if app.source_is_remote() {
@@ -4306,7 +4327,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         // Normal View Help Text
         format!(
-            " ^? Help  ^! Legend  ↑/↓/←/→ Move  Enter Open  F4 SSH  ^T {}  Alt+H {}  Alt+M Meta  ^C Exit",
+            " ^? Help  ^! Legend  ↑/↓/^←/^→ Move  Enter Open  F4 SSH  ^T {}  Alt+H {}  Alt+M Meta  ^C Exit",
             tree_state, hidden_state,
         )
     };

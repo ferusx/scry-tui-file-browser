@@ -323,7 +323,7 @@ thousands or millions of entries.
 Recursive Tree mode retains a bounded Exact result set for safe hierarchy
 construction, while ordinary Exact List mode remains unlimited.
 
-The query caret may be moved with `Ctrl+Left` and `Ctrl+Right`, sent to the
+The query caret may be moved with `Left` and `Right`, sent to the
 beginning or end with `Ctrl+Home` and `Ctrl+End`, and cleared together with the
 complete query using `Ctrl+U`.
 
@@ -532,10 +532,10 @@ Some important controls:
 | `↑` / `↓` | Move the selection |
 | `PgUp` / `PgDn` | Move one visible page |
 | `Home` / `End` | Select the first or last entry |
-| `←` / `Esc` | Move to the parent or collapse a Tree branch |
-| `→` | Enter a directory or expand a Tree branch |
+| `Ctrl+←` / `Esc` | Move to the parent or collapse a Tree branch |
+| `Ctrl+→` | Enter a directory or expand a Tree branch |
 | `Enter` | Open the selected file or establish a Tree directory as the new root |
-| `Ctrl+Left` / `Ctrl+Right` | Move the query caret |
+| `Left` / `Right` | Move the query caret |
 | `Ctrl+Home` / `Ctrl+End` | Move the caret to the beginning or end |
 | `Ctrl+T` | Switch between List and Tree views |
 | `Ctrl+F` | Switch between Exact and Fuzzy search |
@@ -625,7 +625,7 @@ necessary to record newly introduced language and file classifications.
 
 ## Opening files
 
-Directories are entered directly by pressing `Enter` or the `right` arrow key. Executable files are launched in a terminal,
+Directories are entered directly by pressing `Enter` or the `Ctrl+Right` arrow key. Executable files are launched in a terminal,
 while ordinary files are opened through the desktop's default application. Text
 files may fall back to a terminal editor when no suitable desktop opener is
 available.
