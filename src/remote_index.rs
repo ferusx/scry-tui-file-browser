@@ -15,11 +15,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Local};
-
 use serde::{Deserialize, Serialize};
 
-use crate::{classify::FileClass, scan::FileEntry};
+use crate::{
+    classify::FileClass,
+    entry::{EntryKind, format_permissions},
+    scan::FileEntry,
+};
 
 const REMOTE_INDEX_DIRECTORY_NAME: &str = "remote-indexes";
 
@@ -201,7 +203,7 @@ impl CachedRemoteEntry {
 
             is_symlink: entry.is_symlink,
 
-            permissions: entry.permissions.clone(),
+            permissions: format_permissions(entry.kind, entry.permissions_mode),
 
             modified_seconds,
 
@@ -217,6 +219,10 @@ impl CachedRemoteEntry {
 
     pub fn into_file_entry(self) -> io::Result<FileEntry> {
         let modified_time = cached_system_time(self.modified_seconds, self.modified_nanoseconds)?;
+
+        let kind = cached_entry_kind(&self.permissions, self.is_directory, self.is_symlink);
+
+        let permissions_mode = cached_permissions_mode(&self.permissions);
 
         let searchable_path: std::sync::Arc<str> =
             std::sync::Arc::from(self.relative_path.to_string_lossy().to_lowercase());
@@ -238,9 +244,9 @@ impl CachedRemoteEntry {
 
             is_symlink: self.is_symlink,
 
-            permissions: self.permissions,
+            kind,
 
-            modified: format_cached_modified_date(modified_time),
+            permissions_mode,
 
             modified_time,
 
@@ -251,6 +257,90 @@ impl CachedRemoteEntry {
             class: file_class_from_code(self.class_code)?,
         })
     }
+}
+
+fn cached_entry_kind(permissions: &str, is_directory: bool, is_symlink: bool) -> EntryKind {
+    match permissions.as_bytes().first().copied() {
+        /*
+         * Scry renders ordinary files with '.' in the Permissions column.
+         *
+         * Accept '-' as well for compatibility with indexes that may contain
+         * the conventional Unix regular-file marker.
+         */
+        Some(b'.') | Some(b'-') => EntryKind::File,
+
+        Some(b'd') => EntryKind::Directory,
+        Some(b'l') => EntryKind::Symlink,
+        Some(b's') => EntryKind::Socket,
+        Some(b'p') => EntryKind::Fifo,
+        Some(b'b') => EntryKind::BlockDevice,
+        Some(b'c') => EntryKind::CharDevice,
+
+        /*
+         * Older or malformed cache entries still retain the structural
+         * directory/symlink flags stored separately in the index.
+         */
+        _ if is_directory => EntryKind::Directory,
+        _ if is_symlink => EntryKind::Symlink,
+        _ => EntryKind::Unknown,
+    }
+}
+
+fn cached_permissions_mode(permissions: &str) -> u32 {
+    let bytes = permissions.as_bytes();
+
+    if bytes.len() < 10 {
+        return 0;
+    }
+
+    let mut mode = 0_u32;
+
+    if bytes[1] == b'r' {
+        mode |= 0o400;
+    }
+
+    if bytes[2] == b'w' {
+        mode |= 0o200;
+    }
+
+    match bytes[3] {
+        b'x' => mode |= 0o100,
+        b's' => mode |= 0o100 | 0o4000,
+        b'S' => mode |= 0o4000,
+        _ => {}
+    }
+
+    if bytes[4] == b'r' {
+        mode |= 0o040;
+    }
+
+    if bytes[5] == b'w' {
+        mode |= 0o020;
+    }
+
+    match bytes[6] {
+        b'x' => mode |= 0o010,
+        b's' => mode |= 0o010 | 0o2000,
+        b'S' => mode |= 0o2000,
+        _ => {}
+    }
+
+    if bytes[7] == b'r' {
+        mode |= 0o004;
+    }
+
+    if bytes[8] == b'w' {
+        mode |= 0o002;
+    }
+
+    match bytes[9] {
+        b'x' => mode |= 0o001,
+        b't' => mode |= 0o001 | 0o1000,
+        b'T' => mode |= 0o1000,
+        _ => {}
+    }
+
+    mode
 }
 
 #[derive(Debug)]
@@ -1202,17 +1292,6 @@ fn cached_system_time(
 
     Ok(Some(time))
 }
-
-fn format_cached_modified_date(modified_time: Option<SystemTime>) -> String {
-    let Some(modified_time) = modified_time else {
-        return "—".to_string();
-    };
-
-    let date: DateTime<Local> = modified_time.into();
-
-    date.format("%Y-%m-%d %H:%M").to_string()
-}
-
 fn file_class_from_code(code: u16) -> io::Result<FileClass> {
     let class = match code {
         0 => FileClass::Unknown,

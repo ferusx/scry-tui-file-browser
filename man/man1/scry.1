@@ -1,0 +1,2805 @@
+.\" SPDX-License-Identifier: BSD-3-Clause
+.TH SCRY 1 "July 2026" "Scry" "User Commands"
+
+.SH NAME
+scry \- fast terminal file browser, recursive finder, and SSH filesystem explorer
+
+.SH SYNOPSIS
+scry [OPTIONS] [PATH]
+.nf
+  -h, --help
+      --manual
+  -V, --version
+      --generate-config
+      --restore-session
+      --ssh TARGET
+      --preserve-hierarchy
+  -a, --all
+      --hidden-only
+  -r, --recursive
+      --fuzzy
+      --query TEXT
+      --files-only
+      --dirs-only
+  -T, --tree
+      --no-open
+      --exit-on-open
+  -p, --permissions
+  -s, --size
+  -d, --date
+  -u, --user
+.fi
+
+.SH DESCRIPTION
+\fBScry\fP is a fast, interactive terminal file browser, recursive finder, and SSH/SFTP filesystem explorer. It combines local and remote filesystem navigation with responsive \fBList\fP and \fBTree\fP views, live Exact and Fuzzy searching, structured query filters, detailed metadata inspection, and configurable terminal presentation.
+
+\fBScry\fP is designed primarily as a keyboard-driven application, while also providing extensive mouse support. Files and directories may be browsed, searched, filtered, sorted, inspected, and opened without leaving the terminal interface. Optional metadata columns, file icons, information panels, themes, and persistent session restoration allow the browser to be adapted to different workflows and terminal environments.
+
+Recursive searches run in the background and may operate across large directory trees. Queries can match filenames and complete relative paths, restrict results by file classification or extension, require or exclude terms, and use Boolean expressions with \fBAND\fP, \fBOR\fP, \fBNOT\fP, and parentheses. Exact and Fuzzy search modes may be combined with recursive scope and either \fBList\fP or \fBTree\fP presentation.
+
+Remote filesystems may be browsed through OpenSSH and SFTP. \fBScry\fP supports saved connection profiles, persistent remote indexes, private local caching for opened files, transfer progress reporting, and SSH-only multi-file batch downloads. Remote directory hierarchies may either be flattened into the download destination or preserved when requested.
+
+File opening, local deletion, session restoration, interface layout, startup modes, SSH behavior, and visual presentation may be controlled through command-line options and the \fBscry.toml\fP configuration file. Local deletion is optional and disabled by default.
+
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print concise command-line help and exit.
+
+.TP
+.BR \-\-manual
+Print the complete explanatory manual used by the in-app Help window and exit.
+
+.TP
+.BR \-v, " " \-\-version
+Print the current version of \fBScry\fP and exit.
+
+.TP
+.BR \-\-generate\-config
+Generate \fBscry.toml.generated\fP and exit.
+
+The generated file must be reviewed and manually renamed to \fBscry.toml\fP before it becomes the active configuration. It is written to:
+.nf
+
+~/.config/scry/scry.toml.generated
+.fi
+
+.TP
+.BR \-\-restore\-session
+Restore the most recently saved browser session.
+
+When session restoration is enabled, \fBScry\fP saves its current browser state during an orderly exit and restores it on a later destination-less launch. Restoration may be enabled through this option or by setting restore_settion = true in \fBscry.toml\fP. 
+
+.TP
+.BI "\-\-ssh " TARGET
+Browse a remote filesystem through SSH/SFTP directly on startup.
+
+\fBScry\fP connects immediately and opens the remote account's home directory unless a remote \fBPATH\fP is supplied.  Disconnect through the in-app SSH connection window opened with F4.
+
+.TP
+.BR \-\-preserve\-hierarchy
+Preserve remote paths during marked batch downloads.
+
+This option overrides the corresponding \fBscry.toml\fP setting for the current launch. Downloaded files retain paths relative to their remote locations instead of being gathered directly beneath the batch-download directory.
+
+.TP
+.BR \-a, " " \-\-all
+Show hidden files and directories at startup.
+
+.TP
+.BR \-\-hidden\-only
+Start with only hidden entries.
+
+Restricts the visible results to hidden files, hidden directories, and all descendants beneath hidden directories.
+
+.TP
+.BR \-r, " " \-\-recursive
+Start with a recursive listing.
+
+Entries beneath the selected root are listed recursively, including descendants in nested directories. Enter a query in the search field fo filter the recursive result set.
+
+.TP
+.BR \-\-fuzzy
+Start in Fuzzy search mode.
+
+Fuzzy search mode will let you input approximate queries, such as, for example, \(lqhlep\(rq, to search for the word \(lqhelp\(rq. This is useful when the exact spelling of a target file or directory is unknown.
+
+.TP
+.BI "\-\-query " TEXT
+Show TEXT in the search field at startup.
+
+This allows a query to be supplied directly on the command line so matching results appear immediately after \fBScry\fP starts. Queries containing whitespace must me quoted by the shell.
+
+.TP
+.BR \-\-files\-only
+Show files and symlinks only at startup.
+
+Start \fBScry\fP with directories excluded from the visible result set. Files and symbolic links remain available until the filter is changed in-app or \fBScry\fP is launched without this option.
+
+.TP
+.BR \-\-dirs\-only
+Show directories only at startup.
+
+Start \fBScry\fP with non-directory entries excluded from the visible result set. This option cannot be combined with \fB\-\-files\-only\fP.
+
+.TP
+.BR \-T, " " \-\-tree
+Start in \fBTree\fP mode.
+
+\fBScry's Tree\fP mode offers an expandable and collapsible branched view of the file system. It provides a hierarchical overview in which directory branches may be expanded and collapsed. Directories open as branches revealing progressively deeper levels of the filesystem hierarchy. \fBTree\fP mode may also be restored through saved session state when session restoration is enabled by \fBscry.toml\fP or the command-line option.
+
+.TP
+.BR \-\-no\-open
+Do not open selected files.
+
+Directory navigation remains available, but activating a regular file will not launch an external opener.
+
+.TP
+.BR \-\-exit\-on\-open
+Exit after successfully opening a file.
+
+This option makes \fBScry\fP behave like a conventional chooser: after a regular file is opened successfully, \fBScry\fP exits immediately. Entering directories does not close the application, and a failed opener leaves \fBScry\fP running so the error remains visible.
+
+.TP
+.BR \-p, " "  \-\-permissions
+Show permissions column at startup.
+
+.TP
+.BR \-s, " " \-\-size
+Show size column at startup.
+
+.TP
+.BR \-d, " " \-\-date
+Show date column at startup.
+
+.TP
+.BR \-u, " " \-\-user
+Show user column at startup.
+
+
+.\" Interactive Controls Section
+
+.SH INTERACTIVE CONTROLS
+.TP
+\fBScry\fP is designed for keyboard-first operation while retaining extensive mouse support. Most controls act immediately, and the footer displays contextual shortcuts for the current mode or open window.
+
+.RE
+.SS NAVIGATION
+.TP
+.BR Enter
+.RS
+Open the selected entry in \fBList\fP or \fBTree\fP mode, both locally and remotely. A selected directory is entered, while a selected file is opened. When a directory is selected in \fBTree\fP mode, establish that directory as the new browsing root. During an SSH session, Enter still activates a single, selected file, or enters the selected directory. Multiple files cannot be opened simultaneously.
+.RE
+
+.BR Up/Down
+.RS
+Move the selection by one entry.
+.RE
+
+.BR "Page Up/Page Down"
+.RS
+Move the selection by one visible page.
+.RE
+
+.BR Home/End
+.RS
+Select the first or last visible entry.
+.RE
+
+.BR Left/Escape
+.RS
+Move to the parent directory. In \fBTree\fP mode, collapse the selected branch or move the selection to its parent branch.
+.RE
+
+.BR Right
+.RS
+Enter the selected directory. In \fBTree\fP mode, expand the selected branch.
+.RE
+
+.BR Ctrl+T
+.RS
+Switch between \fBList\fP and \fBTree\fP views.
+.RE
+
+.BR Ctrl+C
+.RS
+Exit \fBScry\fP.
+.RE
+
+.SS "SEARCH AND QUERY EDITING"
+.TP
+.BR "Typing Printable Characters"
+.RS
+Insert text into the Search field and update the current result set.
+.RE
+
+.BR Backspace
+.RS
+Remove the character before the query caret.
+.RE
+
+.BR Ctrl+Left/Ctrl+Right
+.RS
+Move the query caret by one character.
+.RE
+
+.BR Ctrl+Home/Ctrl+End
+.RS
+Move the query caret to the beginning or end of the Search field.
+.RE
+
+.BR Ctrl+U
+.RS
+Clear the complete query.
+.RE
+
+.BR Ctrl+F
+.RS
+Switch between Exact and Fuzzy search modes.
+.RE
+
+.BR Ctrl+O
+.RS
+Cycle the active sort mode through Name, Size, Date, and Type.
+.RE
+
+.BR Alt+R
+.RS
+Toggle recursive searching beneath the current root.
+.RE
+
+.BR Ctrl+R
+.RS
+Reverse the current sort direction.
+.RE
+
+.RS
+Search queries are evaluated as they are typed. Complete details of the compact and Boolean query languages are provided in the \fBSEARCHING\fP and \fBQUERY LANGUAGE\fP sections.
+.RE
+
+.RE
+.SS "INTERFACE AND DISPLAY"
+.TP
+
+.BR Enter
+.RS
+Open the selected entry in \fBList\fP or \fBTree\fP mode, both locally and remotely. A selected directory is entered, while a selected file is opened. When a directory is selected in \fBTree\fP mode, establish that directory as the new browsing root. During an SSH session, Enter still activates a single, selected file, or enters the selected directory. Multiple files cannot be opened simultaneously.
+.RE
+
+.BR Shift+Left/Shift+Right
+.RS
+Scroll long filesystem rows horizontally.
+.RE
+
+.BR Ctrl+D
+.RS
+Show or hide the Details panel.
+.RE
+
+.BR Ctrl+S
+.RS
+Show or hide the Selection Panel.
+.RE
+
+.BR Alt+M
+.RS
+Show or hide the Metadata panel.
+.RE
+
+.BR Alt+H
+.RS
+Show or hide hidden files and directories.
+.RE
+
+.BR F3
+.RS
+Show or hide file and directory icons.
+.RE
+
+.BR F7
+.RS
+Show or hide the Permissions column.
+.RE
+
+.BR F8
+.RS
+Show or hide the Size column.
+.RE
+
+.BR F9
+.RS
+Show or hide the Date column.
+.RE
+
+.BR F10
+.RS
+Show or hide the User column.
+.RE
+
+.SS "INFORMATION- AND REFERENCE WINDOWS"
+.TP
+.BR F1
+.RS
+Open or close the complete internal Help window.
+.RE
+
+.BR F2/Alt+I
+.RS
+Open or close the File Information window for the selected entry.
+.RE
+
+.BR ?
+.RS
+Open or close the Shortcut Legend, including the complete query modifier and type-alias reference.
+.RE
+
+.BR Alt+A
+.RS
+Open or close the About window.
+.RE
+
+.BR Escape
+.RS
+Close the active Help, Shortcut Legend, About, File Information, connection, transfer, or confirmation window where applicable.
+.RE
+
+.SS "FILE AND PATH ACTIONS"
+.TP
+.BR Ctrl+Y
+.RS
+Copy the selected entry's complete path to the clipboard.
+.RE
+
+.SS "SSH AND REMOTE OPERATIONS"
+.TP
+.BR F4
+.RS
+Open or close the SSH Connection window.
+.RE
+
+.BR F5
+.RS
+Open the Remote Index Builder while browsing through SSH.
+.RE
+
+.BR Ctrl+Space
+.RS
+Mark or unmark the selected remote file for a batch download.
+.RE
+
+.BR Alt+U
+.RS
+Clear all marked remote files.
+.RE
+
+.BR Alt+D
+.RS
+Download multiple selected remote files.
+.RE
+
+.RS
+File marking and batch downloading are available only during an SSH session. Directories cannot currently be marked for download.
+.RE
+
+.RE
+.SS "LOCAL FILE OPERATIONS"
+.TP
+.BR Delete
+.RS
+Open the deletion confirmation window for the selected local entry when deletion is enabled.
+.RE
+
+.BR Ctrl+Z
+.RS
+Restore the most recently staged local deletion during the current session.
+.RE
+
+.RS
+Local deletion is disabled by default. Deletion controls are unavailable while browsing through SSH.
+.RE
+
+.RE
+.SS "MOUSE CONTROLS"
+.TP
+.BR "Mouse wheel"
+.RS
+Scroll through the current entry list or an open scrollable window.
+.RE
+
+.BR "Left Click"
+.RS
+Select an entry or activate a clickable interface control.
+.RE
+
+.BR "Double-click"
+.RS
+Activate the selected entry.
+.RE
+
+.BR "Middle-Click"
+.RS
+Paste clipboard text into the Search Field.
+.RE
+
+.BR "Scrollbar drag"
+.RS
+Move vertically or horizontally through long listings and scrollable windows.
+.RE
+
+.RS
+Clickable controls are available in the main interface and in applicable dialogs, including the parent and home controls, connection actions, transfer controls, and confirmation buttons.
+.RE
+
+
+.SH SEARCHING
+.TP
+\fBScry\fP filters entries live as text is entered into the Search field. Searches may match filenames or complete relative paths, and the visible result set is updated without requiring confirmation.
+
+.TP
+Searching operates through two matching styles, Exact and Fuzzy, which may each be combined with either the current directory or recursive scope. Together these form four principal search modes: Exact, Fuzzy, Recursive, and Fuzzy+Recursive.
+
+.\" Subsection 'Exact Search'
+.SS "EXACT SEARCH"
+.TP
+Exact search performs case-insensitive literal matching against filenames and relative paths. A result is shown when its searchable path contains the supplied text.
+
+.TP
+Multiple ordinary unsigned words are treated as one continuous phrase. For example:
+
+.nf
+\(lqsource index\(rq
+.fi
+
+.TP
+matches paths containing the phrase \(lqsource index\(rq; it does not independently require the separate words \(lqsource\(rq and \(lqindex\(rq.
+
+.TP
+Exact \fBList\fP mode retains every matching result. Recursive Exact searches run in the background and publish results progressively so that large directory trees do not block the interface.
+
+.\" Subsection 'Fuzzy Search'
+.SS "FUZZY SEARCH"
+
+.TP
+Fuzzy search ranks approximate matches rather than requiring one literal substring. It may recognize prefixes, partial words, compact abbreviations, omitted characters, small typing errors, and adjacent transpositions.
+
+.TP
+For example:
+
+.nf
+
+\(lqhlp\(rq
+\(lqhlep\(rq
+.fi
+
+.TP
+may both locate a file or directory named \(lqhelp\(rq.
+
+.TP
+Fuzzy results are ordered by relevance, with directories retained above ordinary files. To remain responsive with very large indexes, \fBScry\fP keeps the strongest configured number of ranked fuzzy matches rather than displaying every technically possible candidate.
+
+.TP
+Fuzzy mode changes only the matching and ranking of ordinary text. Structural query modifiers such as \fBtype:\fP, \fBext:\fP, required terms, excluded terms, and Boolean expressions continue to be evaluated normally.
+
+.\" Subsection 'Recursive Search'
+.SS "RECURSIVE SEARCH"
+
+.TP
+Recursive search expands the search scope from the current directory to all descendants beneath the selected root.
+
+.TP
+Local recursive searches are scanned in the background and publish results as they are discovered. Symbolic links may appear in results but are not followed as directories, preventing recursive symlink loops.
+
+.TP
+When the selected root is /, \fBScry\fP avoids descending into selected virtual or transient system directories such as \fB/proc\fP, \fB/sys\fP, \fB/dev\fP, and \fB/run\fP.
+
+.TP
+While browsing through SSH, recursive searching may use a persistent remote index. The index allows large remote filesystems to be searched without rescanning the complete remote hierarchy for every query.
+
+.\" Subsection 'Fuzzy and Recursive Search'
+.SS "FUZZY AND RECURSIVE SEARCH"
+
+.TP
+Fuzzy+Recursive mode combines approximate matching with the complete descendant scope beneath the current root.
+
+.TP
+This mode is useful when the location, spelling, or complete filename is not known. Results are selected from the active recursive index and ranked using the same policy as ordinary Fuzzy search.
+
+.\" Subsection 'List and Tree Results'
+.SS "LIST AND TREE RESULTS"
+
+.TP
+Searches may be viewed in either \fBList\fP or \fBTree\fP mode.
+
+.TP
+\fBList\fP mode presents matching entries directly. Exact Recursive \fBList\fP mode remains unlimited, while Fuzzy \fBList\fP mode retains the strongest ranked matches.
+
+.TP
+\fBTree\fP mode adds the parents required to show matching entries in their filesystem context. Branches may be expanded or collapsed while a search is active.
+
+.TP
+Because constructing an enormous result \fBTree\fP would be slow and difficult to navigate, Exact \fBTree\fP searches keep only a configurable number of direct matches before adding the parent directories needed to connect those matches to the current \fBTree\fP root. The setting is \fBexact_tree_match_limit\fP, with a valid range of 500 through 15000 and a default of 5000. \fBScry\fP indicates when this direct-match limit has been reached.
+
+.TP
+The configured value limits direct matches, not the final number of displayed \fBTree\fP rows. \fBTree\fP mode also adds the parent directories needed to show each match in its filesystem location, so the displayed node count may be higher than the configured limit. The additional number varies depending on where the matching entries are located and how many parent directories they share.
+
+.TP
+\fBfuzzy_result_limit\fP controls the number of direct ranked matches retained by Fuzzy searching, while \fBexact_tree_match_limit\fP controls the number of direct matches retained when constructing an Exact \fBTree\fP. For example, a Fuzzy limit of 2000 may produce a \fBTree\fP containing more than 2000 displayed nodes after contextual parent directories have been added.
+
+.TP
+In Fuzzy+Recursive \fBTree\fP mode, a query made entirely from structural selectors, such as \fBtype:code\fP or \fBext:rs\fP, contains no filename or path text that can be ranked approximately. \fBScry\fP therefore uses Exact Tree matching semantics and \fBexact_tree_match_limit\fP for that query so switching between Exact and Fuzzy does not alter the represented hierarchy. Once textual search input is added, as in \fBtype:code test\fP, normal Fuzzy ranking resumes and \fBfuzzy_result_limit\fP becomes the direct-match limit.
+
+
+.\" Subsection 'Search Scope and Hidden Entries'
+.SS "SEARCH SCOPE AND HIDDEN ENTRIES"
+
+.TP
+A recursive query is restricted to descendants of the active search root, even when the underlying remote index contains entries from a larger portion of the filesystem.
+
+.TP
+Hidden files and directories are excluded unless hidden-entry display is enabled. When hidden entries are disabled, \fBScry\fP excludes not only dot-prefixed entries themselves but also descendants located beneath hidden directories.
+
+.TP
+For example, beneath a home directory:
+
+.nf
+\(lq.cache\(rq
+\(lq.cache/browser\(rq
+\(lq.cache/browser/profile\(rq
+.fi
+
+.TP
+are all hidden when hidden-entry display is disabled.
+
+.\" Subsection 'Query Editing'
+.SS "QUERY EDITING"
+
+.TP
+The query caret may be moved with \fBCtrl+Left\fP and \fBCtrl+Right\fP.
+
+.TP
+\fBCtrl+Home\fP and \fBCtrl+End\fP move the caret to the beginning or end of the Search field. \fBBackspace\fP removes the character before the caret, and \fBCtrl+U\fP clears the complete query.
+
+.TP
+Searches are evaluated as the query changes. No confirmation key is required.
+
+.\" Subsection 'Structured Queries'
+.SS "STRUCTURED QUERIES"
+
+.TP
+Ordinary search text may be combined with structural query modifiers and Boolean expressions.
+
+.TP
+Supported forms include:
+
+.nf
+type:TYPE
+ext:EXT
++TERM
+-TERM
+AND
+OR
+NOT
+( ... )
+type:sensitive
+.fi
+
+.TP
+The complete syntax, matching rules, type values, aliases, precedence, and examples are documented in the following \fBQUERY LANGUAGE\fP section.
+
+.\" Section 'Query Language'
+.SH "QUERY LANGUAGE"
+
+.TP
+\fBScry\fP provides two complementary query forms: a compact syntax for direct filtering and a Boolean syntax for more expressive combinations. Both forms operate in Exact, Fuzzy, Recursive, and Fuzzy+Recursive search modes.
+
+.TP
+Queries are case-insensitive by default. Ordinary operands may match filenames or complete relative paths, while structural modifiers restrict results by classification or extension.
+
+.TP
+The in-app Shortcut Legend, opened with \fB?\fP, contains the complete parser-backed query reference and every accepted type alias.
+
+.\" Subsection 'Ordinary Text'
+.SS "ORDINARY TEXT"
+
+.TP
+Ordinary text searches filenames and relative paths.
+
+.TP
+Examples:
+
+.nf
+wallpaper
+source index
+/etc
+.fi
+
+.TP
+In compact syntax, multiple ordinary unsigned words are treated as one continuous phrase. Therefore:
+
+.nf
+\(lqsource index\(rq
+.fi
+
+.TP
+searches for the phrase \(lqsource index\(rq, rather than independently requiring both words.
+
+.TP
+Ordinary text is case-insensitive unless case-sensitive matching has been enabled with \fBtype:sensitive\fP.
+
+.\" Subsection 'Type Modifiers'
+.SS "TYPE MODIFIERS"
+
+.TP
+Use \fBtype:\fP to restrict results to one filesystem kind, programming language, or file classification.
+
+.TP
+Syntax:
+
+.RS
+type:TYPE
+.RE
+
+.TP
+Examples:
+
+.nf
+\(bu type:directory
+\(bu type:source
+\(bu type:python
+\(bu type:asm
+\(bu type:image
+.fi
+
+.TP
+A type modifier may be combined with ordinary text and other modifiers:
+
+.nf
+\(lqtype:source index\(rq
+\(lqtype:python parser\(rq
+\(lqtype:image wallpaper\(rq
+\(lqtype:source ext:rs session\(rq
+.fi
+
+.TP
+Only one unsigned type: restriction is used as the principal compact type filter. Additional accepted classifications may be expressed with positive terms or through a Boolean expression.
+
+.TP
+Aliases are accepted. For example:
+
+.nf
+\(lqtype:dir\(rq
+\(lqtype:code\(rq
+\(lqtype:rs\(rq
+\(lqtype:py\(rq
+\(lqtype:cpp\(rq
+\(lqtype:img\(rq
+.fi
+
+.\" Subsection 'Extension Modifiers'
+.SS "EXTENSION MODIFIERS"
+
+.TP
+Use \fBext:\fP when the actual file extension must match.
+
+.TP
+Syntax:
+
+.RS
+ext:EXT
+.RE
+
+.TP
+Examples:
+
+.nf
+\(lqext:jpg\(rq
+\(lqext:.rs\(rq
+\(lqtype:image ext:tif\(rq
+.fi
+
+.TP
+A leading dot is optional, so these are equivalent:
+
+.nf
+\(lqext:rs\(rq
+\(lqext:.rs\(rq
+.fi
+
+.TP
+Extension matching is exact and case-insensitive. An extension modifier tests the file extension itself rather than matching arbitrary occurrences elsewhere in the filename or path.
+
+.\" Subsection 'Required Terms'
+.SS "REQUIRED TERMS"
+
+.TP
+Prefix a term with + to require it.
+
+.TP
+Syntax:
+
+.RS
++TERM
+.RE
+
+.TP
+Examples:
+
+.nf
+\(lq+session\(rq
+\(lq+python\(rq
+\(lq+rs\(rq
+\(lq+.jpg\(rq
+.fi
+
+.TP
+
+Required terms may represent a known classification, a known extension, or ordinary path text.
+
+.TP
+Terms are interpreted in this order:
+
+.nf
+\(bu known type or programming language
+\(bu known file extension
+\(bu ordinary filename or path text
+.fi
+
+.TP
+Positive ordinary text terms are cumulative. Every positive text term must match.
+
+.TP
+For example:
+
+.RS
+\(lq+session +index\)rq
+.RE
+
+.TP
+requires both session and index.
+
+.TP
+Positive classifications and extensions form an accepted-type group. An entry may match any member of that group.
+
+.TP
+For example:
+
+.RS
+\(lq+python +lua\(rq
+.RE
+
+.TP
+accepts Python or Lua entries rather than requiring one file to possess both classifications.
+
+.\" Subsection 'Excluded Terms'
+.SS "EXCLUDED TERMS"
+
+.TP
+Prefix a term with \fB-\fP to exclude it.
+
+.TP
+Syntax:
+
+.RS
+-TERM
+.RE
+
+.TP
+Examples:
+
+.nf
+\(lq-java\(rq
+\(lq-png\(rq
+\(lq-target\(rq
+\(lq-.cache\(rq
+.fi
+
+.TP
+Any matching negative term rejects the entry.
+
+.TP
+Examples:
+
+.nf
+\(lqrs -test\(rq
+\(lq+session -python\(rq
+\(lqtype:source -target parser\(rq
+\(lqext:jpg -.cache holiday\(rq
+.fi
+
+.TP
+The first query searches for \(lqrs\(rq while excluding paths matching \(lqtest\(rq. The final query requires the JPG extension, excludes paths beneath or containing \(lq.cache\(rq, and also searches for \(lqholiday\(rq.
+
+.\" Seubsection 'Compact Query Rules'
+.SS "COMPACT QUERY RULES"
+
+.TP
+Compact syntax is used whenever the query contains no Boolean operator or parenthesis.
+
+.TP
+The available compact forms are:
+
+.nf
+text
+type:TYPE
+ext:EXT
++TERM
+-TERM
+type:sensitive
+.fi
+
+.TP
+These forms may be combined in one query:
+
+.RS
+\(lqtype:source ext:rs +session -test index\(rq
+.RE
+
+.TP
+The query above restricts results to Rust source entries, requires \(lqsession\(rq, excludes \(lqtest\(rq, and applies \(lqindex\(rq as the ordinary search phrase.
+
+.TP
+Structural modifiers do not become literal search text. For example:
+
+.RS
+\(lqtype:source\(rq
+.RE
+
+.TP
+matches entries classified as source code; it does not search paths for the characters \fBtype:source\fP.
+
+.TP
+Similarly:
+
+.RS
+\(lqext:rs\(rq
+.RE
+
+.TP
+matches the extension .rs; it does not require the path to contain the text \(lqext:rs\(rq.
+
+.\" Subsection 'Boolean Expressions'
+.SS "BOOLEAN EXPRESSIONS"
+
+.TP
+Boolean syntax is selected whenever a query contains \fBAND\fP, \fBOR\fP, \fBNOT\fP, or parentheses.
+
+.TP
+Operators are case-insensitive, although uppercase spelling is recommended for readability.
+
+.TP
+Examples:
+
+.nf
+\(lqrust AND test\(rq
+\(lqrust OR python\(rq
+\(lqtype:source AND NOT target\(rq
+\(lq(rust OR python) AND test\(rq
+.fi
+
+.TP
+\fBAND\fP requires both operands to match.
+
+.RS
+\(lqsession AND rs\(rq
+.RE
+
+.TP
+\fBOR\fP accepts either operand.
+
+.RS
+\(lqrust OR python\(rq
+.RE
+
+.TP
+\fBNOT\fP negates the following operand or grouped expression.
+
+.nf
+\(lqNOT target\(rq
+\(lqtype:source AND NOT test\(rq
+\(lqNOT (archive OR backup)\(rq
+.fi
+
+.TP
+Parentheses group expressions and override ordinary precedence.
+
+.RS
+\(lq(rust OR python) AND test\(rq
+.RE
+
+.\" Subsection 'Boolean Precedence'
+.SS "BOOLEAN PRECEDENCE"
+
+.TP
+Boolean operators are evaluated in this order:
+
+.nf
+1. \fBNOT\fP
+2. \fBAND\fP
+3. \fBOR\fP
+.fi
+
+.TP
+Therefor:
+
+.RS
+\(lqrust OR python AND test\(rq
+.RE
+
+.TP
+is interpreted as:
+
+.RS
+\(lqrust OR (python AND test)\(rq
+.RE
+
+.TP
+To require either language together with \(lqtest\(rq, use:
+
+.RS
+\(lq(rust OR python) AND test\(rq
+.RE
+
+.TP
+Nested parentheses are supported:
+
+.RS
+\(lq(type:rust OR type:python) AND (session OR index) AND NOT test\(rq
+.RE
+
+.\" Subsection 'Compact Operands Inside Boolean Expressions'
+.SS "COMPLEX OPERANDS INSIDE BOOLEAN EXPRESSIONS"
+
+.TP
+Structural and signed compact operands remain available inside Boolean expressions.
+
+.TP
+Examples:
+
+.nf
+\(lqtype:source AND ext:rs\(rq
+\(lqtype:source AND (rust OR cpp)\(rq
+\(lqext:jpg AND NOT .cache\(rq
+\(lq+rs OR +cpp\(rq
+\(lqsession AND -test\(rq
+.fi
+
+.TP
+A leading \fB+\fP remains a positive operand.
+
+.TP
+A leading \fB-\fP acts as a negated operand.
+
+.TP
+Thus:
+
+.RS
+\(lqsession AND -test\(rq
+.RE
+
+.TP
+has the same logical intention as:
+
+.RS
+session AND NOT test
+.RE
+
+.TP
+Explicit selectors retain their structural meaning:
+
+.RS
+\(lqtype:source AND ext:rs\(rq
+.RE
+
+.TP
+requires both a Source classification and the .rs extension.
+
+.\" Subsection 'Case-Sensitive Operands'
+.SS "CASE-SENSITIVE OPERANDS"
+
+.TP
+Use \fBtype:sensitive\fP to make later textual operands case-sensitive.
+
+.TP
+Examples:
+
+.nf
+\(lqtype:sensitive README\(rq
+\(lqtype:sensitive Makefile\(rq
+\(lqrust OR type:sensitive README\(rq
+.fi
+
+.TP
+The directive applies from its position onward. Text appearing before it remains case-insensitive.
+
+.TP
+For example:
+
+.RS
+\(lqreadme OR type:sensitive README\(rq
+.RE
+
+.TP
+uses case-insensitive matching for \(lqreadme\(rq and exact-case matching for \(lqREADME\(rq.
+
+.TP
+Once enabled within a query, case sensitivity remains active for later textual operands:
+
+.RS
+\(lqtype:sensitive README AND Cargo\(rq
+.RE
+
+.TP
+Both \(lqREADME\(rq and \(lqCargo\(rq retain their exact capitalization.
+
+.TP
+Classification and extension selectors remain normalized. Case sensitivity affects textual operands, not the interpretation of:
+
+.nf
+\(lqtype:source\(rq
+\(lqext:rs\(rq
+.fi
+
+.\" Subsection 'Live Boolean Editing'
+.SS "LIVE BOOLEAN EDITING"
+
+.TP
+Boolean queries are evaluated live as they are typed.
+
+.TP
+Temporarily incomplete expressions are normal:
+
+.nf
+rs OR
+NOT
+(
+type:source AND
+.fi
+
+.TP
+\fBScry\fP treats such input as incomplete rather than interpreting the operator words as ordinary filename text. Once the expression becomes syntactically complete, matching resumes automatically.
+
+.TP
+No confirmation key is required.
+
+.\" Subsection 'Query Highlighting'
+.SS "QUERY HIGHLIGHTING"
+
+.TP
+Positive textual operands are highlighted in matching paths.
+
+.TP
+Examples:
+
+.nf
+\(lqsession AND map\(rq
+\(lq+session +index\(rq
+\(lqtype:sensitive README\(rq
+.fi
+
+.TP
+Structural selectors such as:
+
+.nf
+\(lqtype:source\(rq
+\(lqext:rs\(rq
+.fi
+
+.TP
+are not highlighted as literal path text.
+
+.TP
+Negative operands are also not highlighted:
+
+.nf
+\(lqsession AND NOT map\(rq
+\(lqsession -target\(rq
+.fi
+
+.TP
+In these examples, positive matching text may be highlighted, while map or target remains unhighlighted because it represents an exclusion.
+
+.TP
+Overlapping positive matches are merged into a single clean highlighted range.
+
+.\" Subsection 'Type Values and Aliases'
+.SS "TYPE VALUES AND ALIASES"
+
+.TP
+The canonical type name appears first. Accepted aliases follow in parentheses.
+
+.RE
+.BR "Filesystem and general classifications"
+
+.nf
+\(bu file
+\(bu directory (dir)
+\(bu symlink (link)
+\(bu executable (exec)
+\(bu source (code)
+\(bu shell (script, sh)
+\(bu text
+\(bu binary (bin)
+\(bu unknown
+.fi
+
+.RE
+.BR "Programming languages"
+
+.nf
+\(bu rust (rs)
+\(bu python (py)
+\(bu c
+\(bu cpp (c++, cplusplus)
+\(bu java
+\(bu kotlin (kt)
+\(bu javascript (js)
+\(bu typescript (ts)
+\(bu assembly (assembler, asm)
+\(bu lua
+\(bu ruby (rb)
+\(bu perl (pl)
+\(bu php
+\(bu go (golang)
+\(bu swift
+\(bu dart
+\(bu csharp (c#, cs)
+\(bu scala
+\(bu groovy
+\(bu r (rscript)
+\(bu awk
+\(bu elixir (ex)
+\(bu erlang (erl)
+\(bu fsharp (f#, fs)
+\(bu visualbasic (visual-basic, vb)
+\(bu clojure (clj)
+\(bu zig
+\(bu nim
+\(bu crystal (cr)
+\(bu haskell (hs)
+\(bu ocaml (ml)
+\(bu pascal (pas)
+\(bu solidity (sol)
+\(bu vala
+.fi
+
+.RE
+.BR "Development and structured files"
+
+.nf
+\(bu web
+\(bu build
+\(bu config (configuration)
+\(bu data (structured-data, structureddata)
+\(bu log (logs)
+.fi
+
+.RE
+.BR "Archives, packages, and documents"
+
+.nf
+\(bu archive
+\(bu package (pkg)
+\(bu document (doc)
+\(bu spreadsheet (sheet)
+\(bu presentation (slides)
+.fi
+
+.RE
+.BR "Media and resources"
+
+.nf
+\(bu image (images, img)
+\(bu vector (vector-image, vectorimage)
+\(bu audio
+\(bu video
+\(bu font (fonts)
+.fi
+
+.RE
+.BR "System and specialized files"
+
+.nf
+\(bu database (db)
+\(bu torrent
+\(bu desktop (desktop-entry, desktopentry)
+\(bu backup
+\(bu certificate (cert)
+\(bu disk-image (diskimage)
+\(bu plugin
+.fi
+
+.RE
+.TP
+The canonical names are preferred in documentation, but aliases have identical matching behavior. The same parser-backed list is displayed inside \fBScry’s\fP Shortcut Legend, so the in-app reference and accepted query syntax remain synchronized.
+
+.\" Subsection 'Examples'
+.SS "EXAMPLES"
+
+.TP
+Find all source-code entries:
+
+.RS
+\(lqtype:source\(rq
+.RE
+
+.TP
+Find Rust files whose paths contain session:
+
+.RS
+\(lqtype:rust session\(rq
+.RE
+
+.TP
+Require the .rs extension and exclude test paths:
+
+.RS
+\(lqext:rs -test\(rq
+.RE
+
+.TP
+Find Python or Lua entries:
+
+.RS
+\(lq+python +lua\(rq
+.RE
+
+.TP
+Find paths containing both \(lqsession\(rq and \(lqindex\(rq:
+
+.RS
+\(lq+session +index\(rq
+.RE
+
+.TP
+Find source entries containing \(lqparser\(rq but not \(lqtarget\(rq:
+
+.RS
+\(lqtype:source parser -target\(rq
+.RE
+
+.TP
+Find Rust or C++ entries containing \(lqindex\(rq:
+
+.RS
+\(lq(type:rust OR type:cpp) AND index\(rq
+.RE
+
+.TP
+Find either \(lqsession\(rq or \(lqmap\(rq, while requiring \(lqrs\(rq:
+
+.RS
+\(lq(session OR map) AND rs\(rq
+.RE
+
+.TP
+Find the exact-case text \(lqREADME\(rq:
+
+.RS
+\(lqtype:sensitive README\(rq
+.RE
+
+.TP
+Find images outside hidden cache paths:
+
+.RS
+\(lqtype:image AND NOT .cache\(rq
+.RE
+
+.TP
+This section follows the current parser’s two-language design, operator precedence, signed-term rules, case-sensitive directive, structural selectors, and complete canonical type/alias table
+
+.\" Main section  SSH
+.SH "SSH"
+
+.TP
+\fBScry\fP can browse remote filesystems through OpenSSH and SFTP. Remote directories are presented through the same \fBList\fP and \fBTree\fP interfaces used for local browsing, with the same searching, sorting, filtering, metadata columns, query language, and navigation controls.
+
+.TP
+Connections may be started directly from the command line or opened interactively from within \fBScry\fP. Hostnames, OpenSSH aliases, usernames, custom ports, identity files, starting directories, and reusable connection profiles are supported.
+
+.\" Subsection 'Command-Line Connections'
+.SS "COMMAND-LINE CONNECTIONS"
+
+.TP
+Use \fB\-\-ssh\fP to connect directly when \fBScry\fP starts.
+
+.TP
+Syntax:
+
+.RS
+\fBscry --ssh TARGET [PATH]\fP
+.RE
+
+.TP
+\fBTARGET\fP may be written in the following forms:
+
+.nf
+HOST
+USER@HOST
+USER@HOST:PORT
+.fi
+
+.TP
+Examples:
+
+.nf
+scry --ssh nosferatu
+scry --ssh ferusx@nosferatu
+scry --ssh ferusx@nosferatu:2222
+scry --ssh ferusx@nosferatu /var/log
+.fi
+
+.TP
+When no remote \fBPATH\fP is supplied, \fBScry\fP opens the remote account's home directory. A \fBPATH\fP of . also selects the remote home directory. Any other supplied \fBPATH\fP is used as the remote starting location.
+
+.TP
+OpenSSH aliases and settings remain available when the ordinary SSH destination form is used. Authentication, host-key verification, agent use, and SSH configuration are therefore handled through the user's existing OpenSSH environment.
+
+.TP
+If the SSH connection or SFTP subsystem cannot be established, \fBScry\fP reports the error before entering the terminal interface and exits without opening a partial remote session.
+
+.\" Subsection 'Connection Window'
+.SS "CONNECTION WINDOW"
+
+.TP 
+Press \fBF4\fP to open the SSH Connection window.
+
+.TP
+The window contains fields for:
+
+.nf
+.PP
+\(bu Saved Profile
+\(bu Profile Name
+\(bu Host
+\(bu Username
+\(bu Port
+\(bu Identity File
+\(bu Start Directory
+.fi
+
+.TP
+It also provides actions for:
+
+
+.nf
+.PP
+\(bu Connect
+\(bu Save
+\(bu Delete
+\(bu Disconnect
+\(bu Close
+.fi
+
+.TP
+Use \fBTab\fP and \fBShift+Tab\fP to move between available fields and controls. \fBLeft\fP and \fBRight\fP cycle through saved profiles while the Saved Profile row is selected.
+
+.TP
+Connecting from the window preserves the current local browser session. Disconnecting later returns \fBScry\fP to that preserved local directory, selection, query, view, and browsing state.
+
+.TP
+The Disconnect control is available only while an SSH source is active. Deleting a profile removes only the saved connection description; it does not alter the remote host or any SSH configuration files.
+
+.\" Subsection 'Connection Profiles'
+.SS "CONNECTION PROFILES"
+
+.TP
+Connection profiles provide reusable descriptions of remote destinations.
+
+.TP
+A profile may store:
+
+.nf
+.PP
+\(bu profile name
+\(bu host
+\(bu username
+\(bu port
+\(bu identity file
+\(bu starting directory
+.fi
+
+.TP
+After the fields have been completed, use Save to create or update the profile. Saved profiles may be selected, connected, reused, or deleted from the same window.
+
+.TP
+Profiles are stored locally under \fBScry's\fP configuration directory. They contain connection settings only; passwords and private-key contents are not stored by \fBScry\fP.
+
+.TP
+A blank username allows OpenSSH to determine the account through its ordinary configuration and environment. The default SSH port is 22 unless another port is supplied.
+
+.TP
+An optional identity-file path may be used to request a specific private key. Otherwise, OpenSSH may use configured identity files, an available authentication agent, or other authentication methods provided by the user's SSH setup.
+
+.\" Subsection 'Remote Navigation'
+.SS "REMOTE NAVIGATION"
+
+.TP
+After connection, remote directories behave much like local directories.
+
+.TP
+\fBList\fP mode displays entries directly, while \fBTree\fP mode provides expandable and collapsible directory branches. Exact and Fuzzy searching remain available, and ordinary query modifiers and Boolean expressions work against remote entries.
+
+.TP
+Press \fBEnter\fP or \fBRight\fP to enter a selected remote directory. Parent navigation, sorting, hidden-entry display, file classification, Details, Selection, Metadata, and File Information remain available where the remote source can provide the necessary data.
+
+.TP
+The interface header identifies the active SSH source so that local and remote browsing states can be distinguished.
+
+.TP
+Local deletion controls are unavailable during an SSH session. \fBScry\fP does not delete remote files or directories.
+
+.\" Subsection 'Persistent Remote Index'
+.SS "PERSISTENT REMOTE INDEX"
+
+.TP
+Recursive SSH searching uses a persistent local index instead of traversing the complete remote filesystem through SFTP for every query.
+
+.TP
+The Remote Index Builder is opened automatically when recursive searching first requires an index and no usable index is available. It may also be opened manually by pressing F5 during an SSH session.
+
+.TP
+Two indexing policies are available:
+
+.nf
+.PP
+\(bu Standard
+\(bu Include Hidden
+.fi
+
+.TP
+Standard records ordinary remote files and directories while excluding dot-prefixed entries.
+
+.TP
+Include Hidden also records files and directories whose names begin with a dot. Hidden entries remain subject to \fBScry's\fP current hidden-entry display setting when the completed index is searched.
+
+.TP
+The index is constructed from the remote filesystem root:
+
+.RS
+\fB/\fP
+.RE
+
+.RE
+.TP
+Selected virtual and transient system trees are skipped:
+
+.nf
+\fB/proc\fP
+\fB/sys\fP
+\fB/dev\fP
+\fB/run\fP
+.fi
+
+.RE
+.TP
+Index construction runs in the background, and \fBScry\fP reports the number of entries written while work continues. The remote filesystem may still be browsed during construction.
+
+.TP
+The completed index is stored locally and associated with the remote host, account, and port. Later connections using the same identity may reuse it without repeating the complete scan.
+
+.TP
+Although the persistent index represents the remote filesystem from \fB/\fP, recursive searches remain restricted to the current remote root. Searching from:
+
+.RS
+\fB/home/$USER/projects\fP
+.RE
+
+.TP
+therefore returns only entries beneath that directory even when the underlying index contains the rest of the remote filesystem.
+
+.TP
+Indexes preserve remote metadata and file classifications used by searching, filtering, sorting, and \fBTree\fP construction. Rebuilding may be useful after extensive filesystem changes or when a newer \fBScry\fP version introduces additional classification behavior.
+
+.\" Subsection 'Opening Remote Files'
+.SS "OPENING REMOTE FILES"
+
+.TP
+A remote file cannot be passed directly to an ordinary local application. Before opening it, \fBScry\fP transfers the file into a private local cache.
+
+.TP
+After the transfer completes, the cached copy is opened through the same terminal or desktop opener used for local files.
+
+.TP
+\fBScry\fP compares available remote metadata with its cached record. When the local cached copy is still current, it may be reused without downloading the complete file again.
+
+.TP
+Transfers are written first to temporary files using the suffix:
+
+.RS
+.scry-part
+.RE
+
+.TP
+A temporary part file is never treated as a completed cached copy. Interrupted or failed transfers are removed, and the final byte count is validated before the downloaded file is published in the cache.
+
+.TP
+The transfer window displays:
+
+.nf
+.PP
+\(bu transferred bytes
+\(bu total bytes
+\(bu completion percentage
+\(bu elapsed time
+\(bu average speed
+.fi
+
+.TP
+An active transfer may be cancelled safely. A cancelled or failed transfer does not replace an existing valid cached copy.
+
+.TP
+Complete transfer behavior is described in the \fBFILE TRANSFERS\fP section.
+
+.\" Subsection 'Marked Remote Files'
+.SS "MARKED REMOTE FILES"
+
+.TP
+Remote files may be marked for a later batch download.
+
+.TP
+Use:
+
+.RS
+\fBCtrl+Space\fP
+.RE
+
+.TP
+to mark or unmark the selected file.
+
+.TP
+Use:
+
+.RS
+\fBAlt+U\fP
+.RE
+
+.TP
+to clear all marks.
+
+.TP
+Use:
+
+.RS
+\fBAlt+D\fP
+.RE
+
+.TP
+while multiple remote files are marked to begin the batch download.
+
+.TP
+Marks survive directory navigation, filtering, and switching between \fBList\fP and \fBTree\fP modes. Directories cannot currently be marked.
+
+.TP
+Marking is available only during an SSH session. The ordinary cursor selection remains independent from the set of marked files.
+
+.TP
+Batch-download destinations, flattened and preserved layouts, collision handling, progress reporting, and completion summaries are documented in the \fBFILE TRANSFERS\fP section.
+
+.\" Subsection 'SSH Session Restoration'
+.SS "SSH SESSION RESTORATION"
+
+.TP
+When session restoration is enabled, \fBScry\fP may save and later restore an SSH browser session.
+
+.TP
+Restored SSH state may include:
+
+.nf
+.PP
+\(bu remote host, account, and port
+\(bu identity file
+\(bu current remote directory
+\(bu selected entry
+\(bu visible viewport
+\(bu search query and modes
+\(bu List or Tree view
+\(bu sorting and reverse order
+\(bu hidden-entry state
+\(bu displayed panels and columns
+\(bu marked remote files
+.fi
+
+.TP
+Restoring an SSH session requires \fBScry\fP to reconnect to the saved destination. If reconnection fails, \fBScry\fP opens locally instead and reports the restoration error. The existing saved session is preserved so that another restoration attempt may be made later.
+
+.TP
+An explicit \fBPATH\fP or \fB\-\-ssh\fP argument identifies an intentional startup destination and takes precedence over the source stored in the saved session.
+
+.\" Subsection 'SSH Configuration'
+.SS "SSH CONFIGURATION"
+
+.TP
+SSH behavior may be adjusted in the \fB[ssh]\fP section of \fBscry.toml\fP.
+
+.TP
+The available settings include:
+
+.nf
+.PP
+\(bu connect_timeout_seconds
+\(bu server_alive_interval_seconds
+\(bu preserve_hierarchy
+.fi
+
+\fBconnect_timeout_seconds\fP controls how long \fBScry\fP waits while establishing the OpenSSH connection.
+
+.TP
+\fBserver_alive_interval_seconds\fP controls the interval used for SSH keepalive activity. A value of zero disables the interval.
+
+.TP
+\fBpreserve_hierarchy\fP controls the default directory layout used for marked batch downloads. The command-line option \fB\-\-preserve\-hierarchy\fP enables hierarchy preservation for the current launch regardless of the configured default.
+
+.TP
+Example:
+
+.nf
+[ssh]
+connect_timeout_seconds = 10
+server_alive_interval_seconds = 15
+preserve_hierarchy = false
+.fi
+
+.TP
+Invalid or unsafe timeout values fall back to \fBScry's\fP built-in defaults rather than preventing startup.
+
+.\" Main section: 'File Transfers'
+.SH "FILE TRANSFERS"
+
+.TP
+\fBScry\fP transfers remote files through SFTP. Single-file transfers are used when opening remote files, while marked files may be downloaded together into a user-visible local directory.
+
+.SS "SINGLE-FILE TRANSFERS"
+
+.TP
+When a remote file is opened, \fBScry\fP first transfers it into a private local cache. After a successful transfer, the cached copy is opened through the same external opener used for local files.
+
+.TP
+A current cached copy may be reused without downloading the file again. \fBScry\fP compares the remote size and modification information with its stored cache metadata before deciding whether another transfer is required.
+
+.TP
+The transfer window reports:
+
+.nf
+.PP
+\(bu transferred bytes
+\(bu total bytes
+\(bu completion percentage
+\(bu elapsed time
+\(bu transfer speed
+.fi
+
+.TP
+The completed transfer window remains visible until acknowledged, while the downloaded file opens immediately after a successful transfer.
+
+.\" Subsection: 'Marked Batch Downloads'
+.SS "MARKED BATCH DOWNLOADS"
+
+.TP
+During an SSH session, use \fBCtrl+Space\fP to mark or unmark remote files. Marks remain active across directory navigation, filtering, and \fBList\fP or \fBTree\fP changes.
+
+.TP
+Use:
+
+.RS
+\fBAlt+U\fP 
+.RE
+
+.TP
+to clear all marks.
+
+.TP
+Use:
+
+.RS
+\fBAlt+D\fP
+.RE
+
+.TP
+while multiple files are marked, to begin a batch download.
+
+.TP
+Directories cannot currently be marked. Successfully downloaded files are removed from the marked set, while failed or unattempted files remain marked for a possible retry.
+
+.\" Subsection: 'Download Destination'
+.SS "DOWNLOAD DESTINATION"
+
+.TP
+Each batch is placed inside a newly created local download directory.
+
+.TP
+When the SSH connection was opened from an existing local \fBScry\fP session, the batch directory is created beneath the preserved local browsing directory. When \fBScry\fP was started directly with \fB\-\-ssh\fP, it is created beneath the process directory from which \fBScry\fP was launched.
+
+.TP
+The transfer window displays the destination path.
+
+.\" Subsection: 'Flat and Preserved Layouts'
+.SS "FLAT AND PRESERVED LAYOUTS"
+
+.TP
+Batch downloads use a flat layout by default. All marked files are placed directly beneath the batch directory.
+
+.TP
+When two remote files share the same filename, \fBScry\fP assigns a unique destination name so that one download cannot overwrite another.
+
+.TP
+Remote paths may instead be retained by enabling \fBpreserve_hierarchy\fP in \fBscry.toml\fP or by using:
+
+.RS
+\fB\-\-preserve-hierarchy\fP
+.RE
+
+.TP
+With hierarchy preservation enabled, remote directory paths are recreated beneath the batch directory.
+
+.\" Subsection: 'Transfer Safety'
+.SS "TRANSFER SAFETY"
+
+.TP
+Downloads are first written to temporary files ending in:
+
+.RS
+.PP
+*.scry-part
+.RE
+
+.TP
+A temporary part file is never treated as a completed download. Abandoned part files are removed before a retry, and failed or cancelled transfers remove their unfinished temporary file.
+
+.TP
+\fBScry\fP validates the transferred byte count before publishing the completed destination. An existing valid cache file is replaced only after the new transfer has completed, been flushed, and passed validation.
+
+.\" Subsection: 'Cancellation and Results'
+.SS "CANCELLATION AND RESULTS"
+
+.TP
+An active transfer may be cancelled from the transfer window. Cancellation stops safely and removes the unfinished download.
+
+.TP
+During a batch transfer, the window reports the current file, total file count, aggregate bytes, elapsed time, speed, and destination.
+
+.TP
+After completion, the summary reports how many files succeeded or failed. Aggregate byte totals remain accurate when one or more files fail, rather than being forced to the expected total
+
+.\" Main Section: 'Session Restoration'
+.SH "SESSION RESTORATION"
+
+.TP
+\fBScry\fP can save its current browser state during an orderly exit and restore that state on a later launch.
+
+.TP
+Session restoration may be enabled for one launch with:
+
+.RS
+\fB\-\-restore\-session\fB
+.RE
+
+.TP
+or permanently in \fBscry.toml\fP with:
+
+.nf
+.PP
+\(bu [session]
+\(bu restore_session = true
+.fi
+
+.SS "SAVED STATE"
+
+.TP
+A saved session may retain:
+
+.nf
+.PP
+\(bu local or SSH source
+\(bu current directory
+\(bu selected entry
+\(bu visible viewport
+\(bu search query
+\(bu Exact or Fuzzy mode
+\(bu recursive state
+\(bu List or Tree view
+\(bu entry filter
+\(bu sort mode and direction
+\(bu hidden-entry state
+\(bu visible panels and columns
+\(bu file-icon setting
+\(bu marked SSH files
+.fi
+
+.TP
+Temporary interface state is not saved. Open dialogs, notifications, active transfers, background workers, and confirmation windows are excluded.
+
+.\" Subsection: 'Restoring a Session'
+.SS "RESTORING A SESSION"
+
+.TP
+When restoration is enabled and \fBScry\fP is launched without an explicit \fBPATH\fP or \fB\-\-ssh\fP destination, the most recently saved session is loaded.
+
+.TP
+An explicit startup destination always takes precedence. For example:
+
+.nf
+scry /var/log
+scry \-\-ssh host
+.fi
+
+.TP
+start at the supplied destination instead of restoring the saved source.
+
+.TP
+Command-line options are applied after the saved state and therefore override restored settings for the current launch.
+
+.\" Subsection: 'Session Precedence'
+.SS "SESSION PRECEDENCE"
+
+.TP
+When a saved session is restored, its interactive browser state takes precedence over corresponding browser and display defaults from \fBscry.toml\fP. This includes the active \fBList\fP or \fBTree\fP view, Exact or Fuzzy mode, recursive state, entry filtering, sort mode and direction, hidden-entry visibility, visible panels and metadata columns, selection, viewport, and expanded or collapsed \fBTree\fP branches.
+
+.TP
+Explicit command-line options are applied after the restored session and remain authoritative for the current launch.
+
+.TP
+To make \fBscry.toml\fP determine the startup browser and display state without applying a previous session, disable session restoration.
+
+.\" Subsection: 'SSH Restoration'
+.SS "SSH RESTORATION"
+
+.TP
+A saved SSH session reconnects to the recorded host before restoring its remote directory, selection, query, view, and marked files.
+
+.TP
+If the remote connection cannot be restored, \fBScry\fP opens locally and reports the error. The previous saved session is preserved so that restoration may be attempted again later.
+
+.\" Subsection: 'Session File'
+.SS "SESSION FILE"
+
+.TP
+The saved session is stored as JSON in:
+
+.RS
+\fB$XDG_STATE_HOME/scry/session.json\fP
+.RE
+
+.TP
+When \fBXDG_STATE_HOME\fP is not set, the default location is:
+
+.RS
+\fB~/.local/state/scry/session.json\fP
+.RE
+
+.TP
+The file is written through a temporary .part file and then published by rename, reducing the risk of leaving a partially written session after interruption.
+
+.SS "ORDERLY EXIT"
+
+.TP
+Session state is saved only during an orderly \fBScry\fP exit.
+
+.TP
+A process termination, system failure, or forced kill may therefore leave the previous valid session unchanged rather than recording the most recent unsaved state.
+
+.TP
+Unsupported, malformed, or unreadable session files are not silently overwritten. \fBScry\fP starts normally, reports the problem where appropriate, and preserves the existing file for inspection or later recovery.
+
+.\" Main Section: 'Configuration'
+.SH "CONFIGURATION"
+
+.TP
+\fBScry\fP reads its startup configuration from:
+
+.RS
+\fB~/.config/scry/scry.toml\fP
+.RE
+
+.TP
+When \fBXDG_CONFIG_HOME\fP is set, the path becomes:
+
+.RS
+\fB$XDG_CONFIG_HOME/scry/scry.toml\fP
+.RE
+
+.TP
+The configuration file controls theme selection, display defaults, browser behavior, optional features, session restoration, and SSH settings. Command-line options override corresponding configuration values for the current launch.
+
+.\" Subsection: 'Generating a Configuration'
+.SS "GENERATING A CONFIGURATION"
+
+.TP
+Use:
+
+.RS
+\fB\-\-generate\-config\fP
+.RE
+
+.TP
+to create a documented template named:
+
+.RS
+\fBscry.toml.generated\fB
+.RE
+
+.TP
+The generated template is inert. \fBScry\fP does not overwrite the active configuration file with this command.
+
+.TP
+After reviewing the template, rename it to:
+
+.RS
+\fBscry.toml\fP
+.RE
+
+.TP
+inside \fBScry's\fP configuration directory.
+
+.\" Subsection: 'General Settings'
+.SS "GENERAL SETTINGS"
+
+.TP
+The top-level theme setting selects the active color theme.
+
+.TP
+Example:
+
+.RS
+theme = "default"
+.RE
+
+.TP
+Missing, invalid, or unreadable themes fall back to \fBScry's\fP built-in appearance rather than preventing startup. 
+
+.TP
+\fBNote:\fP See subsection \fPCUSTOM THEMES\fP, further down, for information about how to manage your own themes.
+
+.\" Subsection: 'Display Settings'
+.SS "DISPLAY SETTINGS"
+
+.TP
+The \fB[display]\fP section controls which interface elements are visible when \fBScry\fP starts.
+
+.TP
+Available settings include:
+
+.nf
+show_hidden
+show_icons
+show_file_colors
+show_details
+show_selection
+show_columns
+show_permissions
+show_size
+show_date
+show_user
+.fi
+
+.TP
+Example:
+
+.nf
+[display]
+show_hidden = false
+show_icons = false
+show_file_colors = true
+show_details = true
+show_selection = true
+show_columns = true
+show_permissions = false
+show_size = true
+show_date = true
+show_user = false
+.fi
+
+.TP
+These values establish startup defaults. The corresponding panels, columns, icons, and hidden-entry state may still be changed interactively while \fBScry\fP is running.
+
+.\" Subsection: 'Browser Settings'
+.SS "BROWSER SETTINGS"
+
+.TP
+The \fB[browser]\fP section controls \fBScry's\fP initial browsing and search modes.
+
+.TP
+Available settings include:
+
+.nf
+view
+recursive
+fuzzy
+fuzzy_result_limit
+exact_tree_match_limit
+hidden_only
+sort
+reverse
+entry_filter
+.fi
+
+.TP
+Accepted values for \fBview\fP are:
+
+.nf
+list | tree
+.fi
+
+.TP
+Accepted values for \fBsort\fP are:
+
+.nf
+name | size | date | type
+.fi
+
+.TP
+Accepted values for \fBentry_filter\fP are:
+
+.nf
+all | files | directories
+.fi
+
+.TP
+Example:
+
+.nf
+[browser]
+view = "list"
+recursive = false
+fuzzy = false
+fuzzy_result_limit = 500
+exact_tree_match_limit = 5000
+hidden_only = false
+sort = "name"
+reverse = false
+entry_filter = "all"
+.fi
+
+.TP
+\fBfuzzy_result_limit:\fP Sets the maximum number of direct ranked matches retained by Fuzzy search. In \fBTree\fP mode, contextual parent directories may cause the displayed node count to exceed this value.
+
+.TP
+\fBexact_tree_match_limit:\fP Sets the maximum number of direct matches retained when constructing an Exact \fBTree\fP before contextual parent directories are added. Fuzzy+Recursive \fBTree\fP queries containing only structural selectors use this limit until textual search input is present. See \fBLIST AND TREE RESULTS\fP for the complete behavior.
+
+.TP
+\fBhidden_only:\fP Restricts the visible results to hidden files, hidden directories, and all descendants beneath hidden directories.
+
+.TP
+Unknown or misspelled view, sort, or entry-filter values fall back to safe built-in defaults.
+
+.\" Subsection: 'Feature Settings'
+.SS "FEATURE SETTINGS"
+
+.TP
+The \fB[features]\fP section controls optional file operations.
+
+.TP
+Available settings include:
+
+.nf
+enable_deletion
+allow_file_opening
+exit_on_open
+.fi
+
+.TP
+Example:
+
+.nf
+[features]
+enable_deletion = false
+allow_file_opening = true
+exit_on_open = false
+.fi 
+
+.TP
+\fBenable_deletion\fP permits local deletion controls. Deletion is disabled by default.
+
+.TP
+\fBallow_file_opening\fP controls whether selected regular files may be opened externally. Directory navigation remains available when file opening is disabled.
+
+.TP
+\fBexit_on_open\fP causes \fBScry\fP to exit after a regular file has opened successfully. Failed opens and directory navigation leave \fBScry\fP running.
+
+.\" Subsection: 'Session Settings'
+.SS "SESSION SETTINGS"
+
+.TP
+The \fB[session]\fP section controls persistent browser restoration.
+
+.TP
+Example:
+
+.nf
+[session]
+restore_session = true
+.fi
+
+.TP
+When session restoration is enabled and a saved session is available, the restored interactive state takes precedence over corresponding browser and display defaults in \fBscry.toml\fP. This includes the active view and search modes, hidden-entry visibility, sorting, panels, metadata columns, selection, viewport, and expanded \fBTree\fP branches. 
+
+.TP
+Explicit command-line options remain authoritative for the current launch. Disable session restoration when \fBscry.toml\fP should determine the startup state without applying a previous session.
+
+.TP
+The command-line option:
+
+.RS
+\fB--restore-session\fP
+.RE
+
+.TP
+enables restoration for the current launch even when the configuration value is false.
+
+.\" Subsection: 'SSH Settings'
+.SS "SSH SETTINGS"
+
+.TP
+The \fB[ssh]\fP section controls connection and batch-download behavior.
+
+.TP
+Available settings include:
+
+.nf
+connect_timeout_seconds
+server_alive_interval_seconds
+preserve_hierarchy
+.fi
+
+.TP
+Example:
+
+.nf
+[ssh]
+connect_timeout_seconds = 10
+server_alive_interval_seconds = 15
+preserve_hierarchy = false
+.fi
+
+.TP
+\fBconnect_timeout_seconds\fP controls the time allowed for establishing an SSH connection.
+
+.TP
+\fBserver_alive_interval_seconds\fP controls SSH keepalive activity. A value of zero disables the interval.
+
+.TP
+\fBpreserve_hierarchy\fP determines whether marked batch downloads retain their remote paths. The command-line option \fB\-\-preserve\-hierarchy\fP enables this behavior for the current launch.
+
+.\" Subsection: 'Custom Themes'
+.SS "CUSTOM THEMES"
+
+.TP
+Users can create their own \fBScry\fP themes by copying one of the existing theme files, renaming the copy, and changing its color values. Starting from an existing theme is recommended because it shows the complete set of available color settings and provides a ready-made example of the expected structure.
+
+.TP
+Custom themes should be placed in:
+
+.RS
+~/.config/scry/themes
+.RE 
+
+.TP
+and can then be selected with the top-level theme setting in \fBscry.toml\fP.
+
+.TP
+Keeping the original supplied theme files unchanged is recommended. This makes it easy to return to \fBScry's\fP built-in themes and preserves clean templates that can be copied again when creating additional custom themes.
+
+.\" Subsection: 'Terminal Fonts'
+.SS "TERMINAL FONTS"
+
+.TP
+\fBScry\fP is designed for a modern monospaced terminal font. Nerd Fonts are recommended for the most consistent appearance and are especially useful when optional file icons are enabled.
+
+.TP
+A terminal font that lacks some of Scry's Unicode symbols may cause arrows or other interface characters to appear misaligned when the terminal substitutes glyphs from another font. Installing a Nerd Font and selecting it in the terminal emulator usually resolves this.
+
+.TP
+On FreeBSD, for example:
+
+.RS
+sudo pkg install nerd-fonts-jetbrainsmono
+.RE
+
+.TP
+After installation, select the installed Nerd Font in the terminal emulator's font settings. Equivalent Nerd Font packages are available on other operating systems.
+
+.\" Subsection: 'ADVANCED TREE'
+.SS "ADVANCED TREE"
+
+.TP
+The \fB[advanced.tree]\fP section controls how \fBScry\fP handles very large \fBTree\fP displays.
+
+.TP
+These settings apply to the number of \fBTree\fP rows that are visible at one time. They do not limit file system scanning, indexing, recursive searching, or the total number of entries available to \fBScry\fP. A filesystem containing millions of entries may therefore be searched normally while only a much smaller part of its \fBTree\fP is expanded on screen.
+
+.TP
+Available settings include:
+
+.nf
+expand_all_warning_rows
+max_visible_tree_rows
+show_expand_all_warning
+show_max_visible_tree_rows
+show_ssh_expand_all_warning
+.fi
+
+.TP
+Example:
+
+.nf
+[advanced.tree]
+expand_all_warning_rows = 75000
+max_visible_tree_rows = 250000
+show_expand_all_warning = true
+show_max_visible_tree_rows = true
+show_ssh_expand_all_warning = true
+.fi
+
+.TP
+\fBexpand_all_warning_rows\fP sets the projected visible \fBTree\fP row count above which Alt+E asks for confirmation before expanding all represented branches. It must be lower than \fPmax_visible_tree_rows\fP.
+
+.TP
+\fBmax_visible_tree_rows\fP sets the maximum number of \fBTree\fP rows that \fBScry\fP may display at one time. The default is 250000. The limit applies to guarded \fBTree\fP expansion regardless of whether rows would become visible through Expand All, manual branch expansion, Hidden, or another guarded \fBTree\fP-state transition.
+
+.TP
+When an operation would exceed this maximum, \fBScry\fP keeps the last valid \fBTree\fP instead of opening the oversized representation. Collapsing branches frees visible-row capacity and may allow previously refused branches to be expanded afterward. Raising this value permits larger \fBTrees\fP but may substantially increase memory use and make the hierarchy difficult to navigate.
+
+.TP
+\fBshow_expand_all_warning\fP controls whether the \fBLarge Tree\fP confirmation dialog is shown when Alt+E enters the warning range. When disabled, the dialog is never shown; \fBScry\fP reports the first affected expansion through a notification and then continues with the otherwise permitted expansion.
+
+.TP
+\fBshow_max_visible_tree_rows\fP controls whether \fBScry\fP shows the full \fBTree Display Limit\fP dialog when an operation is refused by \fBmax_visible_tree_rows\fP. Disabling this setting hides only the dialog: the configured maximum remains fully enforced, and refused operations are reported through notifications instead.
+
+.TP
+\fBshow_ssh_expand_all_warning\fP controls whether the Large \fBTree\fP confirmation dialog is shown while browsing through SSH. Disabling it suppresses the SSH confirmation only; \fBmax_visible_tree_rows\fP continues to apply.
+
+.TP
+These safeguards affect the visible \fBTree\fP only. They do not discard search results or reduce \fBScry's\fP indexed filesystem corpus. Users who routinely work with unusually large \fBTrees\fP may adjust the thresholds in \fB~/.config/scry/scry.toml\fP, but the defaults are intended to keep expansion responsive and the resulting hierarchy practical to browse.
+
+.\" Subsection: 'Complete Example'
+.SS "COMPLETE EXAMPLE"
+
+.nf
+theme = "default"
+
+[display]
+show_hidden = false
+show_icons = false
+show_file_colors = true
+show_details = true
+show_selection = true
+show_columns = true
+show_permissions = false
+show_size = true
+show_date = true
+show_user = false
+
+[browser]
+view = "list"
+recursive = false
+fuzzy = false
+fuzzy_result_limit = 500
+hidden_only = false
+sort = "name"
+reverse = false
+entry_filter = "all"
+
+[features]
+enable_deletion = false
+allow_file_opening = true
+exit_on_open = false
+
+[session]
+restore_session = false
+
+[ssh]
+connect_timeout_seconds = 10
+server_alive_interval_seconds = 15
+preserve_hierarchy = false
+
+[advanced.tree]
+expand_all_warning_rows = 75000
+expand_all_tree_rows = 250000
+show_ssh_expand_all_warning = true
+.fi
+
+.\" Subsection: 'Error Handling'
+.SS "ERROR HANDLING"
+
+.TP
+Missing configuration files are created with safe defaults.
+
+.TP
+Malformed files, unsupported browser values, invalid sort modes, and unsafe timeout values fall back to built-in defaults rather than preventing \fBScry\fP from starting.
+
+.\" Main Section: 'Files'
+.SH "FILES"
+
+.nf
+.PP
+\fB$XDG_CONFIG_HOME/scry/scry.toml\fP
+\fB~/.config/scry/scry.toml\fP
+.fi
+
+.RS
+\fBScry’s\fP active configuration file. When XDG_CONFIG_HOME is unset, the location beneath ~/.config is used. Missing files are created with safe defaults.
+.RE
+
+.nf
+.PP
+\fB$XDG_CONFIG_HOME/scry/scry.toml.generated\fP
+\fB~/.config/scry/scry.toml.generated\fP
+.fi
+
+.RS
+Documented configuration template created by \fB\-\-generate\-config\fP. The generated file is not active until reviewed and renamed to \fBscry.toml\fP.
+.RE
+
+.nf
+.PP
+\fB$XDG_CONFIG_HOME/scry/connection_profiles.json\fP
+\fB~/.config/scry/connection_profiles.json\fP
+.fi
+
+.RS
+Saved SSH connection profiles containing profile names, hosts, usernames, ports, identity-file paths, and starting directories.
+.RE
+
+.nf
+.PP
+\fB$XDG_STATE_HOME/scry/session.json\fP
+\fB~/.local/state/scry/session.json\fP
+.fi
+
+.RS
+Saved local or SSH browser session. The fallback path beneath ~/.local/state is used when XDG_STATE_HOME is unset.
+.RE
+
+.nf
+.PP
+\fB$XDG_STATE_HOME/scry/session.json.part\fP
+\fB~/.local/state/scry/session.json.part\fP
+.fi
+
+.RS
+Temporary session file used while publishing an updated saved session. It is not treated as the active session file.
+.RE
+
+.nf
+.PP
+\fB$XDG_CACHE_HOME/scry/\fP
+\fB~/.cache/scry/\fP
+.fi
+
+.RS
+Private \fBScry\fP cache containing materialized remote files and persistent remote indexes. The fallback directory beneath ~/.cache is used when XDG_CACHE_HOME is unset.
+
+.TP
+Cached remote files are arranged by remote host, account, port, and source path so that different SSH destinations do not overwrite one another.
+.RE
+
+.nf
+.PP
+\fB*.scry-meta\fP
+.fi
+
+.RS
+Metadata stored beside cached remote files. It records information used to determine whether an existing cached copy remains current.
+.RE
+
+.nf
+.PP
+\fB*.scry-part\fP
+.fi
+
+.RS
+Temporary file used while downloading a remote file or constructing another persistent object. A part file is never treated as a completed download and is removed after failure or cancellation.
+.RE
+
+.nf
+.PP
+\fB.scry-deleted-*\fP
+.fi
+
+.RS
+Hidden temporary sibling names used for staged local deletions. These entries remain beside their original paths until restored with \fBCtrl+Z\fP or permanently removed during an orderly \fBScry\fP exit.
+.RE
+
+.TP
+\fBScry\fP also maintains a deletion-recovery journal under its state directory while staged deletions exist. The journal allows recoverable deletions from an interrupted session to be adopted safely on the next local launch.
+
+.TP
+External theme files are selected by name through \fBscry.toml\fP. Missing or malformed theme files fall back to the built-in palette rather than preventing startup.
+
+.\" Main Section: 'Environment'
+.SH "ENVIRONMENT"
+
+.TP
+\fBScry\fP recognizes the standard XDG base-directory variables when locating configuration, state, and cache data.
+
+.TP
+\fBXDG_CONFIG_HOME\fP
+
+.RS
+Overrides the base directory used for \fBScry’s\fP configuration, generated template, themes, and saved SSH connection profiles.
+.TP
+When unset, \fBScry\fP uses:
+.TP
+\fB~/.config\fP
+.RE
+
+.TP
+\fBXDG_STATE_HOME\fP
+
+.RS
+Overrides the base directory used for saved session state and deletion-recovery data.
+.TP
+When unset, \fBScry\fP uses:
+.TP
+\fB~/.local/state\fP
+.RE
+
+.TP
+\fBXDG_CACHE_HOME\fP
+
+.RS
+Overrides the base directory used for cached remote files and persistent SSH indexes.
+
+.TP
+When unset, \fBScry\fP uses:
+.TP
+\fB~/.cache\fP
+.RE
+
+.TP
+\fBHOME\fP
+
+.RS
+Provides the user’s home directory when an applicable XDG variable is unset. It is also used as \fBScry’s\fP local home-navigation destination.
+.RE
+
+.TP
+\fBPATH\fP
+
+.RS
+Used by the operating environment when resolving external commands invoked while opening files. It also affects commands and utilities used through the user’s existing OpenSSH configuration.
+.RE
+
+.TP
+\fBScry\fP inherits the terminal and OpenSSH environment of the process from which it is launched. SSH aliases, authentication agents, identity configuration, host-key policy, and related connection behavior remain governed by OpenSSH.
+
+.TP
+\fBScry\fP defines no mandatory program-specific environment variables.
+
+.\" Main Section: 'Examples'
+.SH "EXAMPLES"
+
+.\" Subsection: 'Basic Browsing'
+.SS "BASIC BROWSING"
+
+.TP
+Browse the current directory:
+
+.RS
+\fBscry\fP
+.RE
+
+.TP
+Browse a specific directory:
+
+.RS
+\fBscry ~/Projects\fP
+.RE
+
+.TP
+Start in \fBTree\fP mode:
+
+.RS
+\fBscry --tree ~/Projects\fP
+.RE
+
+.TP
+Start with permissions and file sizes visible:
+
+.RS
+\fBscry --permissions --size ~/Projects\fP
+.RE
+
+.TP
+Show hidden files and directories immediately:
+
+.RS
+\fBscry --all ~\fP
+.RE
+
+.\" Subsection: 'Searching
+.SS "SEARCHING"
+
+.TP
+Start with recursive Exact searching enabled:
+
+.RS
+\fBscry --recursive ~/Projects\fP
+.RE
+
+.TP
+Start with Fuzzy and Recursive searching enabled:
+
+.RS
+\fBscry --recursive --fuzzy ~/Projects\fP
+.RE
+
+.TP
+Open \fBScry\fP with a prepared text query:
+
+.RS
+\fBscry --query "session index" ~/Projects\fP
+.RE
+
+.TP
+Search recursively for source-code entries containing index:
+
+.RS
+\fBscry -r --query "type:source index" ~/Projects\fP
+.RE
+
+.TP
+Find Rust entries while excluding test paths:
+
+.RS
+\fBscry -r --query "type:rust -test" ~/Projects\fP
+.RE
+
+.TP
+Use a Boolean query:
+
+.RS
+\fBscry -r --query "(type:rust OR type:python) AND session" ~/Projects\fP
+.RE
+
+.TP
+Search for exact-case text:
+
+.RS
+\fBscry -r --query "type:sensitive README"\fP
+.RE
+
+.TP
+Queries containing whitespace or Boolean operators should be quoted so the shell passes them as one argument.
+
+.\" Subsection: 'Result Filters'
+.SS "RESULT FILTERS"
+
+.TP
+Show only files and symbolic links:
+
+.RS
+\fBscry --files-only ~/Downloads\fP
+.RE
+
+.TP
+Show only directories:
+
+.RS
+\fBscry --dirs-only ~/Projects\fP
+.RE
+
+.TP
+Start in \fBTree\fP mode with directories only:
+
+.RS
+\fBscry --tree --dirs-only ~\fP
+.RE
+
+.\" Subsection: 'File Opening'
+.SS "FILE OPENING"
+
+.TP
+Browse normally but prevent external file opening:
+
+.RS
+\fBscry --no-open ~/Documents\fP
+.RE
+
+.TP
+Exit \fBScry\fP after a regular file has opened successfully:
+
+.RS
+\fBscry --exit-on-open ~/Documents\fP
+.RE
+
+.\" Subsection: 'SSH'
+.SS "SSH"
+
+.TP
+Browse a remote host through SSH and SFTP:
+
+.RS
+\fBscry --ssh user@example-host\fP
+.RE
+
+.TP
+Use an OpenSSH alias:
+
+.RS
+\fBscry --ssh nosferatu\fP
+.RE
+
+.TP
+Connect with an explicit username and port:
+
+.RS
+\fBscry --ssh user@example-host:2222\fP
+.RE
+
+.TP
+Open a specific remote directory:
+
+.RS
+\fBscry --ssh user@example-host /var/log\fP
+.RE
+
+.TP
+Start a remote recursive search with a prepared query:
+
+.RS
+\fBscry --ssh user@example-host -r --query "type:source index" /srv/projects\fP
+.RE
+
+.TP
+Preserve remote directory paths during marked batch downloads:
+
+.RS
+\fBscry --ssh user@example-host --preserve-hierarchy\fP
+.RE
+
+.TP
+When \fB\-\-ssh\fP is used without a remote path, or with ., \fBScry\fP opens the remote account’s home directory.
+
+.\" Subsection: 'Session Restoration'
+.SS "SESSION RESTORATION"
+
+.TP
+Restore the most recently saved session:
+
+.RS
+\fBscry --restore-session\fP
+.RE
+
+.TP
+Restore the saved session while overriding its display mode:
+
+.RS
+\fBscry --restore-session --tree --permissions --size\fP
+.RE
+
+.TP
+An explicit local path or SSH destination takes precedence over the source stored in the saved session.
+
+.\" Subsection: 'Documentation and Configuration"
+.SS "DOCUMENTATION AND CONFIGURATION"
+
+.TP
+Print concise command-line help:
+
+.RS
+\fBscry --help\fP
+.RE
+
+.TP
+Read the complete explanatory manual in a pager:
+
+.RS
+\fBscry --manual | less\fP
+.RE
+
+.TP
+Save the printable manual as plain text:
+
+.RS
+\fBscry --manual > scry\-manual.txt\fP
+.RE
+
+.TP
+Generate a documented configuration template:
+
+.RS
+\fBscry --generate-config\fP
+.RE
+
+.\" Main Section: 'Exit Status'
+.SH "EXIT STATUS"
+
+.TP
+Scry exits with one of the following status values:
+
+.TP
+\fB0\fP
+
+.RS
+The requested operation completed successfully, or \fBScry\fP exited normally from the interactive interface.
+.RE
+
+.TP
+\fB1\fP
+
+.RS
+A runtime failure prevented the requested operation from completing. Examples include failure to generate a configuration template, establish an SSH connection, initialize SFTP, open the requested starting directory, or restore the terminal state cleanly.
+.RE
+
+.TP
+\fB2\fP
+
+.RS
+The command line was invalid. This includes malformed options, conflicting arguments, missing option values, or an invalid SSH target.
+.RE
+
+.TP
+Informational commands such as \fB\-\-help\fP, \fB\-\-manual\fP, and \fB\-\-version\fP return 0 when their output is produced successfully.
+
+.TP
+Errors encountered after \fBScry\fP has already entered the interactive interface are normally reported inside the application and do not necessarily determine the eventual process exit status. Failures during final cleanup, staged-deletion removal, session saving, or clipboard handoff may be printed after the terminal interface closes.
+
+.\" Main Section: 'Notes'
+.SH "NOTES"
+
+.TP
+\fBScry\fP is an interactive terminal application. Its behavior may depend on the capabilities of the active terminal emulator, pager, font, desktop environment, and OpenSSH configuration.
+
+.TP
+File and directory icons use Nerd Font glyphs. \fBScry\fP remains fully usable when icon support is unavailable or disabled.
+
+.TP
+External file opening relies on the user’s local system and configured applications. A file that cannot be opened externally remains selected, and \fBScry\fP reports the failure without exiting unless the operation succeeded.
+
+.TP
+Local deletion is optional and disabled by default. Remote deletion is not supported.
+
+.TP
+Fuzzy searching retains the strongest configured number of ranked matches. Exact Recursive \fBTree\fP mode also applies a bounded direct-match limit before constructing parent branches. These limits protect responsiveness and navigability when searching very large filesystems.
+
+.TP
+Remote indexes and cached files reflect the state observed when they were created or refreshed. Rebuilding a remote index may be necessary after extensive changes on the remote filesystem.
+
+.TP
+\fBScry\fP is currently unreleased and under active development. Command-line options, configuration fields, shortcuts, stored formats, and behavior may change before the first stable release.
+
+.\" Main Section: 'Author'
+.SH "AUTHOR"
+
+.TP
+\fBScry\fP was created by \fBMarkus Johnsson\fP.
+
+.\" Main Section: 'License'
+.SH "LICENSE"
+
+.TP
+\fBScry\fP is distributed underq the \đBBSD 3-Clause License\fP.
+
+.TP
+Copyright and complete license terms are provided in the LICENSE file included with the source distribution.
+
+.\" Main Section: 'See Also'
+.SH "SEE ALSO"
+
+.TP
+ssh(1), sftp(1), less(1), xdg-open(1)
+
+.TP
+The complete in-app Help window is available with F1.
+
+.TP
+The Shortcut Legend, including the complete query modifier and type-alias reference, is available with \fB?\fP.
+
+.TP
+Concise command-line help may be printed with:
+
+.TP
+scry --help
+
+.TP
+The complete printable manual used by the in-app Help window may be printed with:
+
+.TP
+scry --manual
+
+
+
+
+
+

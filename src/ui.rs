@@ -12,11 +12,14 @@ use ratatui::{
 };
 use std::time::{Duration, SystemTime};
 
+use chrono::{DateTime, Local};
+
 use crate::app::{
-    App, DeletionChoice, EXACT_TREE_MATCH_LIMIT, RemoteIndexDialogFocus, SearchMode, TreeRow,
-    ViewMode,
+    App, DeletionChoice, RemoteIndexDialogFocus, SearchMode, TreeDisplayLimitAction,
+    TreeExpandAllDialogKind, TreeRow, ViewMode,
 };
 use crate::connection::ConnectionField;
+use crate::entry::format_permissions;
 use crate::fuzzy::fuzzy_highlight_positions;
 use crate::help;
 use crate::query::{
@@ -31,8 +34,6 @@ const COLOR_FRAME: Color = Color::Rgb(160, 110, 220);
 const COLOR_DIRECTORY: Color = Color::Rgb(80, 155, 235);
 
 const COLOR_FILE: Color = Color::Rgb(195, 200, 210);
-
-const COLOR_SYMLINK: Color = Color::Rgb(75, 195, 210);
 
 // const COLOR_QUERY: Color = Color::Rgb(110, 220, 225);
 
@@ -53,6 +54,45 @@ const COLOR_DATE: Color = COLOR_DIRECTORY; // Color::Rgb(160, 110, 220);
 const COLOR_USER: Color = Color::Rgb(91, 93, 99); //rgb(91, 93, 99)
 
 const COLOR_SIZE: Color = COLOR_QUERY;
+
+// Horizontal scroll bar
+const COLOR_HORIZONTAL_SCROLLBAR_TRACK: Color = Color::Rgb(45, 50, 60);
+
+const COLOR_HORIZONTAL_SCROLLBAR_THUMB: Color = COLOR_FRAME;
+
+/*
+ * Large-Tree policy dialogs deliberately use one stable green accent.
+ *
+ * This is an informational boundary rather than a destructive error, so it
+ * should not inherit error-red styling from themes.
+ */
+const COLOR_TREE_POLICY: Color = Color::Rgb(90, 205, 130);
+
+/*
+ * Scry's complete interface requires enough space for its fixed-width footer,
+ * optional panels, and modal dialogs to remain readable.
+ *
+ * Below this geometry the ordinary interface is replaced by a resize notice
+ * rather than allowing panels and text to overlap or truncate unpredictably.
+ */
+pub const MIN_TERMINAL_WIDTH: u16 = 110;
+
+pub const MIN_TERMINAL_HEIGHT: u16 = 22;
+
+const SCRY_LOGO_FULL: &[&str] = &[
+    " ██████╗  ██████╗ ██████╗ ██╗   ██╗",
+    "██╔════╝ ██╔════╝ ██╔══██╗╚██╗ ██╔╝",
+    "███████╗ ██║      ██████╔╝ ╚████╔╝ ",
+    "╚════██║ ██║      ██╔══██╗  ╚██╔╝  ",
+    "███████║ ╚██████╗ ██║  ██║   ██║   ",
+    "╚══════╝  ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ",
+];
+
+const FULL_LOGO_MIN_WIDTH: u16 = 70;
+const FULL_LOGO_MIN_HEIGHT: u16 = 16;
+
+const COMPACT_LOGO_MIN_WIDTH: u16 = 28;
+const COMPACT_LOGO_MIN_HEIGHT: u16 = 9;
 
 /*
  * Permissions and modification dates use fixed-width formats:
@@ -87,7 +127,14 @@ const HOME_BUTTON_RIGHT_BRACKET: &str = " ]";
  * The limits prevent unusually long values from consuming the filesystem
  * panel.
  */
-const SIZE_COLUMN_MIN_WIDTH: u16 = 4;
+/*
+ * Keep the Size column at one stable width.
+ *
+ * Recalculating it from only the visible viewport during rapid navigation or
+ * scrollbar dragging made the complete Metadata panel repeatedly contract and
+ * expand as differently sized values entered the screen.
+ */
+const SIZE_COLUMN_MIN_WIDTH: u16 = 10;
 
 const SIZE_COLUMN_MAX_WIDTH: u16 = 10;
 
@@ -128,6 +175,24 @@ pub struct TransferUiRegions {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+pub struct DeletionUiRegions {
+    pub delete: Rect,
+
+    pub cancel: Rect,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TreeExpandAllUiRegions {
+    pub warning_checkbox: Option<Rect>,
+
+    pub expand_all: Option<Rect>,
+
+    pub cancel: Option<Rect>,
+
+    pub ok: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ConnectionUiRegions {
     pub profiles: Rect,
 
@@ -162,13 +227,23 @@ pub struct UiRegions {
 
     pub home_button: Rect,
 
+    pub horizontal_scrollbar: Option<Rect>,
+
     pub file_info_close: Option<Rect>,
 
     pub help_scrollbar: Option<Rect>,
 
+    pub help_tips_link: Option<Rect>,
+
+    pub help_top_link: Option<Rect>,
+
     pub connection: Option<ConnectionUiRegions>,
 
     pub transfer: Option<TransferUiRegions>,
+
+    pub deletion: Option<DeletionUiRegions>,
+
+    pub tree_expand_all: Option<TreeExpandAllUiRegions>,
 
     pub remote_index_setup: Option<RemoteIndexSetupUiRegions>,
 }
@@ -184,14 +259,164 @@ pub struct RemoteIndexSetupUiRegions {
     pub cancel: Rect,
 }
 
+fn full_logo_lines() -> Vec<Line<'static>> {
+    const LOGO_COLORS: [Color; 6] = [
+        Color::Rgb(225, 215, 245),
+        Color::Rgb(195, 165, 235),
+        Color::Rgb(170, 125, 225),
+        Color::Rgb(145, 95, 210),
+        Color::Rgb(120, 70, 195),
+        Color::Rgb(95, 55, 170),
+    ];
+
+    SCRY_LOGO_FULL
+        .iter()
+        .zip(LOGO_COLORS)
+        .map(|(text, color)| {
+            Line::styled(
+                (*text).to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center)
+        })
+        .collect()
+}
+
+fn compact_logo_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("┌─ ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            "Scry",
+            Style::default()
+                .fg(Color::Rgb(160, 110, 220))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ─┐", Style::default().fg(COLOR_MUTED)),
+    ])
+    .alignment(Alignment::Center)
+}
+
+pub fn terminal_size_is_sufficient(width: u16, height: u16) -> bool {
+    width >= MIN_TERMINAL_WIDTH && height >= MIN_TERMINAL_HEIGHT
+}
+
+fn render_terminal_too_small(frame: &mut Frame, area: Rect) {
+    let use_full_logo = area.width >= FULL_LOGO_MIN_WIDTH && area.height >= FULL_LOGO_MIN_HEIGHT;
+
+    let use_compact_logo = !use_full_logo
+        && area.width >= COMPACT_LOGO_MIN_WIDTH
+        && area.height >= COMPACT_LOGO_MIN_HEIGHT;
+
+    let mut lines = Vec::new();
+
+    if use_full_logo {
+        lines.extend(full_logo_lines());
+
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(""));
+    } else if use_compact_logo {
+        lines.push(compact_logo_line());
+
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(
+        Line::styled(
+            "Scry requires a larger terminal.",
+            Style::default()
+                .fg(COLOR_TREE_POLICY)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            format!(
+                "Minimum size: {} × {}",
+                MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT,
+            ),
+            Style::default().fg(COLOR_FILE),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(
+        Line::from(vec![
+            Span::styled("Current size: ", Style::default().fg(COLOR_FILE)),
+            Span::styled(
+                area.width.to_string(),
+                Style::default()
+                    .fg(COLOR_ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" × ", Style::default().fg(COLOR_FILE)),
+            Span::styled(
+                area.height.to_string(),
+                Style::default()
+                    .fg(COLOR_ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Please enlarge the terminal window.",
+            Style::default().fg(COLOR_MUTED),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    let content_height = lines.len().min(u16::MAX as usize) as u16;
+
+    let message_area = Rect {
+        x: area.x,
+
+        y: area
+            .y
+            .saturating_add(area.height.saturating_sub(content_height) / 2),
+
+        width: area.width,
+
+        height: content_height.min(area.height),
+    };
+
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        message_area,
+    );
+}
+
 pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
+    let area = frame.area();
+
+    if !terminal_size_is_sufficient(area.width, area.height) {
+        render_terminal_too_small(frame, area);
+
+        return UiRegions::default();
+    }
+
     let mut help_scrollbar_region = None;
+
+    let mut help_tips_link_region = None;
+
+    let mut help_top_link_region = None;
 
     let mut connection_regions = None;
 
     let mut transfer_regions = None;
 
     let mut file_info_close_region = None;
+
+    let mut deletion_regions = None;
+
+    let mut tree_expand_all_regions = None;
 
     let mut remote_index_setup_regions = None;
 
@@ -306,6 +531,9 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
         height: 1,
     };
 
+    let horizontal_scrollbar =
+        render_horizontal_entries_scrollbar(frame, app, entries_area, home_button);
+
     if let Some(area) = selection_area {
         render_selection(frame, app, area);
     }
@@ -313,7 +541,13 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
     render_footer(frame, app, footer_area);
 
     if app.help_visible() {
-        help_scrollbar_region = render_help_overlay(frame, app, frame.area());
+        let help_regions = render_help_overlay(frame, app, frame.area());
+
+        help_scrollbar_region = help_regions.scrollbar;
+
+        help_tips_link_region = help_regions.tips_link;
+
+        help_top_link_region = help_regions.top_link;
     }
 
     if app.legend_visible() {
@@ -329,6 +563,10 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
             Some(render_remote_index_setup_overlay(frame, app, frame.area()));
     }
 
+    if app.tree_expand_all_dialog_visible() {
+        tree_expand_all_regions = Some(render_tree_expand_all_dialog(frame, app, frame.area()));
+    }
+
     if app.connection_visible() {
         connection_regions = Some(render_connection_overlay(frame, app, frame.area()));
     }
@@ -338,7 +576,7 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
     }
 
     if app.deletion_visible() {
-        render_deletion_overlay(frame, app, frame.area());
+        deletion_regions = render_deletion_overlay(frame, app, frame.area());
     }
 
     /*
@@ -356,11 +594,21 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
 
         home_button,
 
+        horizontal_scrollbar,
+
         help_scrollbar: help_scrollbar_region,
+
+        help_tips_link: help_tips_link_region,
+
+        help_top_link: help_top_link_region,
 
         connection: connection_regions,
 
         transfer: transfer_regions,
+
+        deletion: deletion_regions,
+
+        tree_expand_all: tree_expand_all_regions,
 
         remote_index_setup: remote_index_setup_regions,
 
@@ -371,20 +619,36 @@ pub fn render(frame: &mut Frame, app: &mut App) -> UiRegions {
 fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let theme = &app.theme;
 
-    let title = format!(
-        " Scry — {} — {} ",
-        app.source_label(),
-        app.current_directory.display(),
-    );
+    /*
+     * Keep Scry's name in the normal search-frame color.
+     *
+     * A live SSH source receives a white source-and-path label so local and
+     * connected browsing can be distinguished immediately. Disconnecting
+     * installs LocalSource again, so the ordinary theme color returns
+     * automatically.
+     */
+    let source_path_color = if app.source_is_remote() {
+        Color::White
+    } else {
+        theme.frames.search
+    };
 
-    let mode_label = match (
-        app.search_mode,
-        app.recursive_mode,
-        app.sort_descending,
-    ) {
+    let title = Line::from(vec![
+        Span::styled(" Scry — ", Style::default().fg(theme.frames.search)),
+        Span::styled(
+            format!(
+                "{} — {} ",
+                app.source_label(),
+                app.current_directory.display(),
+            ),
+            Style::default().fg(source_path_color),
+        ),
+    ]);
+
+    let base_mode_label = match (app.search_mode, app.recursive_mode, app.sort_descending) {
         (SearchMode::Exact, false, false) => "Exact",
 
-        (SearchMode::Exact, false, true) => "Exact+Reverse",
+        (SearchMode::Exact, false, true) => "Reverse",
 
         (SearchMode::Fuzzy, false, false) => "Fuzzy",
 
@@ -399,14 +663,20 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         (SearchMode::Fuzzy, true, true) => "Fuzzy+Recursive+Reverse",
     };
 
-    let placeholder = match (app.search_mode, app.recursive_mode) {
-        (SearchMode::Exact, false) => {
-            r#"type to filter — e.g. "hello", "ext:rs", "type:source""#
+    let mode_label = if app.hidden_only_active() {
+        if base_mode_label == "Exact" {
+            "HiddenOnly".to_string()
+        } else {
+            format!("{}+HiddenOnly", base_mode_label)
         }
+    } else {
+        base_mode_label.to_string()
+    };
 
-        (SearchMode::Fuzzy, false) => {
-            r#"type to search fuzzily — e.g. "help", "hlep", "-java""#
-        }
+    let placeholder = match (app.search_mode, app.recursive_mode) {
+        (SearchMode::Exact, false) => r#"type to filter — e.g. "hello", "ext:rs", "type:source""#,
+
+        (SearchMode::Fuzzy, false) => r#"type to search fuzzily — e.g. "help", "hlep", "-java""#,
 
         (SearchMode::Exact, true) => {
             r#"type to filter recursively — e.g. "config", "type:dir", "+rust""#
@@ -417,10 +687,10 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
     };
 
-    let emphasized_mode =
-        app.search_mode == SearchMode::Fuzzy
-            || app.recursive_mode
-            || app.sort_descending;
+    let emphasized_mode = app.search_mode == SearchMode::Fuzzy
+        || app.recursive_mode
+        || app.sort_descending
+        || app.hidden_only_active();
 
     let mode_color = if emphasized_mode {
         theme.ui.query
@@ -431,7 +701,7 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let search = Paragraph::new(Line::from(vec![
         Span::styled("Search [", Style::default().fg(theme.ui.muted)),
         Span::styled(
-            mode_label,
+            &mode_label,
             Style::default()
                 .fg(mode_color)
                 .add_modifier(if emphasized_mode {
@@ -447,7 +717,11 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             } else {
                 &app.query
             },
-            Style::default().fg(theme.ui.query),
+            Style::default().fg(if app.query.is_empty() {
+                theme.ui.muted
+            } else {
+                theme.ui.query
+            }),
         ),
     ]))
     .block(
@@ -485,6 +759,25 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 area.y.saturating_add(1),
             ));
         }
+    }
+}
+
+/*
+ * Resolve the filename color without changing structural directory/symlink
+ * semantics.
+ *
+ * When classified colors are disabled, every ordinary file returns to the
+ * theme's established neutral file color.
+ */
+fn entry_name_color(entry: &FileEntry, show_file_colors: bool, theme: &Theme) -> Color {
+    if entry.is_directory {
+        theme.ui.directory
+    } else if entry.is_symlink {
+        theme.ui.symlink
+    } else if show_file_colors {
+        theme.file_class_color(entry.class)
+    } else {
+        theme.ui.file
     }
 }
 
@@ -532,13 +825,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let age = format_file_age(entry.modified_time);
 
-    let name_color = if entry.is_directory {
-        theme.ui.directory
-    } else if entry.is_symlink {
-        theme.ui.symlink
-    } else {
-        theme.ui.file
-    };
+    let name_color = entry_name_color(&entry, app.show_file_colors, &theme);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -601,7 +888,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         frame,
         second_row[0],
         "Modified",
-        entry.modified.clone(),
+        format_modified_date(entry.modified_time),
         theme.ui.date,
         &theme,
     );
@@ -620,7 +907,9 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(rows[2]);
 
-    render_detail_permissions(frame, third_row[0], &entry.permissions, &theme);
+    let permissions = format_permissions(entry.kind, entry.permissions_mode);
+
+    render_detail_permissions(frame, third_row[0], &permissions, &theme);
 
     render_detail_value(
         frame,
@@ -699,6 +988,16 @@ fn format_file_age(modified_time: Option<SystemTime>) -> String {
             format!("in {}", format_age_duration(error.duration(),),)
         }
     }
+}
+
+fn format_modified_date(modified_time: Option<SystemTime>) -> String {
+    let Some(modified_time) = modified_time else {
+        return "—".to_string();
+    };
+
+    let modified: DateTime<Local> = DateTime::from(modified_time);
+
+    modified.format("%Y-%m-%d %H:%M").to_string()
 }
 
 fn format_past_age(age: Duration) -> String {
@@ -805,6 +1104,261 @@ fn render_entries(frame: &mut Frame, app: &mut App, area: Rect) -> Rect {
     }
 }
 
+fn transient_layout_measurement_active(app: &App) -> bool {
+    app.scrollbar_drag_active || app.rapid_navigation_active
+}
+
+/*
+ * Choose which result positions may participate in redraw-time layout
+ * measurement.
+ *
+ * Ordinary rendering examines the complete result set so horizontal scrolling
+ * and metadata widths remain globally accurate.
+ *
+ * During active vertical scrollbar dragging, inspecting tens of thousands of
+ * entries for every mouse event creates a severe event backlog. Restrict those
+ * temporary measurements to the visible viewport instead.
+ */
+fn layout_measurement_range(app: &App, total_entries: usize) -> std::ops::Range<usize> {
+    if !transient_layout_measurement_active(app) {
+        return 0..total_entries;
+    }
+
+    let start = app.list_offset.min(total_entries);
+
+    let end = start
+        .saturating_add(app.viewport_rows.max(1))
+        .min(total_entries);
+
+    start..end
+}
+
+/*
+ * Width of the widest filesystem row in the complete filtered result.
+ *
+ * This deliberately examines every filtered entry rather than only the rows
+ * inside the current vertical viewport. A long path farther down the result
+ * set must establish the horizontal scrolling range immediately.
+ */
+fn widest_filesystem_row(app: &App) -> usize {
+    match app.view_mode {
+        ViewMode::List => {
+            let positions = layout_measurement_range(app, app.filtered_indices.len());
+
+            positions
+                .filter_map(|position| app.entry_at_filtered_position(position))
+                .map(|entry| list_entry_display_width(app, entry))
+                .max()
+                .unwrap_or(0)
+        }
+
+        ViewMode::Tree => {
+            let positions = layout_measurement_range(app, app.filtered_tree_indices.len());
+
+            positions
+                .filter_map(|position| app.tree_row_at_filtered_position(position))
+                .map(|row| tree_entry_display_width(app, row))
+                .max()
+                .unwrap_or(0)
+        }
+    }
+}
+
+fn list_entry_display_width(app: &App, entry: &FileEntry) -> usize {
+    /*
+     * Stateful List highlight symbol:
+     *
+     *     ▶
+     *
+     * One additional cell separates it from the rendered entry.
+     */
+    let selection_width = 1;
+
+    let mark_width = if app.is_path_marked(&entry.path) {
+        2
+    } else {
+        0
+    };
+
+    let marker_width = 2;
+
+    let icon_width = if app.show_icons { 2 } else { 0 };
+
+    let path_width = entry.relative_path.to_string_lossy().chars().count();
+
+    let suffix_width = usize::from(entry.is_directory || entry.is_symlink);
+
+    selection_width + mark_width + marker_width + icon_width + path_width + suffix_width
+}
+
+fn tree_entry_display_width(app: &App, row: &TreeRow) -> usize {
+    let selection_width = 1;
+
+    let indentation_width = row.ancestor_has_more.len().saturating_mul(3);
+
+    /*
+     * Branch connector:
+     *
+     *     ├─
+     *     └─
+     */
+    let branch_width = 3;
+
+    let mark_width = if app.is_path_marked(&row.entry.path) {
+        2
+    } else {
+        0
+    };
+
+    let marker_width = 2;
+
+    let icon_width = if app.show_icons { 2 } else { 0 };
+
+    let name_width = row.entry.name.chars().count();
+
+    /*
+     * Directories and symbolic links append a visual suffix. A closed
+     * non-empty directory may use " →", which is two cells.
+     */
+    let suffix_width = if row.entry.is_directory && !row.expanded {
+        2
+    } else if row.entry.is_directory || row.entry.is_symlink {
+        1
+    } else {
+        0
+    };
+
+    selection_width
+        + indentation_width
+        + branch_width
+        + mark_width
+        + marker_width
+        + icon_width
+        + name_width
+        + suffix_width
+}
+
+fn render_horizontal_entries_scrollbar(
+    frame: &mut Frame,
+    app: &mut App,
+    filesystem_area: Rect,
+    home_button: Rect,
+) -> Option<Rect> {
+    /*
+     * The filesystem content area excludes its two border cells.
+     *
+     * The ordinary vertical scrollbar occupies the rightmost frame column, not
+     * this inner content width.
+     */
+    let viewport_width = filesystem_area.width.saturating_sub(2) as usize;
+
+    let measured_content_width = widest_filesystem_row(app);
+
+    /*
+     * A viewport-only drag measurement must never shrink the previously known
+     * complete horizontal range.
+     *
+     * Otherwise a page containing short paths could clamp horizontal_offset while
+     * the vertical handle is moving.
+     */
+    let content_width = if transient_layout_measurement_active(app) {
+        measured_content_width.max(viewport_width.saturating_add(app.horizontal_max_offset))
+    } else {
+        measured_content_width
+    };
+
+    app.horizontal_max_offset = content_width.saturating_sub(viewport_width);
+
+    app.horizontal_offset = app.horizontal_offset.min(app.horizontal_max_offset);
+
+    /*
+     * No overflow means no control.
+     *
+     * Resetting the offset prevents stale horizontal displacement after a
+     * query, resize, mode change, or column change makes every row fit again.
+     */
+    if app.horizontal_max_offset == 0 {
+        app.horizontal_offset = 0;
+
+        return None;
+    }
+
+    /*
+     * Keep the complete Home control and one separating border cell intact.
+     */
+    let track_x = home_button
+        .x
+        .saturating_add(home_button.width)
+        .saturating_add(1);
+
+    let right_border_x = filesystem_area
+        .x
+        .saturating_add(filesystem_area.width.saturating_sub(1));
+
+    let track_width = right_border_x.saturating_sub(track_x);
+
+    /*
+     * Very narrow terminals may leave no useful room after the Home button.
+     */
+    if track_width < 3 {
+        return None;
+    }
+
+    let track_area = Rect {
+        x: track_x,
+
+        y: filesystem_area
+            .y
+            .saturating_add(filesystem_area.height.saturating_sub(1)),
+
+        width: track_width,
+
+        height: 1,
+    };
+
+    const HORIZONTAL_THUMB_WIDTH: u16 = 5;
+
+    let thumb_width = HORIZONTAL_THUMB_WIDTH.min(track_area.width);
+
+    let thumb_travel = track_area.width.saturating_sub(thumb_width);
+
+    let thumb_offset = if app.horizontal_max_offset == 0 || thumb_travel == 0 {
+        0
+    } else {
+        let numerator = app.horizontal_offset.saturating_mul(thumb_travel as usize);
+
+        numerator.saturating_add(app.horizontal_max_offset / 2) / app.horizontal_max_offset
+    };
+
+    let thumb_offset = u16::try_from(thumb_offset)
+        .unwrap_or(thumb_travel)
+        .min(thumb_travel);
+
+    let track = Line::from(vec![
+        Span::styled(
+            "─".repeat(thumb_offset as usize),
+            Style::default().fg(COLOR_HORIZONTAL_SCROLLBAR_TRACK),
+        ),
+        Span::styled(
+            "◼".repeat(thumb_width as usize),
+            Style::default().fg(COLOR_HORIZONTAL_SCROLLBAR_THUMB),
+        ),
+        Span::styled(
+            "─".repeat(
+                track_area
+                    .width
+                    .saturating_sub(thumb_offset)
+                    .saturating_sub(thumb_width) as usize,
+            ),
+            Style::default().fg(COLOR_HORIZONTAL_SCROLLBAR_TRACK),
+        ),
+    ]);
+
+    frame.render_widget(Paragraph::new(track), track_area);
+
+    Some(track_area)
+}
+
 fn metadata_visible(app: &App) -> bool {
     app.show_columns && (app.show_permissions || app.show_size || app.show_date || app.show_user)
 }
@@ -819,24 +1373,32 @@ fn metadata_widths(app: &mut App) -> MetadataWidths {
      * immutable entry borrow while resolving the displayed owner.
      */
     let metadata: Vec<(u64, bool, u32)> = match app.view_mode {
-        ViewMode::List => (0..app.filtered_indices.len())
-            .filter_map(|position| {
-                app.entry_at_filtered_position(position)
-                    .map(|entry| (entry.size_bytes, entry.is_directory, entry.owner_id))
-            })
-            .collect(),
+        ViewMode::List => {
+            let positions = layout_measurement_range(app, app.filtered_indices.len());
 
-        ViewMode::Tree => (0..app.filtered_tree_indices.len())
-            .filter_map(|position| {
-                app.tree_row_at_filtered_position(position).map(|row| {
-                    (
-                        row.entry.size_bytes,
-                        row.entry.is_directory,
-                        row.entry.owner_id,
-                    )
+            positions
+                .filter_map(|position| {
+                    app.entry_at_filtered_position(position)
+                        .map(|entry| (entry.size_bytes, entry.is_directory, entry.owner_id))
                 })
-            })
-            .collect(),
+                .collect()
+        }
+
+        ViewMode::Tree => {
+            let positions = layout_measurement_range(app, app.filtered_tree_indices.len());
+
+            positions
+                .filter_map(|position| {
+                    app.tree_row_at_filtered_position(position).map(|row| {
+                        (
+                            row.entry.size_bytes,
+                            row.entry.is_directory,
+                            row.entry.owner_id,
+                        )
+                    })
+                })
+                .collect()
+        }
     };
 
     if app.show_size {
@@ -972,28 +1534,36 @@ fn render_metadata(
         let metadata = match app.view_mode {
             ViewMode::List => app.entry_at_filtered_position(position).map(|entry| {
                 (
-                    entry.permissions.clone(),
+                    entry.kind,
+                    entry.permissions_mode,
                     entry.size_bytes,
                     entry.is_directory,
-                    entry.modified.clone(),
+                    entry.modified_time,
                     entry.owner_id,
                 )
             }),
 
             ViewMode::Tree => app.tree_row_at_filtered_position(position).map(|row| {
                 (
-                    row.entry.permissions.clone(),
+                    row.entry.kind,
+                    row.entry.permissions_mode,
                     row.entry.size_bytes,
                     row.entry.is_directory,
-                    row.entry.modified.clone(),
+                    row.entry.modified_time,
                     row.entry.owner_id,
                 )
             }),
         };
 
-        let Some((permissions, size_bytes, is_directory, modified, owner_id)) = metadata else {
+        let Some((kind, permissions_mode, size_bytes, is_directory, modified_time, owner_id)) =
+            metadata
+        else {
             continue;
         };
+
+        let permissions = format_permissions(kind, permissions_mode);
+
+        let modified = format_modified_date(modified_time);
 
         let owner = if app.show_user {
             Some(app.owner_name(owner_id))
@@ -1062,6 +1632,45 @@ fn metadata_title(app: &App, widths: MetadataWidths) -> String {
     }
 
     format!(" {} ", columns.join("  "),)
+}
+
+/*
+ * Remove `offset` displayed characters from the left side of a styled row.
+ *
+ * Styles are preserved span by span, so query highlights, permission colors,
+ * icons, Tree connectors, marks, and ordinary entry colors survive horizontal
+ * scrolling.
+ *
+ * Ratatui clips the remaining right edge to the widget's inner rectangle.
+ */
+fn horizontally_shift_spans(spans: Vec<Span<'static>>, offset: usize) -> Vec<Span<'static>> {
+    if offset == 0 {
+        return spans;
+    }
+
+    let mut characters_to_skip = offset;
+
+    let mut shifted = Vec::new();
+
+    for span in spans {
+        let character_count = span.content.chars().count();
+
+        if characters_to_skip >= character_count {
+            characters_to_skip -= character_count;
+
+            continue;
+        }
+
+        let content: String = span.content.chars().skip(characters_to_skip).collect();
+
+        characters_to_skip = 0;
+
+        if !content.is_empty() {
+            shifted.push(Span::styled(content, span.style));
+        }
+    }
+
+    shifted
 }
 
 fn metadata_list_item(
@@ -1279,6 +1888,30 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let highlight_terms = parsed_query.highlight_terms();
 
+    let extension_highlights = parsed_query.extension_highlights();
+
+    /*
+     * Compact +terms become fuzzy only while Fuzzy mode is active.
+     *
+     * Keep them separate from highlight_terms so Boolean operands and other exact
+     * visible terms retain their established substring highlighting.
+     */
+    let fuzzy_signed_highlight_terms = if app.search_mode == SearchMode::Fuzzy {
+        let mut terms = parsed_query.fuzzy_signed_highlight_terms();
+
+        /*
+         * Boolean operands use Fuzzy painting in the UI but must not enter the
+         * worker's cumulative compact +term requirement list.
+         */
+        terms.extend(parsed_query.fuzzy_boolean_highlight_terms());
+
+        terms.dedup();
+
+        terms
+    } else {
+        Vec::new()
+    };
+
     /*
      * The ordinary fuzzy search text retains scattered-character highlighting.
      *
@@ -1309,16 +1942,20 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
         let marked = app.is_path_marked(&entry.path);
 
-        let has_content = entry.is_directory && app.directory_has_content(&entry.path);
+        let has_content = entry.is_directory && app.directory_has_content_for_render(&entry.path);
 
         items.push(entry_list_item(
             &entry,
             &highlight_terms,
+            &fuzzy_signed_highlight_terms,
             fuzzy_highlight_query,
+            &extension_highlights,
             has_content,
             marked,
             app.show_icons,
+            app.show_file_colors,
             &app.theme,
+            app.horizontal_offset,
         ));
     }
 
@@ -1328,16 +1965,7 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             app.filtered_indices.len(),
         )
     } else if app.recursive_search_active() {
-        if app.scan_in_progress {
-            match app.search_mode {
-                SearchMode::Exact => "Recursive results — updating…".to_string(),
-
-                SearchMode::Fuzzy => format!(
-                    "Fuzzy results — updating… — best {}",
-                    app.filtered_indices.len(),
-                ),
-            }
-        } else if app.search_mode == SearchMode::Fuzzy {
+        if app.search_mode == SearchMode::Fuzzy {
             if app.recursive_scan_partial {
                 format!(
                     "Fuzzy results — best {} — partial index",
@@ -1353,32 +1981,36 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         "Entries".to_string()
     };
 
-    let sort_arrow = if app.sort_descending { "↓" } else { "↑" };
-
     let marked_title = if app.marked_count() == 0 {
         String::new()
     } else {
         format!(" — {} marked", app.marked_count())
     };
 
+    let ordering_label = if app.search_mode == SearchMode::Fuzzy {
+        "Relevance".to_string()
+    } else {
+        let sort_arrow = if app.sort_descending { "↓" } else { "↑" };
+
+        format!("{} {}", app.sort_mode.label(), sort_arrow)
+    };
+
     let title = if app.scan_in_progress && app.recursive_search_active() {
         format!(
-            " {}{} — {} shown — {} {} ",
+            " {}{} — {} shown — {} ",
             heading,
             marked_title,
             app.filtered_indices.len(),
-            app.sort_mode.label(),
-            sort_arrow,
+            ordering_label,
         )
     } else {
         format!(
-            " {}{} — {} shown / {} scanned — {} {} ",
+            " {}{} — {} shown / {} scanned — {} ",
             heading,
             marked_title,
             app.filtered_indices.len(),
             app.active_entry_count(),
-            app.sort_mode.label(),
-            sort_arrow,
+            ordering_label,
         )
     };
 
@@ -1400,7 +2032,7 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let mut state = ListState::default();
 
-    if !app.filtered_indices.is_empty() && !app.scrollbar_drag_active {
+    if !app.filtered_indices.is_empty() {
         state.select(Some(app.selected.saturating_sub(window_start)));
     }
 
@@ -1490,6 +2122,24 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let highlight_terms = parsed_query.highlight_terms();
 
+    let extension_highlights = parsed_query.extension_highlights();
+
+    let fuzzy_signed_highlight_terms = if app.search_mode == SearchMode::Fuzzy {
+        let mut terms = parsed_query.fuzzy_signed_highlight_terms();
+
+        /*
+         * Boolean operands use Fuzzy painting in the UI but must not enter the
+         * worker's cumulative compact +term requirement list.
+         */
+        terms.extend(parsed_query.fuzzy_boolean_highlight_terms());
+
+        terms.dedup();
+
+        terms
+    } else {
+        Vec::new()
+    };
+
     let fuzzy_highlight_query = if app.search_mode == SearchMode::Fuzzy
         && !parsed_query.search_text().is_empty()
         && parsed_query.search_text() != "."
@@ -1508,16 +2158,21 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
         let marked = app.is_path_marked(&row.entry.path);
 
-        let has_content = row.entry.is_directory && app.directory_has_content(&row.entry.path);
+        let has_content =
+            row.entry.is_directory && app.tree_directory_has_visible_children(&row.entry.path);
 
         items.push(tree_list_item(
             &row,
             &highlight_terms,
+            &fuzzy_signed_highlight_terms,
             fuzzy_highlight_query,
+            &extension_highlights,
             has_content,
             marked,
             app.show_icons,
+            app.show_file_colors,
             &app.theme,
+            app.horizontal_offset,
         ));
     }
 
@@ -1529,42 +2184,32 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         format!(" — {} marked", app.marked_count())
     };
 
-    let title = if app.scan_in_progress && app.recursive_search_active() {
+    let tree_kind = if app.recursive_search_active() && app.recursive_scan_partial {
+        "Tree — partial index"
+    } else {
+        "Tree"
+    };
+
+    let title = if app.exact_tree_limit_reached {
         format!(
-            " Recursive Tree{} — scanning {} entries… — {} {} ",
+            " {}{} — {} matches capped / {} nodes — limit reached — {} {} ",
+            tree_kind,
             marked_title,
-            app.recursive_entries.len(),
+            app.exact_tree_match_limit,
+            app.tree_rows.len(),
             app.sort_mode.label(),
             sort_arrow,
         )
     } else {
-        let tree_kind = if app.recursive_search_active() && app.recursive_scan_partial {
-            "Tree — partial index"
-        } else {
-            "Tree"
-        };
-
-        if app.exact_tree_limit_reached {
-            format!(
-                " {}{} — {} matches capped / {} nodes — limit reached — {} {} ",
-                tree_kind,
-                marked_title,
-                EXACT_TREE_MATCH_LIMIT,
-                app.tree_rows.len(),
-                app.sort_mode.label(),
-                sort_arrow,
-            )
-        } else {
-            format!(
-                " {}{} — {} shown / {} nodes — {} {} ",
-                tree_kind,
-                marked_title,
-                app.filtered_tree_indices.len(),
-                app.tree_rows.len(),
-                app.sort_mode.label(),
-                sort_arrow,
-            )
-        }
+        format!(
+            " {}{} — {} shown / {} nodes — {} {} ",
+            tree_kind,
+            marked_title,
+            app.filtered_tree_indices.len(),
+            app.tree_rows.len(),
+            app.sort_mode.label(),
+            sort_arrow,
+        )
     };
 
     let list = List::new(items)
@@ -1585,7 +2230,7 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
 
     let mut state = ListState::default();
 
-    if !app.filtered_tree_indices.is_empty() && !app.scrollbar_drag_active {
+    if !app.filtered_tree_indices.is_empty() {
         state.select(Some(app.selected.saturating_sub(window_start)));
     }
 
@@ -1601,33 +2246,38 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tree_list_item(
     row: &TreeRow,
     highlight_terms: &[QueryHighlightTerm],
+    fuzzy_signed_highlight_terms: &[QueryHighlightTerm],
     fuzzy_highlight_query: Option<&str>,
+    extension_highlights: &[String],
     has_content: bool,
     marked: bool,
     show_icons: bool,
+    show_file_colors: bool,
     theme: &Theme,
+    horizontal_offset: usize,
 ) -> ListItem<'static> {
     let mut spans = Vec::new();
 
     for ancestor_has_more in &row.ancestor_has_more {
         spans.push(Span::styled(
-            if *ancestor_has_more { "│  " } else { "   " },
+            if *ancestor_has_more { "│ " } else { "  " },
             Style::default().fg(COLOR_MUTED),
         ));
     }
 
     spans.push(Span::styled(
-        if row.is_last { "└─ " } else { "├─ " },
+        if row.is_last { "└─" } else { "├─" },
         Style::default().fg(COLOR_MUTED),
     ));
 
-    let (marker, color, suffix) = if row.entry.is_directory {
+    let (marker, structural_color, suffix) = if row.entry.is_directory {
         (
-            if row.expanded { "▾ " } else { "▸ " },
-            COLOR_DIRECTORY,
+            if row.expanded { "▾" } else { "▸" },
+            theme.ui.directory,
             if has_content && !row.expanded {
                 " →"
             } else {
@@ -1635,12 +2285,21 @@ fn tree_list_item(
             },
         )
     } else if row.entry.is_symlink {
-        ("↪ ", COLOR_SYMLINK, "@")
+        ("↪ ", theme.ui.symlink, "@")
     } else {
-        ("  ", COLOR_FILE, "")
+        ("", theme.ui.file, "")
     };
 
-    spans.push(Span::styled(marker.to_string(), Style::default().fg(color)));
+    let name_color = entry_name_color(&row.entry, show_file_colors, theme);
+
+    /*
+     * Tree markers remain structural. Only the filename receives its FileClass
+     * color.
+     */
+    spans.push(Span::styled(
+        marker.to_string(),
+        Style::default().fg(structural_color),
+    ));
 
     if show_icons {
         spans.push(Span::styled(
@@ -1656,13 +2315,20 @@ fn tree_list_item(
     spans.extend(highlighted_query_spans(
         &row.entry.name,
         highlight_terms,
+        fuzzy_signed_highlight_terms,
         fuzzy_highlight_query,
-        color,
+        extension_highlights,
+        name_color,
     ));
 
     if !suffix.is_empty() {
-        spans.push(Span::styled(suffix.to_string(), Style::default().fg(color)));
+        spans.push(Span::styled(
+            suffix.to_string(),
+            Style::default().fg(structural_color),
+        ));
     }
+
+    let spans = horizontally_shift_spans(spans, horizontal_offset);
 
     ListItem::new(Line::from(spans))
 }
@@ -1799,24 +2465,38 @@ fn file_icon_color(entry: &FileEntry, theme: &Theme) -> Color {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn entry_list_item(
     entry: &FileEntry,
     highlight_terms: &[QueryHighlightTerm],
+    fuzzy_signed_highlight_terms: &[QueryHighlightTerm],
     fuzzy_highlight_query: Option<&str>,
+    extension_highlights: &[String],
     has_content: bool,
     marked: bool,
     show_icons: bool,
+    show_file_colors: bool,
     theme: &Theme,
+    horizontal_offset: usize,
 ) -> ListItem<'static> {
-    let (prefix, color, suffix) = if entry.is_directory {
-        ("▸", COLOR_DIRECTORY, if has_content { " →" } else { "/" })
+    let (prefix, structural_color, suffix) = if entry.is_directory {
+        (
+            "▸",
+            theme.ui.directory,
+            if has_content { " →" } else { "/" },
+        )
     } else if entry.is_symlink {
-        ("↪ ", COLOR_SYMLINK, "@")
+        ("↪ ", theme.ui.symlink, "@")
     } else {
-        (" ", COLOR_FILE, "")
+        (" ", theme.ui.file, "")
     };
 
-    let mut spans = vec![Span::styled(prefix.to_string(), Style::default().fg(color))];
+    let name_color = entry_name_color(entry, show_file_colors, theme);
+
+    let mut spans = vec![Span::styled(
+        prefix.to_string(),
+        Style::default().fg(structural_color),
+    )];
 
     if show_icons {
         spans.push(Span::styled(
@@ -1834,13 +2514,20 @@ fn entry_list_item(
     spans.extend(highlighted_query_spans(
         &display_path,
         highlight_terms,
+        fuzzy_signed_highlight_terms,
         fuzzy_highlight_query,
-        color,
+        extension_highlights,
+        name_color,
     ));
 
     if !suffix.is_empty() {
-        spans.push(Span::styled(suffix.to_string(), Style::default().fg(color)));
+        spans.push(Span::styled(
+            suffix.to_string(),
+            Style::default().fg(structural_color),
+        ));
     }
+
+    let spans = horizontally_shift_spans(spans, horizontal_offset);
 
     ListItem::new(Line::from(spans))
 }
@@ -1848,24 +2535,57 @@ fn entry_list_item(
 fn highlighted_query_spans(
     text: &str,
     terms: &[QueryHighlightTerm],
+    fuzzy_signed_terms: &[QueryHighlightTerm],
     fuzzy_query: Option<&str>,
+    extension_highlights: &[String],
     normal_color: Color,
 ) -> Vec<Span<'static>> {
     let mut ranges = Vec::new();
 
     /*
-     * Preserve Scry's existing scattered-character highlighting for the
-     * ordinary fuzzy query.
+     * Translate fuzzy character positions back into UTF-8 byte ranges used by
+     * Ratatui spans.
+     */
+    let character_ranges: Vec<(usize, usize)> = text
+        .char_indices()
+        .map(|(start, character)| (start, start + character.len_utf8()))
+        .collect();
+
+    /*
+     * Ordinary unsigned fuzzy query.
+     *
+     * Example:
+     *
+     *     hlep
+     *
+     * may highlight the corresponding scattered characters in "help".
      */
     if let Some(query) = fuzzy_query {
-        let positions = fuzzy_highlight_positions(text, query);
+        for position in fuzzy_highlight_positions(text, query) {
+            if let Some(range) = character_ranges.get(position) {
+                ranges.push(*range);
+            }
+        }
+    }
 
-        let character_ranges: Vec<(usize, usize)> = text
-            .char_indices()
-            .map(|(start, character)| (start, start + character.len_utf8()))
-            .collect();
+    /*
+     * Positive compact fuzzy operands.
+     *
+     * Example:
+     *
+     *     +clagn
+     *
+     * may highlight the characters selected from "clang".
+     *
+     * Negative terms remain invisible because they describe exclusion rather
+     * than the reason a displayed result was accepted.
+     */
+    for term in fuzzy_signed_terms {
+        if term.value.is_empty() {
+            continue;
+        }
 
-        for position in positions {
+        for position in fuzzy_highlight_positions(text, &term.value) {
             if let Some(range) = character_ranges.get(position) {
                 ranges.push(*range);
             }
@@ -1878,18 +2598,52 @@ fn highlighted_query_spans(
         }
 
         /*
-         * The ordinary fuzzy term was already represented by scattered
-         * positions above. Do not additionally paint it as a contiguous
-         * substring.
+         * Fuzzy terms were already represented by scattered character ranges.
+         *
+         * Do not additionally attempt to paint them as contiguous substrings.
          */
-        if fuzzy_query.is_some_and(|query| !term.case_sensitive && term.value == query) {
+        let is_unsigned_fuzzy_query =
+            fuzzy_query.is_some_and(|query| !term.case_sensitive && term.value == query);
+
+        let is_signed_fuzzy_term = fuzzy_signed_terms
+            .iter()
+            .any(|fuzzy_term| fuzzy_term == term);
+
+        if is_unsigned_fuzzy_query || is_signed_fuzzy_term {
             continue;
         }
 
+        /*
+         * Boolean operands and ordinary Exact-mode +terms retain their existing
+         * contiguous substring highlighting.
+         */
         if term.case_sensitive {
             collect_sensitive_match_ranges(text, &term.value, &mut ranges);
         } else {
             collect_insensitive_match_ranges(text, &term.value, &mut ranges);
+        }
+    }
+
+    /*
+     * ext:value highlights only the final filename extension, including its dot.
+     *
+     * Case-insensitive comparison matches the extension-filter semantics while the
+     * byte range preserves the entry's original spelling.
+     */
+    for extension in extension_highlights {
+        let suffix = format!(".{}", extension);
+
+        if text.len() < suffix.len() {
+            continue;
+        }
+
+        let suffix_start = text.len() - suffix.len();
+
+        if text
+            .get(suffix_start..)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&suffix))
+        {
+            ranges.push((suffix_start, text.len()));
         }
     }
 
@@ -1901,11 +2655,8 @@ fn highlighted_query_spans(
     }
 
     /*
-     * Combine overlaps such as:
-     *
-     *     +bas +bash
-     *
-     * so "bash" becomes one clean highlighted span.
+     * Merge adjacent and overlapping character ranges into clean highlighted
+     * spans.
      */
     ranges.sort_unstable_by_key(|range| range.0);
 
@@ -2012,6 +2763,35 @@ fn fold_with_source_ranges(text: &str) -> Vec<(char, usize, usize)> {
     folded
 }
 
+/*
+ * Interpolate the remote-index loading message between a readable dim amber and
+ * a bright golden amber.
+ *
+ * The minimum never approaches black, so a temporarily blocked UI thread freezes
+ * on visible text rather than an empty-looking Selection panel.
+ */
+fn remote_index_pulse_color(level: u8) -> Color {
+    const DIM: (u8, u8, u8) = (120, 85, 25);
+
+    const BRIGHT: (u8, u8, u8) = (245, 185, 65);
+
+    let interpolate = |dim: u8, bright: u8| {
+        let range = u16::from(bright.saturating_sub(dim));
+
+        let addition = range
+            .saturating_mul(u16::from(level))
+            .saturating_div(u16::from(u8::MAX));
+
+        dim.saturating_add(addition as u8)
+    };
+
+    Color::Rgb(
+        interpolate(DIM.0, BRIGHT.0),
+        interpolate(DIM.1, BRIGHT.1),
+        interpolate(DIM.2, BRIGHT.2),
+    )
+}
+
 fn render_selection(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let theme = app.theme;
 
@@ -2020,7 +2800,13 @@ fn render_selection(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rec
     let content = if let Some(message) = &app.error_message {
         Line::styled(message.clone(), Style::default().fg(theme.ui.error))
     } else if let Some(status) = &app.status_message {
-        Line::styled(status.clone(), Style::default().fg(theme.ui.status))
+        let status_color = match app.status_message_pulse_level() {
+            Some(level) => remote_index_pulse_color(level),
+
+            None => theme.ui.status,
+        };
+
+        Line::styled(status.clone(), Style::default().fg(status_color))
     } else if let Some(entry) = app.selected_entry() {
         Line::styled(
             entry.path.display().to_string(),
@@ -2081,18 +2867,18 @@ fn render_file_info_overlay(frame: &mut Frame, app: &App, area: Rect) -> Option<
      */
     let popup_width = area
         .width
-        .saturating_mul(86)
+        .saturating_mul(80)
         .saturating_div(100)
-        .clamp(72, 124)
-        .min(area.width.saturating_sub(4).max(1));
+        .max(72)
+        .min(area.width.saturating_sub(8).max(1));
 
     /*
-     * The ordinary landscape layout needs twenty-two rows.
+     * The ordinary landscape layout needs twenty-four rows.
      *
      * Very short terminals surrender only a small outer margin rather than
      * producing invalid geometry.
      */
-    let popup_height = 22_u16.min(area.height.saturating_sub(2).max(1));
+    let popup_height = 24_u16.min(area.height.saturating_sub(2).max(1));
 
     let popup_area = centered_rect(popup_width, popup_height, area);
 
@@ -2125,13 +2911,15 @@ fn render_file_info_overlay(frame: &mut Frame, app: &App, area: Rect) -> Option<
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(12),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // Path
+            Constraint::Length(1), // blank
+            Constraint::Min(12),   // two-column body
+            Constraint::Length(1), // Link target
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // Location/context
+            Constraint::Length(1), // Status
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // Close
         ])
         .split(inner);
 
@@ -2146,18 +2934,20 @@ fn render_file_info_overlay(frame: &mut Frame, app: &App, area: Rect) -> Option<
 
     render_file_info_right_column(frame, columns[1], info, theme);
 
-    render_file_info_context_line(frame, rows[4], info, theme);
+    render_file_info_link_path(frame, rows[3], info, theme);
 
-    render_file_info_status(frame, rows[5], state, theme);
+    render_file_info_context_line(frame, rows[5], info, theme);
 
-    let close_width = 11_u16.min(rows[6].width);
+    render_file_info_status(frame, rows[6], state, theme);
+
+    let close_width = 11_u16.min(rows[8].width);
 
     let close_area = Rect {
-        x: rows[6]
+        x: rows[8]
             .x
-            .saturating_add(rows[6].width.saturating_sub(close_width) / 2),
+            .saturating_add(rows[8].width.saturating_sub(close_width) / 2),
 
-        y: rows[6].y,
+        y: rows[8].y,
 
         width: close_width,
 
@@ -2267,7 +3057,7 @@ fn render_file_info_right_column(
         ),
         file_info_value_line(
             "Link target",
-            info.symlink_target_display(),
+            symlink_target_name(info),
             theme.ui.symlink,
             theme,
         ),
@@ -2298,6 +3088,48 @@ fn render_file_info_right_column(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn render_file_info_link_path(
+    frame: &mut Frame,
+    area: Rect,
+    info: &crate::file_info::FileInfo,
+    theme: &Theme,
+) {
+    if info.kind != crate::entry::EntryKind::Symlink {
+        return;
+    }
+
+    /*
+     * Symlink targets receive a dedicated full-width row.
+     *
+     * Preserve the beginning of long paths and shorten only the tail when the
+     * complete target cannot fit inside the File Information window.
+     */
+    let value = info.symlink_target_display();
+
+    let value_width = area.width.saturating_sub(17) as usize;
+
+    let value = truncate_with_ellipsis(&value, value_width);
+
+    frame.render_widget(
+        Paragraph::new(file_info_value_line(
+            "Link path",
+            value,
+            theme.ui.symlink,
+            theme,
+        )),
+        area,
+    );
+}
+
+fn symlink_target_name(info: &crate::file_info::FileInfo) -> String {
+    let target = info.symlink_target_display();
+
+    std::path::Path::new(&target)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or(target)
+}
+
 fn render_file_info_context_line(
     frame: &mut Frame,
     area: Rect,
@@ -2310,12 +3142,6 @@ fn render_file_info_context_line(
         (
             "Cache path",
             cache_info.cache_path.display().to_string(),
-            theme.ui.symlink,
-        )
-    } else if info.kind == crate::entry::EntryKind::Symlink {
-        (
-            "Resolved link",
-            info.symlink_target_display(),
             theme.ui.symlink,
         )
     } else {
@@ -2687,10 +3513,544 @@ fn render_remote_index_setup_overlay(
     }
 }
 
+fn render_tree_expand_all_dialog(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+) -> TreeExpandAllUiRegions {
+    const CONFIRMATION_WIDTH: u16 = 88;
+
+    const CONFIRMATION_HEIGHT: u16 = 18;
+
+    const REFUSAL_WIDTH: u16 = 94;
+
+    const REFUSAL_HEIGHT: u16 = 16;
+
+    const DISPLAY_LIMIT_WIDTH: u16 = 82;
+
+    const DISPLAY_LIMIT_HEIGHT: u16 = 13;
+
+    const OK_BUTTON_TEXT: &str = "OK";
+
+    const OK_BUTTON_PADDING: u16 = 4;
+
+    let Some(dialog) = app.tree_expand_all_dialog.as_ref() else {
+        return TreeExpandAllUiRegions::default();
+    };
+
+    let (requested_width, requested_height) = match dialog.kind {
+        TreeExpandAllDialogKind::LocalConfirmation | TreeExpandAllDialogKind::SshConfirmation => {
+            (CONFIRMATION_WIDTH, CONFIRMATION_HEIGHT)
+        }
+
+        TreeExpandAllDialogKind::Refusal => (REFUSAL_WIDTH, REFUSAL_HEIGHT),
+
+        TreeExpandAllDialogKind::DisplayLimit => (DISPLAY_LIMIT_WIDTH, DISPLAY_LIMIT_HEIGHT),
+    };
+
+    let popup_width = requested_width.min(area.width.saturating_sub(4).max(1));
+
+    let popup_height = requested_height.min(area.height.saturating_sub(2).max(1));
+
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    let projected_rows = format_row_count(dialog.projected_rows);
+
+    let configured_max_rows = format_row_count(dialog.configured_max_rows);
+
+    let focused_button_style = Style::default()
+        .fg(Color::Black)
+        .bg(COLOR_TREE_POLICY)
+        .add_modifier(Modifier::BOLD);
+
+    let mut regions = TreeExpandAllUiRegions::default();
+
+    let mut lines = Vec::new();
+
+    match dialog.kind {
+        TreeExpandAllDialogKind::LocalConfirmation => {
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Expand very large Tree?",
+                    Style::default()
+                        .fg(COLOR_TREE_POLICY)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        "Opening every branch will display ",
+                        Style::default().fg(app.theme.ui.file),
+                    ),
+                    Span::styled(
+                        format!("{} rows", projected_rows),
+                        Style::default()
+                            .fg(COLOR_TREE_POLICY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(".", Style::default().fg(app.theme.ui.file)),
+                ])
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Navigation may become slow and difficult at this size, and Scry",
+                    Style::default().fg(app.theme.ui.file),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(
+                Line::styled(
+                    "cannot guarantee a smooth or pleasant browsing experience.",
+                    Style::default().fg(app.theme.ui.file),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "This warning is shown only once per session.",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            let marker = if dialog.disable_warning { "[o]" } else { "[ ]" };
+
+            let checkbox_text = format!("{} Disable this message for future sessions", marker,);
+
+            lines.push(
+                Line::styled(
+                    checkbox_text.clone(),
+                    Style::default().fg(if dialog.disable_warning {
+                        COLOR_TREE_POLICY
+                    } else {
+                        app.theme.ui.file
+                    }),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled("  ", focused_button_style),
+                    Span::styled("OK", focused_button_style),
+                    Span::styled("  ", focused_button_style),
+                ])
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Change the warning threshold in ~/.config/scry/scry.toml under [advanced.tree].",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                    .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Space toggles future warnings   Enter continues   Esc closes",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            let inner_left = popup_area.x.saturating_add(1);
+
+            let inner_width = popup_area.width.saturating_sub(2);
+
+            let checkbox_width = checkbox_text.chars().count() as u16;
+
+            regions.warning_checkbox = Some(Rect {
+                x: inner_left.saturating_add(inner_width.saturating_sub(checkbox_width) / 2),
+
+                /*
+                 * Content line 9 plus the popup's top border.
+                 */
+                y: popup_area.y.saturating_add(10),
+
+                width: checkbox_width,
+
+                height: 1,
+            });
+
+            let ok_width =
+                (OK_BUTTON_TEXT.chars().count() as u16).saturating_add(OK_BUTTON_PADDING);
+
+            regions.ok = Some(Rect {
+                x: inner_left.saturating_add(inner_width.saturating_sub(ok_width) / 2),
+
+                /*
+                 * Content line 11 plus the popup's top border.
+                 */
+                y: popup_area.y.saturating_add(12),
+
+                width: ok_width,
+
+                height: 1,
+            });
+        }
+
+        TreeExpandAllDialogKind::SshConfirmation => {
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Expand very large remote Tree?",
+                    Style::default()
+                        .fg(COLOR_TREE_POLICY)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        "Opening every branch will display ",
+                        Style::default().fg(app.theme.ui.file),
+                    ),
+                    Span::styled(
+                        format!("{} rows", projected_rows),
+                        Style::default()
+                            .fg(COLOR_TREE_POLICY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(".", Style::default().fg(app.theme.ui.file)),
+                ])
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Navigation may become slow and difficult at this size, and Scry",
+                    Style::default().fg(app.theme.ui.file),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(
+                Line::styled(
+                    "cannot guarantee a smooth or pleasant browsing experience.",
+                    Style::default().fg(app.theme.ui.file),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "This warning is shown only once per session.",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(
+                Line::styled(
+                    "It can be disabled only under [advanced.tree] in scry.toml.",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled("  ", focused_button_style),
+                    Span::styled(OK_BUTTON_TEXT, focused_button_style),
+                    Span::styled("  ", focused_button_style),
+                ])
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Change the warning threshold in ~/.config/scry/scry.toml under [advanced.tree].",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                    .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Enter continues   Esc closes",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            let inner_left = popup_area.x.saturating_add(1);
+
+            let inner_width = popup_area.width.saturating_sub(2);
+
+            let ok_width =
+                (OK_BUTTON_TEXT.chars().count() as u16).saturating_add(OK_BUTTON_PADDING);
+
+            regions.ok = Some(Rect {
+                x: inner_left.saturating_add(inner_width.saturating_sub(ok_width) / 2),
+
+                /*
+                 * Content line 11 plus the popup's top border.
+                 */
+                y: popup_area.y.saturating_add(12),
+
+                width: ok_width,
+
+                height: 1,
+            });
+        }
+
+        TreeExpandAllDialogKind::Refusal => {
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "This Tree is too large to expand fully.",
+                    Style::default()
+                        .fg(COLOR_TREE_POLICY)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        "Full expansion would display ",
+                        Style::default().fg(app.theme.ui.file),
+                    ),
+                    Span::styled(
+                        format!("{} rows", projected_rows),
+                        Style::default()
+                            .fg(COLOR_TREE_POLICY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        ", exceeding the configured maximum of ",
+                        Style::default().fg(app.theme.ui.file),
+                    ),
+                    Span::styled(
+                        format!("{} rows", configured_max_rows),
+                        Style::default()
+                            .fg(COLOR_TREE_POLICY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(".", Style::default().fg(app.theme.ui.file)),
+                ])
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Scry will keep the Tree at its safe partial expansion instead.",
+                    Style::default().fg(app.theme.ui.file),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(
+                Line::styled(
+                    "Branches beyond the configured maximum remain collapsed and may still be opened manually.",
+                    Style::default().fg(app.theme.ui.file),
+                )
+                    .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "The configured maximum continues to apply to Expand All for this session.",
+                    Style::default().fg(app.theme.ui.file),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(
+                Line::styled(
+                    "This message will not be shown again during this session.",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Change the maximum in ~/.config/scry/scry.toml under [advanced.tree].",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Enter or Esc to close",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+        }
+
+        TreeExpandAllDialogKind::DisplayLimit => {
+            let (first_part, second_part) = match dialog.display_limit_action {
+                TreeDisplayLimitAction::BranchExpansion => (
+                    "Expanding this branch would display ",
+                    "Collapse another branch to make room before expanding this one.",
+                ),
+
+                TreeDisplayLimitAction::ShowHidden => (
+                    "Showing hidden entries would display ",
+                    "Collapse some open branches first, or raise the Tree limit.",
+                ),
+            };
+
+            let config_path = crate::config::config_file_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "scry.toml".to_string());
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Tree display limit reached",
+                    Style::default()
+                        .fg(COLOR_TREE_POLICY)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled(first_part, Style::default().fg(app.theme.ui.file)),
+                    Span::styled(
+                        format!("{} entries", projected_rows),
+                        Style::default()
+                            .fg(COLOR_TREE_POLICY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(".", Style::default().fg(app.theme.ui.file)),
+                ])
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        "The configured maximum is ",
+                        Style::default().fg(app.theme.ui.file),
+                    ),
+                    Span::styled(
+                        format!("{} entries", configured_max_rows),
+                        Style::default()
+                            .fg(COLOR_TREE_POLICY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(".", Style::default().fg(app.theme.ui.file)),
+                ])
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(second_part, Style::default().fg(app.theme.ui.file))
+                    .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    format!("Change `max_visible_tree_rows` in {}", config_path,),
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+
+            lines.push(Line::raw(""));
+
+            lines.push(
+                Line::styled(
+                    "Enter or Esc to close",
+                    Style::default().fg(app.theme.ui.muted),
+                )
+                .alignment(Alignment::Center),
+            );
+        }
+    }
+
+    let title = match dialog.kind {
+        TreeExpandAllDialogKind::LocalConfirmation => " Large Tree Expansion ",
+
+        TreeExpandAllDialogKind::SshConfirmation => " Large Remote Tree Expansion ",
+
+        TreeExpandAllDialogKind::Refusal => " Expand All Limit ",
+
+        TreeExpandAllDialogKind::DisplayLimit => " Tree Display Limit ",
+    };
+
+    let popup = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_TREE_POLICY)),
+        )
+        .style(Style::default().bg(app.theme.frames.popup_background));
+
+    frame.render_widget(Clear, popup_area);
+
+    frame.render_widget(popup, popup_area);
+
+    regions
+}
+
 fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> ConnectionUiRegions {
     const POPUP_WIDTH: u16 = 76;
 
-    const POPUP_HEIGHT: u16 = 24;
+    const POPUP_HEIGHT: u16 = 26;
 
     let popup_area = centered_rect(POPUP_WIDTH, POPUP_HEIGHT, area);
 
@@ -2770,6 +4130,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::Name,
             app.connection_dialog.focus,
+            app.connection_dialog.cursor,
             &app.theme,
         ),
         connection_field_line(
@@ -2778,6 +4139,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::Host,
             app.connection_dialog.focus,
+            app.connection_dialog.cursor,
             &app.theme,
         ),
         connection_field_line(
@@ -2786,6 +4148,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::Username,
             app.connection_dialog.focus,
+            app.connection_dialog.cursor,
             &app.theme,
         ),
         connection_field_line(
@@ -2794,6 +4157,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::Port,
             app.connection_dialog.focus,
+            app.connection_dialog.cursor,
             &app.theme,
         ),
         connection_field_line(
@@ -2802,6 +4166,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             Some("Optional — e.g. ~/.ssh/id_ed25519"),
             ConnectionField::IdentityFile,
             app.connection_dialog.focus,
+            app.connection_dialog.cursor,
             &app.theme,
         ),
         connection_field_line(
@@ -2810,6 +4175,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             None,
             ConnectionField::StartDirectory,
             app.connection_dialog.focus,
+            app.connection_dialog.cursor,
             &app.theme,
         ),
         Line::raw(""),
@@ -2865,6 +4231,8 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
         connection_help_line("Backspace", "Delete from the focused field"),
         connection_help_line("Ctrl+U", "Clear the focused field"),
         connection_help_line("F4 / Esc", "Close the connection window"),
+        connection_help_line("Left / Right", "Move the caret in an editable field"),
+        connection_help_line("Home / End", "Move to the start or end of the field"),
         if let Some(message) = &app.connection_dialog.error_message {
             Line::styled(
                 message.clone(),
@@ -2880,10 +4248,13 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
         } else {
             Line::raw("")
         },
-        Line::styled(
-            "[ Close ]",
-            Style::default().fg(COLOR_FILE).add_modifier(Modifier::BOLD),
-        )
+        Line::from(vec![connection_button_span(
+            "Close",
+            ConnectionField::Close,
+            app.connection_dialog.focus,
+            true,
+            &app.theme,
+        )])
         .alignment(Alignment::Center),
         Line::raw(""),
     ];
@@ -2921,6 +4292,54 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
     };
 
     /*
+     * Place the real terminal cursor over the focused editable field.
+     *
+     * field_rect.x points at the left │ border:
+     *
+     *     │ text
+     *     ^ ^─ actual first text cell
+     *     │ └─ one padding space
+     *     └─── border
+     *
+     * The text therefore begins two columns after field_rect.x.
+     */
+    let focused_field = match app.connection_dialog.focus {
+        ConnectionField::Name => Some((field_rect(4), draft.name.as_str())),
+
+        ConnectionField::Host => Some((field_rect(5), draft.host.as_str())),
+
+        ConnectionField::Username => Some((field_rect(6), draft.username.as_str())),
+
+        ConnectionField::Port => Some((field_rect(7), app.connection_dialog.port_text.as_str())),
+
+        ConnectionField::IdentityFile => Some((field_rect(8), draft.identity_file.as_str())),
+
+        ConnectionField::StartDirectory => Some((field_rect(9), draft.start_directory.as_str())),
+
+        _ => None,
+    };
+
+    if let Some((field_area, value)) = focused_field {
+        const FIELD_WIDTH: usize = 47;
+
+        let (_, cursor_column) =
+            connection_field_window(value, app.connection_dialog.cursor, FIELD_WIDTH);
+
+        /*
+         * Display the terminal cursor one cell after Scry's insertion position.
+         *
+         * Text entry therefore happens immediately to the left of the visible cursor,
+         * and an end-position cursor appears after the final character.
+         */
+        let cursor_x = field_area
+            .x
+            .saturating_add(cursor_column as u16)
+            .saturating_add(1);
+
+        frame.set_cursor_position((cursor_x, field_area.y));
+    }
+
+    /*
      * The button row is centered. These rectangles follow the rendered labels
      * exactly, including their brackets.
      */
@@ -2937,7 +4356,13 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
      */
     let close_width: u16 = 9;
 
-    let close_row = popup_area.y.saturating_add(22);
+    /*
+     * The Close label is content line 22.
+     *
+     * The popup border occupies the outer row, so its absolute terminal row is
+     * popup_area.y + 1 + 22.
+     */
+    let close_row = popup_area.y.saturating_add(23);
 
     let close_start = popup_area
         .x
@@ -3018,12 +4443,40 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
     }
 }
 
+fn connection_field_window(value: &str, cursor: usize, field_width: usize) -> (String, usize) {
+    let mut normalized_cursor = cursor.min(value.len());
+
+    while normalized_cursor > 0 && !value.is_char_boundary(normalized_cursor) {
+        normalized_cursor = normalized_cursor.saturating_sub(1);
+    }
+
+    let cursor_character = value[..normalized_cursor].chars().count();
+
+    /*
+     * The real terminal cursor overlays a cell instead of occupying one.
+     *
+     * Reserve the final visible cell for a cursor positioned after the last
+     * displayed character, then scroll long values just enough to keep it
+     * inside the field.
+     */
+    let maximum_cursor_column = field_width.saturating_sub(1);
+
+    let window_start = cursor_character.saturating_sub(maximum_cursor_column);
+
+    let displayed_value: String = value.chars().skip(window_start).take(field_width).collect();
+
+    let cursor_column = cursor_character.saturating_sub(window_start);
+
+    (displayed_value, cursor_column)
+}
+
 fn connection_field_line(
     label: &str,
     value: &str,
     placeholder: Option<&str>,
     field: ConnectionField,
     focused_field: ConnectionField,
+    cursor: usize,
     theme: &Theme,
 ) -> Line<'static> {
     const FIELD_WIDTH: usize = 47;
@@ -3038,17 +4491,11 @@ fn connection_field_line(
         value
     };
 
-    let available_width = if focused {
-        FIELD_WIDTH.saturating_sub(1)
+    let displayed_value = if focused {
+        connection_field_window(value, cursor, FIELD_WIDTH).0
     } else {
-        FIELD_WIDTH
+        source_text.chars().take(FIELD_WIDTH).collect()
     };
-
-    let mut displayed_value: String = source_text.chars().take(available_width).collect();
-
-    if focused {
-        displayed_value.push('▏');
-    }
 
     let border_color = if focused { COLOR_FRAME } else { COLOR_MUTED };
 
@@ -3066,12 +4513,12 @@ fn connection_field_line(
 
     Line::from(vec![
         Span::styled(
-            format!("  {:<16}", format!("{}:", label),),
+            format!("  {:<16}", format!("{}:", label)),
             Style::default().fg(if focused { COLOR_QUERY } else { COLOR_MUTED }),
         ),
         Span::styled("│", Style::default().fg(border_color)),
         Span::styled(
-            format!(" {:<width$}", displayed_value, width = FIELD_WIDTH,),
+            format!(" {:<width$}", displayed_value, width = FIELD_WIDTH),
             value_style,
         ),
         Span::styled("│", Style::default().fg(border_color)),
@@ -3571,16 +5018,14 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
-fn render_deletion_overlay(frame: &mut Frame, app: &App, area: Rect) {
+fn render_deletion_overlay(frame: &mut Frame, app: &App, area: Rect) -> Option<DeletionUiRegions> {
     const POPUP_WIDTH: u16 = 74;
 
     const FILE_POPUP_HEIGHT: u16 = 12;
 
     const DIRECTORY_POPUP_HEIGHT: u16 = 14;
 
-    let Some(deletion) = app.deletion.as_ref() else {
-        return;
-    };
+    let deletion = app.deletion.as_ref()?;
 
     let popup_height =
         if deletion.is_directory && !deletion.is_symlink && deletion.directory_has_content {
@@ -3684,6 +5129,8 @@ fn render_deletion_overlay(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::raw(""));
     }
 
+    let button_line_index = lines.len() as u16;
+
     lines.push(
         Line::from(vec![
             Span::styled("[ Delete ]", button_style(delete_focused, true)),
@@ -3715,6 +5162,49 @@ fn render_deletion_overlay(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, popup_area);
 
     frame.render_widget(popup, popup_area);
+
+    let delete_label_width = "[ Delete ]".chars().count() as u16;
+
+    let button_gap_width = 5_u16;
+
+    let cancel_label_width = "[ Cancel ]".chars().count() as u16;
+
+    let complete_button_width = delete_label_width
+        .saturating_add(button_gap_width)
+        .saturating_add(cancel_label_width);
+
+    let buttons_x = popup_area
+        .x
+        .saturating_add(popup_area.width.saturating_sub(complete_button_width) / 2);
+
+    let buttons_y = popup_area
+        .y
+        .saturating_add(1)
+        .saturating_add(button_line_index);
+
+    Some(DeletionUiRegions {
+        delete: Rect {
+            x: buttons_x,
+
+            y: buttons_y,
+
+            width: delete_label_width,
+
+            height: 1,
+        },
+
+        cancel: Rect {
+            x: buttons_x
+                .saturating_add(delete_label_width)
+                .saturating_add(button_gap_width),
+
+            y: buttons_y,
+
+            width: cancel_label_width,
+
+            height: 1,
+        },
+    })
 }
 
 fn render_about_overlay(frame: &mut Frame, app: &App, area: Rect) {
@@ -3831,28 +5321,26 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
 
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
 
-    let deletion_binding = if app.enable_deletion {
-        ("Delete", "Delete the selected local entry")
-    } else {
-        ("Delete", "Delete sel. entry (enable via scry.toml)")
-    };
-
     /*
      * Normal Mode contains the controls that form Scry's ordinary browsing
      * interface and the global controls that remain useful in every view.
-     *
-     * The conditional Delete entry must remain at index 6, immediately after
-     * Enter and before Ctrl+T.
      */
-    let mut normal_bindings = vec![
-        ("↑ / ↓", "Move the selection"),
+
+    let normal_bindings = vec![
+        ("Up / Down", "Move the selection"),
         ("PgUp / PgDn", "Move one visible page"),
+        ("Ctrl+PgUp / Ctrl+PgDn", "Move ten visible pages"),
+        ("Shift+← / →", "Scroll the listing horizontally"),
         ("Home / End", "Select first or last entry"),
-        ("Ctrl+← / Esc", "Enter the parent directory"),
-        ("Ctrl+→", "Open the selected directory"),
+        ("Left / Esc", "Enter the parent directory"),
+        ("Right", "Open the selected directory"),
         ("Enter", "Open or activate the selection"),
+        ("Delete", "Delete the selected local entry when enabled"),
+        ("Ctrl+Z", "Restore the most recently staged deletion"),
         ("Ctrl+T", "Enter Tree mode"),
+        ("Alt+E", "Expand or collapse all Tree branches"),
         ("Alt+H", "Show or hide hidden entries"),
+        ("F6", "Toggle Hidden Only mode"),
         ("Ctrl+O", "Cycle through sort modes"),
         ("Alt+R", "Toggle recursive mode"),
         ("Ctrl+R", "Reverse the sort direction"),
@@ -3864,14 +5352,16 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
         ("F9", "Toggle Date column"),
         ("F10", "Toggle User column"),
         ("Ctrl+Y", "Copy the selected entry's full path"),
-        ("F2", "Show detailed file information"),
+        ("F1", "Open the Help window"),
+        ("F2 / Alt+I", "Show detailed file information"),
+        ("F3", "Show or hide file and directory icons"),
+        ("F12", "Show or hide classified filename colors"),
         ("F4", "Open SSH connections manager"),
-        ("Ctrl+!", "Open or close this window"),
+        ("F5", "Open the Remote Index Builder"),
+        ("?", "Open or close this window"),
         ("Alt+A", "Open the About window"),
         ("Ctrl+C", "Exit Scry"),
     ];
-
-    normal_bindings.insert(6, deletion_binding);
 
     push_shortcut_section(&mut lines, "Normal Mode", &normal_bindings);
 
@@ -3884,9 +5374,9 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
         &mut lines,
         "Tree Mode",
         &[
-            ("↑ / ↓", "Move through visible nodes"),
-            ("Ctrl+→", "Expand the selected directory"),
-            ("Ctrl+← / Esc", "Collapse or select the parent"),
+            ("Up / Down", "Move through visible nodes"),
+            ("Right", "Expand the selected directory"),
+            ("Left / Esc", "Collapse or select the parent"),
             ("Enter", "Make directory the new root"),
             ("Ctrl+T", "Return to List mode"),
         ],
@@ -3894,7 +5384,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
 
     /*
      * Search Mode lists only controls specifically concerned with query editing,
-     * search policy, committing modifiers, and returning from search results.
+     * search policy, activating results, and returning from search results.
      *
      * Backspace edits the query only and never navigates to the parent directory.
      */
@@ -3906,14 +5396,14 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             ("Backspace", "Delete the character before the caret"),
             ("Ctrl+H", "Delete the character before the caret"),
             ("Ctrl+U", "Clear the complete search"),
-            ("←", "Move left in the search field"),
-            ("→", "Move right in the search field"),
+            ("Ctrl+Left", "Move left in the search field"),
+            ("Ctrl+Right", "Move right in the search field"),
             ("Ctrl+Home", "Move to the beginning of the search field"),
             ("Ctrl+End", "Move to the end of the search field"),
             ("Ctrl+F", "Toggle Fuzzy search"),
             ("Alt+R", "Toggle Recursive search"),
-            ("Enter", "Commit a pending modifier or activate the result"),
-            ("← / Esc", "Return to parent or previous search state"),
+            ("Enter", "Open or activate the selected result"),
+            ("Left / Esc", "Return to parent or previous search state"),
         ],
     );
 
@@ -3947,7 +5437,6 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             ("Wheel", "Move through entries"),
             ("Left-click", "Select an entry"),
             ("Double-click", "Activate the selected entry"),
-            ("Middle-click", "Collapse or enter parent"),
             ("Scrollbar drag", "Move through long listings"),
             ("Popup buttons", "Activate visible actions"),
         ],
@@ -3955,10 +5444,13 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
 
     lines.push(Line::raw(""));
 
-    lines.push(Line::styled(
-        "  ↑/↓ scroll   PgUp/PgDn page   Ctrl+!/Esc close",
-        Style::default().fg(COLOR_MUTED),
-    ));
+    lines.push(
+        Line::styled(
+            "  ↑/↓ scroll   PgUp/PgDn page   ?/Esc close",
+            Style::default().fg(COLOR_MUTED),
+        )
+        .alignment(Alignment::Center),
+    );
 
     let block = Block::default()
         .title(" Scry Shortcuts ")
@@ -4014,14 +5506,23 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
     if app.legend_max_scroll == 0 || content_area.height == 0 {
         None
     } else {
+        /*
+         * The visible mouse pointer may cover the scrollbar while the terminal
+         * reports its position one cell to the left or right.
+         *
+         * Return a three-column interaction zone centered on the rendered
+         * scrollbar so its left, middle, and right side are all easy to grab.
+         */
+        let scrollbar_x = content_area
+            .x
+            .saturating_add(content_area.width.saturating_sub(1));
+
         Some(Rect {
-            x: content_area
-                .x
-                .saturating_add(content_area.width.saturating_sub(1)),
+            x: scrollbar_x.saturating_sub(1),
 
             y: content_area.y,
 
-            width: 1,
+            width: 3,
 
             height: content_area.height,
         })
@@ -4101,7 +5602,16 @@ fn shortcut_help_line(shortcut: &str, description: &str) -> Line<'static> {
     ])
 }
 
-fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
+#[derive(Debug, Clone, Copy, Default)]
+struct HelpOverlayRegions {
+    scrollbar: Option<Rect>,
+
+    tips_link: Option<Rect>,
+
+    top_link: Option<Rect>,
+}
+
+fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> HelpOverlayRegions {
     const POPUP_MAX_WIDTH: u16 = 82;
 
     const HORIZONTAL_MARGIN: u16 = 4;
@@ -4122,6 +5632,13 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
 
     let block = Block::default()
         .title(" Scry Help ")
+        .title(
+            Line::from(Span::styled(
+                " tips ",
+                Style::default().fg(Color::Rgb(90, 150, 235)),
+            ))
+            .right_aligned(),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.frames.popup));
 
@@ -4154,7 +5671,32 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
 
     let text_width = document_area.width as usize;
 
-    let lines = help::content(&app.theme, text_width);
+    let mut lines = help::content(&app.theme, text_width);
+
+    let tips_link_line = lines.iter().position(|line| {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            == help::TIPS_LINK_TEXT
+    });
+
+    let tips_heading_line = lines.iter().position(|line| {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .trim()
+            == "Tips"
+    });
+
+    let top_link_line = lines.iter().position(|line| {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            == help::TOP_LINK_TEXT
+    });
 
     let viewport_height = document_area.height as usize;
 
@@ -4162,7 +5704,87 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
 
     app.help_max_scroll = content_height.saturating_sub(viewport_height) as u16;
 
+    app.help_tips_scroll = tips_heading_line
+        .unwrap_or(0)
+        .min(app.help_max_scroll as usize)
+        .min(u16::MAX as usize) as u16;
+
     app.help_scroll = app.help_scroll.min(app.help_max_scroll);
+
+    let tips_link_region = tips_link_line.and_then(|document_row| {
+        let scroll = app.help_scroll as usize;
+
+        if document_row < scroll {
+            return None;
+        }
+
+        let visible_row = document_row - scroll;
+
+        if visible_row >= document_area.height as usize {
+            return None;
+        }
+
+        Some(Rect {
+            x: document_area.x,
+
+            y: document_area.y.saturating_add(visible_row as u16),
+
+            width: help::TIPS_LINK_TEXT.chars().count() as u16,
+
+            height: 1,
+        })
+    });
+
+    let top_link_region = top_link_line.and_then(|document_row| {
+        let scroll = app.help_scroll as usize;
+
+        if document_row < scroll {
+            return None;
+        }
+
+        let visible_row = document_row - scroll;
+
+        if visible_row >= document_area.height as usize {
+            return None;
+        }
+
+        Some(Rect {
+            x: document_area.x,
+
+            y: document_area.y.saturating_add(visible_row as u16),
+
+            width: help::TOP_LINK_TEXT.chars().count() as u16,
+
+            height: 1,
+        })
+    });
+
+    /*
+     * Present the in-document jump as a conventional hyperlink.
+     *
+     * The text remains blue normally and gains an underline only while the
+     * pointer is actually over its visible mouse region.
+     */
+    if let Some(index) = tips_link_line
+        && let Some(line) = lines.get_mut(index)
+    {
+        *line = Line::styled(
+            help::TIPS_LINK_TEXT,
+            Style::default().fg(Color::Rgb(90, 150, 235)),
+        );
+    }
+
+    /*
+     * Render the return link using the same hyperlink treatment.
+     */
+    if let Some(index) = top_link_line
+        && let Some(line) = lines.get_mut(index)
+    {
+        *line = Line::styled(
+            help::TOP_LINK_TEXT,
+            Style::default().fg(Color::Rgb(90, 150, 235)),
+        );
+    }
 
     let background = Style::default().bg(Color::Rgb(15, 16, 22));
 
@@ -4212,21 +5834,54 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option<R
         frame.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
     }
 
-    if app.help_max_scroll == 0 || document_area.height == 0 {
+    let scrollbar_region = if app.help_max_scroll == 0 || content_area.height == 0 {
         None
     } else {
+        /*
+         * Give the visible scrollbar a three-column mouse interaction zone.
+         *
+         * The terminal may report the pointer one cell to either side of the
+         * character that it visually covers, so the left, middle, and right portions
+         * of the track and thumb should all remain easy to grab.
+         */
+        let scrollbar_x = content_area
+            .x
+            .saturating_add(content_area.width.saturating_sub(1));
+
         Some(Rect {
-            x: content_area
-                .x
-                .saturating_add(content_area.width.saturating_sub(1)),
+            x: scrollbar_x.saturating_sub(1),
 
             y: content_area.y,
 
-            width: 1,
+            width: 3,
 
             height: content_area.height,
         })
+    };
+
+    HelpOverlayRegions {
+        scrollbar: scrollbar_region,
+
+        tips_link: tips_link_region,
+
+        top_link: top_link_region,
     }
+}
+
+fn format_row_count(value: usize) -> String {
+    let digits = value.to_string();
+
+    let mut formatted = String::with_capacity(digits.len().saturating_add(digits.len() / 3));
+
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+
+        formatted.push(character);
+    }
+
+    formatted
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -4247,9 +5902,23 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let hidden_state = if app.show_hidden {
-        "Hidden:on"
+        "hidden:on"
     } else {
-        "Hidden:off"
+        "hidden:off"
+    };
+
+    /*
+     * Alt+H is intentionally unavailable while Hidden Only owns the visibility
+     * policy.
+     *
+     * Omitting the shortcut from the contextual footer makes that temporary
+     * unavailability visible without cluttering the interface with a disabled
+     * control.
+     */
+    let hidden_control = if app.hidden_only_active() {
+        String::new()
+    } else {
+        format!("  Alt+H {}", hidden_state)
     };
 
     #[allow(unused)]
@@ -4269,11 +5938,10 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let any_columns_enabled =
         app.show_permissions || app.show_size || app.show_date || app.show_user;
 
-
     let tree_state = if app.view_mode == ViewMode::Tree {
-        "Tree:on"
+        "tree:on"
     } else {
-        "Tree:off"
+        "tree:off"
     };
 
     #[allow(unused)]
@@ -4294,9 +5962,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     #[allow(unused)]
     let fuzzy_state = if app.search_mode == SearchMode::Fuzzy {
-        "Fuzzy:on"
+        "fuzzy:on"
     } else {
-        "Fuzzy:off"
+        "fuzzy:off"
     };
 
     #[allow(unused)]
@@ -4306,29 +5974,35 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         "reverse:off"
     };
 
+    let sort_control = if app.sort_controls_available() {
+        "  ^O sort mode"
+    } else {
+        ""
+    };
+
     let footer = if !app.query.is_empty() {
         // Active Search Help Text
         format!(
-            " ←/→ Move Cursor  Enter Open  Alt+R {}  Alt+H {}  ^U Clear  ^O Sort Mode  F2 Info  ^Y Copy",
-            recursive_state, hidden_state,
+            " ^←/^→ move cursor  Enter open  Alt+R {}{}  ^U clear{}  ^Y copy  F2 info",
+            recursive_state, hidden_control, sort_control,
         )
     } else if app.view_mode == ViewMode::Tree {
         // Tree View Help Text
         format!(
-            " ^? Help  ^! Legend  ↑/↓/^←/^→ Move  Enter Open  F4 SSH  ^T {}  Alt+H {}  Alt+M Meta  ^C Exit",
-            tree_state, hidden_state,
+            " F1 help  ? legend  ↑/↓/←/→ move  Enter open  F4 SSH  ^T {}{}  Alt+M meta  ^C exit",
+            tree_state, hidden_control,
         )
     } else if app.source_is_remote() {
         // SSH Normal View Help Text
         format!(
-            " ^! Legend  ^Space Select  Alt+U Clear Select  Enter Open  Alt+D Download  F4 SSH  ^T {}  ^C Exit",
-            tree_state,
+            " ^Space select  Alt+U clear select  Enter open  Alt+D download  ^T {}{}  ^C exit",
+            tree_state, hidden_control
         )
     } else {
         // Normal View Help Text
         format!(
-            " ^? Help  ^! Legend  ↑/↓/^←/^→ Move  Enter Open  F4 SSH  ^T {}  Alt+H {}  Alt+M Meta  ^C Exit",
-            tree_state, hidden_state,
+            " F1 help  ? legend  ↑/↓/←/→ move  Enter open  F4 SSH  ^T {}{}  Alt+M meta  ^C exit",
+            tree_state, hidden_control,
         )
     };
     let paragraph = Paragraph::new(footer).style(Style::default().fg(COLOR_MUTED));

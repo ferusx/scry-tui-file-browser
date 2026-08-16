@@ -117,19 +117,18 @@ fn launch_in_terminal(
     if let Some(configured_terminal) = env::var_os("TERMINAL") {
         let configured_path = PathBuf::from(&configured_terminal);
 
-        if command_path_exists(&configured_path) {
-            if let Some(mut command) =
+        if command_path_exists(&configured_path)
+            && let Some(mut command) =
                 terminal_command(configured_path.as_os_str(), program, program_arguments)
-            {
-                if let Some(directory) = working_directory {
-                    command.current_dir(directory);
-                }
+        {
+            if let Some(directory) = working_directory {
+                command.current_dir(directory);
+            }
 
-                detach_stdio(&mut command);
+            detach_stdio(&mut command);
 
-                if command.spawn().is_ok() {
-                    return Ok(());
-                }
+            if command.spawn().is_ok() {
+                return Ok(());
             }
         }
     }

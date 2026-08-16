@@ -3,11 +3,22 @@
 use std::io::{self, Write};
 
 use ratatui::{
-    style::{Modifier, Style},
+    layout::Alignment,
+    style::{Color, Modifier, Style},
     text::Line,
 };
 
 use crate::themes::Theme;
+
+/*
+ * Tips deliberately use a bright terminal green so the final section
+ * remains visually discoverable while scrolling rapidly through Help.
+ */
+const COLOR_TIP_TEXT: Color = Color::Rgb(90, 230, 120);
+
+pub const TIPS_LINK_TEXT: &str = "[Jump to Tips]";
+
+pub const TOP_LINK_TEXT: &str = "[Jump back to top]";
 
 pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -22,6 +33,19 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         theme,
     );
 
+    lines.push(Line::raw(""));
+    /*
+     * In-document jump link.
+     *
+     * ui.rs replaces this line's style while the pointer is hovering over it,
+     * but the text itself belongs to the Help document so its position remains
+     * stable and discoverable.
+     */
+    lines.push(Line::styled(
+        TIPS_LINK_TEXT,
+        Style::default().fg(Color::Rgb(90, 150, 235)),
+    ));
+
     push_title(&mut lines, "The Interface", theme);
 
     push_section(&mut lines, "Search Field", theme);
@@ -32,8 +56,8 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     searching immediately, while the current mode is shown in brackets beside \
     the field. Backspace deletes the character before the caret and never changes \
     the active directory. The visible caret may be moved one character at a time \
-    (Left and Right), sent to the beginning or end of the query (Ctrl+Home and \
-    Ctrl+End), or cleared together with the complete query (Ctrl+U).",
+    (Ctrl+Left and Ctrl+Right), sent to the beginning or end of the query (Ctrl+ Home \
+    and Ctrl+End), or cleared together with the complete query (Ctrl+U).",
         text_width,
         theme,
     );
@@ -68,9 +92,10 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         "The main listing is where files, directories, symbolic links, search \
         results, and Tree branches are displayed. The highlighted row is the \
         current selection, while the parent control in the panel title returns to \
-        the preceding directory or search root. File and directory icons may be \
-        shown or hidden (F3), and hidden entries may be revealed or concealed \
-        (Alt+H).",
+        the preceding directory or search root. Hidden entries may be revealed or \
+        concealed (Alt+H), while Hidden Only mode restricts the listing to hidden \
+        content (F6). File and directory icons may be shown or hidden (F3), and \
+        classified filename colors may be toggled independently (F12).",
         text_width,
         theme,
     );
@@ -103,7 +128,7 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "The Shortcut Legend is the quick reference for Scry's keyboard and mouse \
-        controls (Ctrl+!). It is intended for rapid lookup, while this Help window \
+        controls (?). It is intended for rapid lookup, while this Help window \
         explains the interface, features, and workflows in fuller detail.",
         text_width,
         theme,
@@ -130,11 +155,13 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "Tree mode displays directories as expandable branches and makes the \
-        relationship between parents and descendants visible. It may be enabled or \
-        disabled at any time (Ctrl+T). Ctrl+Right expands the selected directory, while \
-        Ctrl+Left collapses an open branch or moves the selection to its parent. Enter \
-        makes the selected directory the new active root, closing the former \
-        hierarchy behind it.",
+    relationship between parents and descendants visible. It may be enabled or \
+    disabled at any time (Ctrl+T). Ctrl+Right expands the selected directory, while \
+    Ctrl+Left collapses an open branch or moves the selection to its parent. Alt+E \
+    expands or collapses every branch represented by the current Tree, providing a \
+    quick way to open a complete hierarchy or fold a large result back down. Enter \
+    makes the selected directory the new active root, closing the former hierarchy \
+    behind it.",
         text_width,
         theme,
     );
@@ -143,24 +170,118 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
 
     push_paragraph(
         &mut lines,
-        "Entries may be sorted by Name, Size, Date, or Type, with the current choice \
-        shown in the main listing title. The available sort modes may be cycled \
-        (Ctrl+O), and the direction may be reversed independently (Ctrl+R). \
-        Directories remain grouped above ordinary files so navigation stays \
-        predictable.",
+        "Entries may normally be sorted by Name, Size, Date, or Type, with the \
+    current choice shown in the main listing title. The available sort modes \
+    may be cycled (Ctrl+O), and the direction may be reversed independently \
+    (Ctrl+R). Flat Fuzzy results are instead ordered by relevance, so ordinary \
+    sorting controls are unavailable in Fuzzy List mode. Fuzzy Tree mode still \
+    uses the selected sort mode to arrange siblings within each branch. \
+    Directories remain grouped above ordinary files where structural sorting \
+    applies.",
         text_width,
         theme,
     );
 
-    push_section(&mut lines, "Hidden Entries and Icons", theme);
+    push_section(&mut lines, "Hidden Entries and Hidden Only", theme);
 
     push_paragraph(
         &mut lines,
-        "Hidden files and directories may be revealed or concealed without leaving \
-        the current location (Alt+H). Optional file and directory icons may also be \
-        shown or hidden (F3), allowing the listing to favor either visual \
-        classification or maximum compatibility with terminals and fonts that do \
-        not provide icon support.",
+        "Hidden files and directories may be revealed alongside ordinary content \
+        without leaving the current location (Alt+H). Hidden Only mode instead \
+        restricts the visible result corpus to hidden content (F6). An entry belongs \
+        to hidden content when its own name begins with a dot or when any directory \
+        in its path begins with a dot. A file such as .config/scry/scry.toml therefore \
+        remains part of Hidden Only even though scry.toml itself is not dot-prefixed. \
+        Pressing F6 again returns to the ordinary hidden-entry policy.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Navigation", theme);
+
+    push_paragraph(
+        &mut lines,
+        "The selection may be moved one entry at a time with Up and Down, or one \
+        visible page at a time with PgUp and PgDn. Ctrl+PgUp and Ctrl+PgDn move \
+        ten visible pages at once, providing faster travel through exceptionally \
+        long listings and expanded Trees; releasing Ctrl immediately returns \
+        paging to its normal one-page movement. Home and End select the first or \
+        last visible entry, while the mouse wheel may also be used for ordinary \
+        scrolling.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Very Large Trees", theme);
+
+    push_paragraph(
+        &mut lines,
+        "A query-less Tree may represent an extremely large filesystem hierarchy, \
+        particularly when Alt+E is used to expand every represented branch. Scry \
+        therefore uses configurable safeguards to very large Tree displays. \
+        The config variable 'expand_all_warning_rows' controls when complete expansion requires \
+        confirmation, while 'max_visible_tree_rows' sets the maximum number of Tree \
+        rows that may be visible at one time. This ceiling limits only the displayed \
+        Tree; it does not restrict indexing, recursive searching, or the number of \
+        filesystem entries available to Scry.",
+        text_width,
+        theme,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_paragraph(
+        &mut lines,
+        "When an expansion would exceed the configured maximum, Scry keeps the \
+        existing valid Tree instead of opening an oversized representation. Manual \
+        branches may continue to be expanded while sufficient visible-row capacity \
+        remains, and collapsing open branches frees that capacity for expansion \
+        elsewhere. Alt+E may always be used to collapse a fully expanded Tree. \
+        When a saved session is restored, Scry does not automatically recreate a \
+        previous query-less Expand All state; instead, the Tree remains collapsed \
+        except for the ancestor path required to reveal the restored selection.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Browsing Restrictions", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Very large Trees are subject to a hard visible-row limit so Scry cannot \
+        accidentally open a hierarchy that is too large to browse safely. Alt+E \
+        may always collapse an expanded Tree, but the opposite is not always true: \
+        complete expansion, manual branch expansion, or another guarded Tree \
+        transition may be refused when it would exceed max_visible_tree_rows. \
+        The default maximum is 250000 visible Tree rows and may be changed in \
+        ~/.config/scry/scry.toml.",
+        text_width,
+        theme,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_paragraph(
+        &mut lines,
+        "Some large-Tree dialogs are shown only once during a Scry session. After \
+        the explanation has already been shown, the same restriction may still \
+        apply without opening the dialog again; Scry instead reports the refusal \
+        through its notification area while leaving the last valid Tree unchanged. \
+        Collapsing branches reduces the visible row count and may make room for \
+        further expansion elsewhere.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Icons and File Colors", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Optional file and directory icons may be shown or hidden (F3). Classified \
+        filename colors may be toggled independently (F12), assigning a bright \
+        visual family to ordinary files according to Scry's established file \
+        classification. Directories and symbolic links retain their structural \
+        colors. Both optional visual features are disabled by default.",
         text_width,
         theme,
     );
@@ -189,7 +310,9 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         the active directory (Alt+R). Local filesystems are scanned in the \
         background, so a large directory tree may require some time before its \
         complete search corpus is available. Exact results may appear progressively \
-        as entries are discovered.",
+        as entries are discovered. In Hidden Only mode, Scry still traverses ordinary \
+        directories when necessary to discover hidden directories deeper in the \
+        hierarchy, but those ordinary traversal paths are not published as results.",
         text_width,
         theme,
     );
@@ -221,12 +344,42 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         theme,
     );
 
+    push_section(&mut lines, "Search Result Limits", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Fuzzy searches retain a configurable number of the strongest direct \
+    matches, while Exact Tree searches use a separate configurable direct-match \
+    limit. These limits apply to matching entries before a Tree is constructed. \
+    Tree mode then adds the ancestor directories required to show those matches \
+    in their filesystem context, so the displayed Tree may contain more rows than \
+    the configured match limit. The additional number depends on where the \
+    matching entries are located and therefore is not a fixed amount.",
+        text_width,
+        theme,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_paragraph(
+        &mut lines,
+        "In Fuzzy+Recursive Tree mode, a query containing only structural selectors \
+    such as \"type:code\" or \"ext:rs\" has no filename or path text to score \
+    approximately. Such a query therefore uses Exact Tree matching semantics and \
+    the configured exact_tree_match_limit so toggling Exact/Fuzzy does not change \
+    the hierarchy. As soon as textual search input is added, as in \
+    \"type:code test\", normal Fuzzy ranking resumes and fuzzy_result_limit becomes \
+    the direct-match limit. Both settings are documented in scry.toml.",
+        text_width,
+        theme,
+    );
+
     push_section(&mut lines, "Query-language Reference", theme);
 
     push_paragraph(
         &mut lines,
         "The sections below explain Scry's compact modifiers and Boolean query \
-    language in detail. Open the Shortcut Legend with Ctrl+! for a complete \
+    language in detail. Open the Shortcut Legend with ? for a complete \
     quick-reference list of every query form, every accepted type: value, and \
     all supported aliases. That reference is generated from the same definitions \
     used by the query parser, so the documented values remain synchronized with \
@@ -321,20 +474,6 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         theme,
     );
 
-    push_section(&mut lines, "Pending Modifiers", theme);
-
-    push_paragraph(
-        &mut lines,
-        "A modifier being written at the end of the query remains pending until it \
-        is committed. This prevents partial terms such as \"-e\", \"-ex\", or \
-        \"ext:pn\" from repeatedly changing a large result set while they are still \
-        being entered. Press Space to begin another term, or Enter to commit the \
-        pending modifier without activating the selected entry. Pressing Enter \
-        again performs the normal selection action.",
-        text_width,
-        theme,
-    );
-
     push_section(&mut lines, "Searching over SSH", theme);
 
     push_paragraph(
@@ -342,9 +481,11 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         "Ordinary searches over SSH filter the entries already loaded from the \
         current remote directory. Recursive remote searches use the host's \
         persistent index, while the active remote directory continues to define \
-        the visible search scope. Existing indexes remain readable after compatible \
-        Scry upgrades, although rebuilding an older index may be necessary before \
-        newly introduced file classifications become available.",
+        the visible search scope. Hidden Only searches over the recursive remote \
+        corpus require an index built with hidden entries included. Existing indexes \
+        remain readable after compatible Scry upgrades, although rebuilding an older \
+        index may be necessary before newly introduced file classifications become \
+        available.",
         text_width,
         theme,
     );
@@ -383,12 +524,14 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "While browsing through SSH, files may be marked for a later batch download \
-    with Ctrl+Space. Pressing Ctrl+Space again on an already marked file removes \
-    its mark. Marks are independent from the ordinary highlighted row and remain \
-    attached to their full paths while the user filters results, changes \
-    directories, switches between List and Tree views, or restores a saved SSH \
-    session. Directories cannot currently be marked. Alt+U clears every marked \
-    file. Marking and clearing marks are unavailable during local browsing.",
+        with Ctrl+Space. Pressing Ctrl+Space again on an already marked file removes \
+        its mark. Marks are independent from the ordinary highlighted row and remain \
+        attached to their full paths while the user filters results, changes \
+        directories, switches between List and Tree views, or restores a saved SSH \
+        session. Directories cannot currently be marked. Alt+U clears every marked \
+        file. Marking and clearing marks are unavailable during local browsing. \
+        Existing marks do not change Enter behavior: Enter always activates only the \
+        currently highlighted entry, while Alt+D starts the marked batch download.",
         text_width,
         theme,
     );
@@ -451,10 +594,11 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "The Remote Index Builder may be opened manually (F5). A Standard build \
-        records ordinary entries, while Include Hidden also records files and \
-        directories whose names begin with a dot. After the build has started, it \
-        continues in the background and reports its progress while the rest of \
-        Scry remains available for browsing.",
+        records ordinary entries, while Include Hidden also records dot-prefixed \
+        files and directories together with the descendants of hidden directories. \
+        This extended corpus is required for recursive Hidden Only searches. After \
+        the build has started, it continues in the background and reports its progress \
+        while the rest of Scry remains available for browsing.",
         text_width,
         theme,
     );
@@ -532,15 +676,17 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "Deletion is disabled by default and must be enabled in Scry's configuration \
-        before the Delete key becomes active. Deletion is currently available only \
-        for local entries; remote files and directories cannot be removed through \
-        SSH. Every request opens a confirmation window with Cancel selected by \
-        default. Ordinary files and symbolic links are removed directly, while \
-        directories and all of their contents are removed recursively. A symbolic \
-        link is deleted as a link and is never followed into its target. Scry also \
-        refuses dangerous targets such as the filesystem root, the current browsing \
-        root, or paths outside the active root. Confirmed deletion is permanent and \
-        does not use a trash or recovery area.",
+    before the Delete key becomes active. Deletion is currently available only \
+    for local entries; remote files and directories cannot be removed through \
+    SSH. Every request opens a confirmation window with Cancel selected by \
+    default. Files, directories, and symbolic links are first moved to hidden \
+    staged paths beside their original locations. A symbolic link is handled as \
+    a link and is never followed into its target. Scry also refuses dangerous \
+    targets such as the filesystem root, the current browsing root, or paths \
+    outside the active root. Press Ctrl+Z to restore the most recently staged \
+    deletion during the current session. Remaining staged entries are removed \
+    permanently when Scry exits cleanly, while interrupted deletion sessions can \
+    be recovered from the deletion journal when Scry starts again.",
         text_width,
         theme,
     );
@@ -552,10 +698,18 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "Session restoration is disabled by default. It may be enabled permanently \
-    with restore_session = true in the [session] section of scry.toml, or for one \
-    launch with --restore-session. When enabled, Scry saves its stable browser \
-    state during a normal shutdown and attempts to restore it the next time Scry \
-    is launched without an explicit replacement source.",
+with restore_session = true in the [session] section of scry.toml, or for one \
+launch with --restore-session. When enabled, Scry saves its stable browser \
+state during a normal shutdown and attempts to restore it the next time Scry \
+is launched without an explicit replacement source.",
+        text_width,
+        theme,
+    );
+
+    push_paragraph(
+        &mut lines,
+        "Restored session settings override matching browser and display defaults \
+from scry.toml. Explicit command-line options override both.",
         text_width,
         theme,
     );
@@ -635,25 +789,140 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         theme,
     );
 
+    push_section(&mut lines, "Creating Custom Themes", theme);
+
+    push_paragraph(
+        &mut lines,
+        "Users may create their own themes by copying one of Scry's existing theme \
+        files, renaming the copy, and changing its color values. Starting from an \
+        existing theme is recommended because it provides the complete set of \
+        available color settings and makes it easy to see how a theme is structured. \
+        Custom themes should be placed in ~/.config/scry/themes and can then be \
+        selected with the top-level theme setting in scry.toml. Keeping the original \
+        theme files unchanged also makes it easy to return to Scry's supplied themes \
+        or use them again as clean starting points.",
+        text_width,
+        theme,
+    );
+
     push_title(&mut lines, "Keyboard and Mouse Use", theme);
 
     push_paragraph(
         &mut lines,
         "Scry supports both keyboard and mouse navigation throughout the interface. \
-        Mouse actions include selecting entries, activating them with a double \
-        click, using the middle button to return to a parent or collapse a Tree \
-        branch, dragging scrollbars through long listings, and clicking available \
-        controls in supported windows. The complete keyboard and mouse bindings \
-        are available in the Shortcut Legend (Ctrl+!).",
+    Mouse actions include selecting entries, activating them with a double \
+    click, dragging scrollbars through long listings, and clicking available \
+    controls in supported windows. The complete keyboard and mouse bindings \
+    are available in the Shortcut Legend (?).",
         text_width,
         theme,
     );
+
+    /*
+     * ========== TIPS SECTION ==========
+     */
+    push_title(&mut lines, "Tips", theme);
+
+    push_tip_paragraph(
+        &mut lines,
+        "# For a compact reminder of keyboard controls and query syntax, open the Shortcut \
+    Legend with ? instead of searching through this complete Help document.",
+        text_width,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_tip_paragraph(
+        &mut lines,
+        "# When browsing a very large listing, click and hold the scrollbar track above \
+    or below the thumb to move through the entries rapidly one page at a time. You may \
+    also click on either side of the thumb to move a single page in that direction.",
+        text_width,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_tip_paragraph(
+        &mut lines,
+        "# Icons and classified filename colors are optional. To enable them permanently, \
+    edit ~/.config/scry/scry.toml and set show_icons = true and/or \
+    show_file_colors = true.",
+        text_width,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_tip_paragraph(
+        &mut lines,
+        "# Did you know that you can enable icons in-app by pressing F3, and file colors with F12?",
+        text_width,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_tip_paragraph(
+        &mut lines,
+        "# When in HiddenOnly mode (F6), you may sometimes end up inside directories without \
+        any dot-entries in it. That means, there will be no visible entry to select and open/enter, which \
+        might make you feel trapped. Just disable HiddenOnly by pressing F6 to see the selectable \
+        entries again.",
+        text_width,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_tip_paragraph(
+        &mut lines,
+        "# If you have lots of search results, and you have enabled file colors, and \
+        you find that it is difficult to see the highlighting in your search results, try toggling \
+        file colors off (F12) temporarily for clarity.",
+        text_width,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_tip_paragraph(
+        &mut lines,
+        "# You may want to have Recursive search mode enabled (Alt+R) when searching. \
+        Recursive mode includes all forward directories from the current root. Sometimes, you may \
+        have had the intention to search all subdirectories, but there will only be results from \
+        the current root unless you are in Recursive mode.",
+        text_width,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_tip_paragraph(
+        &mut lines,
+        "# When a directory wears the right arrow (→) after its name, it means the directory \
+        contains other entries. When there, instead of a right arrow, is a slash (/), there are no \
+        entries inside. However, if you, while browsing, enter a → dir, and you find it empty, it is \
+        certain to have hidden entries inside. Enable Hidden entries to gain access to them.",
+        text_width,
+    );
+
+    lines.push(Line::raw(""));
 
     /*
      * Leave one empty line below the final paragraph so the document does not
      * end directly against the bottom edge.
      */
     lines.push(Line::raw(""));
+
+    lines.push(Line::styled(
+        TOP_LINK_TEXT,
+        Style::default().fg(Color::Rgb(90, 150, 235)),
+    ));
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "↑/↓ scroll  PgUp/PgDn page  Esc/F1 closes",
+            Style::default().fg(Color::Rgb(75, 80, 92)),
+        )
+        .alignment(Alignment::Center),
+    );
 
     lines
 }
@@ -743,6 +1012,15 @@ fn push_paragraph(lines: &mut Vec<Line<'static>>, text: &str, text_width: usize,
         lines.push(Line::styled(
             wrapped_line,
             Style::default().fg(theme.ui.file),
+        ));
+    }
+}
+
+fn push_tip_paragraph(lines: &mut Vec<Line<'static>>, text: &str, text_width: usize) {
+    for wrapped_line in wrap_text(text, text_width) {
+        lines.push(Line::styled(
+            wrapped_line,
+            Style::default().fg(COLOR_TIP_TEXT),
         ));
     }
 }

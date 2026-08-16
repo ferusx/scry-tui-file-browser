@@ -239,6 +239,8 @@ pub enum ConnectionField {
     Delete,
 
     Disconnect,
+
+    Close,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +258,14 @@ pub struct ConnectionDialogState {
      * port. It is converted to u16 only when saving or connecting.
      */
     pub port_text: String,
+
+    /*
+     * Byte offset inside the currently focused editable field.
+     *
+     * Every movement method keeps this on a valid UTF-8 character boundary.
+     * Non-editable controls use zero.
+     */
+    pub cursor: usize,
 
     pub error_message: Option<String>,
 }
@@ -279,6 +289,8 @@ impl ConnectionDialogState {
 
             port_text,
 
+            cursor: 0,
+
             error_message: None,
         }
     }
@@ -292,6 +304,8 @@ impl ConnectionDialogState {
             self.port_text = default_port().to_string();
 
             self.focus = ConnectionField::Name;
+
+            self.move_cursor_to_end();
 
             self.error_message = None;
 
@@ -308,6 +322,8 @@ impl ConnectionDialogState {
             self.port_text = profile.port.to_string();
         }
 
+        self.move_cursor_to_end();
+
         self.error_message = None;
     }
 
@@ -321,7 +337,117 @@ impl ConnectionDialogState {
 
         self.focus = ConnectionField::Name;
 
+        self.move_cursor_to_end();
+
         self.error_message = None;
+    }
+
+    pub fn set_focus(&mut self, field: ConnectionField) {
+        self.focus = field;
+
+        self.move_cursor_to_end();
+
+        self.error_message = None;
+    }
+
+    fn focused_text(&self) -> Option<&str> {
+        match self.focus {
+            ConnectionField::Name => Some(&self.draft.name),
+
+            ConnectionField::Host => Some(&self.draft.host),
+
+            ConnectionField::Username => Some(&self.draft.username),
+
+            ConnectionField::Port => Some(&self.port_text),
+
+            ConnectionField::IdentityFile => Some(&self.draft.identity_file),
+
+            ConnectionField::StartDirectory => Some(&self.draft.start_directory),
+
+            _ => None,
+        }
+    }
+
+    fn focused_text_mut(&mut self) -> Option<&mut String> {
+        match self.focus {
+            ConnectionField::Name => Some(&mut self.draft.name),
+
+            ConnectionField::Host => Some(&mut self.draft.host),
+
+            ConnectionField::Username => Some(&mut self.draft.username),
+
+            ConnectionField::Port => Some(&mut self.port_text),
+
+            ConnectionField::IdentityFile => Some(&mut self.draft.identity_file),
+
+            ConnectionField::StartDirectory => Some(&mut self.draft.start_directory),
+
+            _ => None,
+        }
+    }
+
+    fn normalize_cursor(&mut self) {
+        let normalized_cursor = match self.focused_text() {
+            Some(text) => {
+                let mut cursor = self.cursor.min(text.len());
+
+                while cursor > 0 && !text.is_char_boundary(cursor) {
+                    cursor = cursor.saturating_sub(1);
+                }
+
+                cursor
+            }
+
+            None => 0,
+        };
+
+        self.cursor = normalized_cursor;
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        self.normalize_cursor();
+
+        if self.cursor == 0 {
+            return;
+        }
+
+        let Some(text) = self.focused_text() else {
+            return;
+        };
+
+        self.cursor = text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        self.normalize_cursor();
+
+        let Some(text) = self.focused_text() else {
+            return;
+        };
+
+        if self.cursor >= text.len() {
+            return;
+        }
+
+        self.cursor = text[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(offset, _)| self.cursor.saturating_add(offset))
+            .unwrap_or(text.len());
+    }
+
+    pub fn move_cursor_to_start(&mut self) {
+        if self.focused_text().is_some() {
+            self.cursor = 0;
+        }
+    }
+
+    pub fn move_cursor_to_end(&mut self) {
+        self.cursor = self.focused_text().map_or(0, str::len);
     }
 
     pub fn focus_next(&mut self) {
@@ -346,15 +472,19 @@ impl ConnectionDialogState {
 
             ConnectionField::Delete => ConnectionField::Disconnect,
 
-            ConnectionField::Disconnect => ConnectionField::Profiles,
+            ConnectionField::Disconnect => ConnectionField::Close,
+
+            ConnectionField::Close => ConnectionField::Profiles,
         };
+
+        self.move_cursor_to_end();
 
         self.error_message = None;
     }
 
     pub fn focus_previous(&mut self) {
         self.focus = match self.focus {
-            ConnectionField::Profiles => ConnectionField::Disconnect,
+            ConnectionField::Profiles => ConnectionField::Close,
 
             ConnectionField::Name => ConnectionField::Profiles,
 
@@ -375,74 +505,68 @@ impl ConnectionDialogState {
             ConnectionField::Delete => ConnectionField::Save,
 
             ConnectionField::Disconnect => ConnectionField::Delete,
+
+            ConnectionField::Close => ConnectionField::Disconnect,
         };
+
+        self.move_cursor_to_end();
 
         self.error_message = None;
     }
 
     pub fn push_character(&mut self, character: char) {
-        match self.focus {
-            ConnectionField::Name => {
-                self.draft.name.push(character);
-            }
-
-            ConnectionField::Host => {
-                self.draft.host.push(character);
-            }
-
-            ConnectionField::Username => {
-                self.draft.username.push(character);
-            }
-
-            ConnectionField::Port => {
-                if character.is_ascii_digit() && self.port_text.len() < 5 {
-                    self.port_text.push(character);
-                }
-            }
-
-            ConnectionField::IdentityFile => {
-                self.draft.identity_file.push(character);
-            }
-
-            ConnectionField::StartDirectory => {
-                self.draft.start_directory.push(character);
-            }
-
-            _ => {}
+        /*
+         * Port accepts only decimal digits and remains limited to five characters.
+         */
+        if self.focus == ConnectionField::Port
+            && (!character.is_ascii_digit() || self.port_text.chars().count() >= 5)
+        {
+            return;
         }
+
+        self.normalize_cursor();
+
+        let cursor = self.cursor;
+
+        let Some(text) = self.focused_text_mut() else {
+            return;
+        };
+
+        text.insert(cursor, character);
+
+        self.cursor = cursor.saturating_add(character.len_utf8());
 
         self.error_message = None;
     }
 
-    #[allow(dead_code)]
     pub fn pop_character(&mut self) {
-        match self.focus {
-            ConnectionField::Name => {
-                self.draft.name.pop();
-            }
+        self.normalize_cursor();
 
-            ConnectionField::Host => {
-                self.draft.host.pop();
-            }
-
-            ConnectionField::Username => {
-                self.draft.username.pop();
-            }
-
-            ConnectionField::Port => {
-                self.port_text.pop();
-            }
-
-            ConnectionField::IdentityFile => {
-                self.draft.identity_file.pop();
-            }
-
-            ConnectionField::StartDirectory => {
-                self.draft.start_directory.pop();
-            }
-
-            _ => {}
+        if self.cursor == 0 {
+            return;
         }
+
+        let cursor = self.cursor;
+
+        let previous_character_start = {
+            let Some(text) = self.focused_text() else {
+                return;
+            };
+
+            text[..cursor]
+                .char_indices()
+                .next_back()
+                .map(|(index, _)| index)
+                .unwrap_or(0)
+        };
+
+        let Some(text) = self.focused_text_mut() else {
+            return;
+        };
+
+        text.drain(previous_character_start..cursor);
+
+        self.cursor = previous_character_start;
 
         self.error_message = None;
     }
@@ -475,6 +599,8 @@ impl ConnectionDialogState {
 
             _ => {}
         }
+
+        self.cursor = 0;
 
         self.error_message = None;
     }

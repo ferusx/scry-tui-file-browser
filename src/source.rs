@@ -37,6 +37,16 @@ pub trait FileSource: Debug + Send {
     fn path_is_directory(&mut self, path: &Path) -> io::Result<bool>;
 
     /*
+     * Resolve a numeric owner ID within this filesystem source.
+     *
+     * Local and remote machines have independent user databases, so an SSH UID
+     * must never be interpreted through the local host's /etc/passwd.
+     */
+    fn owner_name(&mut self, _owner_id: u32) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /*
      * Begin extended metadata inspection for one selected filesystem entry.
      *
      * Sources perform the potentially blocking work outside Scry's terminal
@@ -59,6 +69,8 @@ pub trait FileSource: Debug + Send {
         &mut self,
         _root: PathBuf,
         _show_hidden: bool,
+        _hidden_only: bool,
+        _excluded_subtree: Option<PathBuf>,
         _generation: u64,
         _mode: RecursiveScanMode,
     ) -> io::Result<Receiver<ScanMessage>> {
@@ -164,10 +176,19 @@ impl FileSource for LocalSource {
         &mut self,
         root: PathBuf,
         show_hidden: bool,
+        hidden_only: bool,
+        excluded_subtree: Option<PathBuf>,
         generation: u64,
         mode: RecursiveScanMode,
     ) -> io::Result<Receiver<ScanMessage>> {
-        Ok(start_recursive_scan(root, show_hidden, generation, mode))
+        Ok(start_recursive_scan(
+            root,
+            show_hidden,
+            hidden_only,
+            excluded_subtree,
+            generation,
+            mode,
+        ))
     }
 
     fn source_label(&self) -> String {

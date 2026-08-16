@@ -8,7 +8,7 @@ use std::{
 use ratatui::style::Color;
 use serde::Deserialize;
 
-use crate::config::config_directory_path;
+use crate::{classify::FileClass, config::config_directory_path};
 
 const THEMES_DIRECTORY_NAME: &str = "themes";
 
@@ -338,6 +338,156 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /*
+     * Bright, harmonious filename palette based on Scry's established FileClass.
+     *
+     * The colors deliberately occupy a similar lightness range. This provides
+     * variety without turning the listing into a collection of harsh high-contrast
+     * signals.
+     *
+     * Directories, symlinks, and unresolved files retain structural/theme colors.
+     */
+    pub fn file_class_color(&self, class: FileClass) -> Color {
+        match class {
+            FileClass::Directory => self.ui.directory,
+
+            FileClass::Symlink => self.ui.symlink,
+
+            /*
+             * Executable and binary objects use related warm coral shades.
+             */
+            FileClass::Executable => Color::Rgb(245, 145, 125),
+
+            FileClass::Binary => Color::Rgb(225, 150, 160),
+
+            /*
+             * Shell and command-oriented languages.
+             */
+            FileClass::ShellScript | FileClass::Awk => Color::Rgb(125, 220, 150),
+
+            FileClass::Perl => Color::Rgb(145, 205, 185),
+
+            /*
+             * Major language identities receive distinct but similarly bright
+             * colors.
+             */
+            FileClass::Rust => Color::Rgb(245, 160, 110),
+
+            FileClass::Python => Color::Rgb(235, 205, 105),
+
+            FileClass::C | FileClass::Cpp | FileClass::Assembly | FileClass::SourceCode => {
+                Color::Rgb(125, 180, 240)
+            }
+
+            FileClass::Java => Color::Rgb(245, 140, 120),
+
+            FileClass::Kotlin => Color::Rgb(205, 155, 240),
+
+            FileClass::JavaScript => Color::Rgb(245, 220, 110),
+
+            FileClass::TypeScript => Color::Rgb(115, 195, 245),
+
+            FileClass::Lua => Color::Rgb(140, 175, 240),
+
+            FileClass::Ruby => Color::Rgb(240, 140, 155),
+
+            FileClass::Php => Color::Rgb(180, 165, 235),
+
+            FileClass::Go => Color::Rgb(110, 210, 225),
+
+            FileClass::Swift => Color::Rgb(245, 155, 115),
+
+            FileClass::Dart => Color::Rgb(105, 205, 220),
+
+            FileClass::CSharp | FileClass::FSharp | FileClass::VisualBasic => {
+                Color::Rgb(185, 155, 235)
+            }
+
+            FileClass::Scala | FileClass::Groovy => Color::Rgb(235, 145, 150),
+
+            FileClass::R => Color::Rgb(135, 185, 235),
+
+            FileClass::Elixir => Color::Rgb(200, 155, 230),
+
+            FileClass::Erlang => Color::Rgb(230, 145, 190),
+
+            FileClass::Clojure => Color::Rgb(145, 210, 155),
+
+            FileClass::Zig => Color::Rgb(240, 185, 115),
+
+            FileClass::Nim => Color::Rgb(235, 215, 120),
+
+            FileClass::Crystal => Color::Rgb(205, 180, 225),
+
+            FileClass::Haskell => Color::Rgb(190, 160, 230),
+
+            FileClass::Ocaml => Color::Rgb(235, 170, 115),
+
+            FileClass::Pascal => Color::Rgb(135, 195, 225),
+
+            FileClass::Solidity => Color::Rgb(180, 185, 215),
+
+            FileClass::Vala => Color::Rgb(145, 190, 235),
+
+            /*
+             * Web, build, configuration, and structured-data families.
+             */
+            FileClass::Web => Color::Rgb(235, 145, 215),
+
+            FileClass::Build => Color::Rgb(240, 180, 110),
+
+            FileClass::Config => Color::Rgb(195, 170, 235),
+
+            FileClass::StructuredData => Color::Rgb(120, 215, 220),
+
+            /*
+             * Documents and storage formats.
+             */
+            FileClass::Log => Color::Rgb(175, 190, 210),
+
+            FileClass::Archive | FileClass::Package => Color::Rgb(235, 165, 105),
+
+            FileClass::Document | FileClass::Text => Color::Rgb(225, 215, 180),
+
+            FileClass::Spreadsheet => Color::Rgb(125, 220, 165),
+
+            FileClass::Presentation => Color::Rgb(245, 165, 110),
+
+            /*
+             * Media families.
+             */
+            FileClass::Image => Color::Rgb(235, 145, 215),
+
+            FileClass::VectorImage => Color::Rgb(245, 165, 205),
+
+            FileClass::Audio => Color::Rgb(120, 220, 185),
+
+            FileClass::Video => Color::Rgb(200, 150, 235),
+
+            FileClass::Font => Color::Rgb(215, 175, 240),
+
+            /*
+             * Specialized filesystem content.
+             */
+            FileClass::Database => Color::Rgb(110, 210, 205),
+
+            FileClass::Torrent => Color::Rgb(120, 215, 170),
+
+            FileClass::DesktopEntry | FileClass::Plugin => Color::Rgb(185, 165, 235),
+
+            FileClass::Backup => Color::Rgb(205, 165, 220),
+
+            FileClass::Certificate => Color::Rgb(245, 210, 115),
+
+            FileClass::DiskImage => Color::Rgb(155, 185, 235),
+
+            /*
+             * Unknown files deliberately retain the theme's neutral file color.
+             */
+            FileClass::Unknown => self.ui.file,
+        }
+    }
+
     pub fn load(theme_name: &str) -> Self {
         let mut theme = Self::default();
 

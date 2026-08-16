@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 
 use crate::scan::FileEntry;
 
@@ -33,14 +33,15 @@ pub struct SearchRecord {
      */
     pub original_path: Arc<str>,
 
-    /*
-     * Lowercase extension prepared once when the index is created.
-     *
-     * An extensionless entry uses an empty string.
-     */
-    pub extension: Arc<str>,
-
     pub class: FileClass,
+
+    /*
+     * Lightweight copies of the metadata required to sort Exact worker results
+     * without touching or rearranging the backing FileEntry corpus.
+     */
+    pub size_bytes: u64,
+
+    pub modified_time: Option<SystemTime>,
 
     pub character_mask: u64,
 
@@ -100,14 +101,7 @@ impl SearchIndex {
 
         self.records
             .extend(entries.iter().enumerate().map(|(offset, entry)| {
-                let extension = entry
-                    .path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or_default()
-                    .to_lowercase();
-
-                let contains_hidden_component = entry.relative_path.components().any(|component| {
+                let contains_hidden_component = entry.path.components().any(|component| {
                     let component = component.as_os_str().to_string_lossy();
 
                     component != "." && component != ".." && component.starts_with('.')
@@ -125,9 +119,11 @@ impl SearchIndex {
 
                     original_path,
 
-                    extension: Arc::from(extension),
-
                     class: entry.class,
+
+                    size_bytes: entry.size_bytes,
+
+                    modified_time: entry.modified_time,
 
                     character_mask: character_mask(&entry.searchable_path),
 
@@ -140,19 +136,6 @@ impl SearchIndex {
                     contains_hidden_component,
                 }
             }));
-    }
-
-    /*
-     * Rebuild after recursive_entries has been reordered.
-     *
-     * This is required while Exact mode still sorts the backing FileEntry
-     * vector. Later, the lightweight scanner refactor can give entries stable
-     * IDs and remove this rebuild.
-     */
-    pub fn rebuild_from_entries(&mut self, entries: &[FileEntry]) {
-        self.clear();
-
-        self.extend_from_entries(entries, 0);
     }
 }
 
@@ -198,7 +181,7 @@ mod tests {
 
     use std::{path::PathBuf, sync::Arc};
 
-    use crate::{classify::FileClass, scan::FileEntry};
+    use crate::{classify::FileClass, entry::EntryKind, scan::FileEntry};
 
     #[test]
     fn mask_contains_repeated_characters_only_once() {
@@ -232,9 +215,9 @@ mod tests {
 
             is_symlink: true,
 
-            permissions: "lrwxrwxrwx".to_string(),
+            kind: EntryKind::Symlink,
 
-            modified: "2026-07-21 07:00".to_string(),
+            permissions_mode: 0o777,
 
             modified_time: None,
 
@@ -249,9 +232,7 @@ mod tests {
 
         let record = &index.records()[0];
 
-        assert_eq!(record.extension.as_ref(), "rs");
-
-        assert_eq!(record.original_path.as_ref(), ".cache/Example.rs",);
+        assert_eq!(record.original_path.as_ref(), ".cache/Example.rs");
 
         assert_eq!(record.class, FileClass::Rust);
 

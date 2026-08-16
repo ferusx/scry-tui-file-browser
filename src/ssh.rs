@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use std::{
+    collections::HashMap,
     collections::VecDeque,
     env, fmt, fs,
     io::{self, Write},
@@ -12,8 +13,6 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-use chrono::{DateTime, Local};
 
 use futures_util::TryStreamExt;
 
@@ -92,6 +91,14 @@ pub struct SftpSource {
     label: String,
 
     cache_namespace: String,
+
+    /*
+     * Remote UID → username map loaded lazily from the remote /etc/passwd.
+     *
+     * None means it has not yet been requested. Once loaded, metadata rendering
+     * performs no further remote reads.
+     */
+    owner_names: Option<HashMap<u32, String>>,
 }
 
 impl SshTarget {
@@ -321,8 +328,66 @@ impl SftpSource {
                     sanitize_cache_component(target.user.as_deref().unwrap_or("unknown-user",),),
                     target.port,
                 ),
+
+                owner_names: None,
             },
         ))
+    }
+
+    fn remote_owner_name(&mut self, owner_id: u32) -> io::Result<Option<String>> {
+        /*
+         * /etc/passwd is tiny and contains the authoritative UID mapping for the
+         * remote machine. Load it once, parse it, and retain the complete map.
+         */
+        if self.owner_names.is_none() {
+            let contents = self.runtime.block_on(async {
+                let mut filesystem = self.sftp.fs();
+
+                filesystem
+                    .read(Path::new("/etc/passwd"))
+                    .await
+                    .map_err(sftp_io_error)
+            })?;
+
+            let contents = String::from_utf8_lossy(&contents);
+
+            let mut owner_names = HashMap::new();
+
+            for line in contents.lines() {
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                let mut fields = line.split(':');
+
+                let Some(name) = fields.next() else {
+                    continue;
+                };
+
+                /*
+                 * Skip the password field.
+                 */
+                let _password = fields.next();
+
+                let Some(uid_text) = fields.next() else {
+                    continue;
+                };
+
+                let Ok(uid) = uid_text.parse::<u32>() else {
+                    continue;
+                };
+
+                owner_names.insert(uid, name.to_string());
+            }
+
+            self.owner_names = Some(owner_names);
+        }
+
+        Ok(self
+            .owner_names
+            .as_ref()
+            .and_then(|owner_names| owner_names.get(&owner_id))
+            .cloned())
     }
 
     fn materialize_remote_file(
@@ -748,7 +813,11 @@ fn start_remote_file_info(
         let result = collect_remote_file_info(target, ssh_config, cache_namespace, initial_info);
 
         let message = match result {
-            Ok(info) => FileInfoMessage::Finished { generation, info },
+            Ok(info) => FileInfoMessage::Finished {
+                generation,
+
+                info: Box::new(info),
+            },
 
             Err(error) => FileInfoMessage::Failed {
                 generation,
@@ -767,6 +836,127 @@ fn start_remote_file_info(
     receiver
 }
 
+fn remote_created_time(
+    runtime: &Runtime,
+    target: &SshTarget,
+    ssh_config: &SshConfig,
+    path: &Path,
+) -> io::Result<Option<SystemTime>> {
+    /*
+     * SFTP v3 has no birth-time field.
+     *
+     * File Information therefore asks the remote host for this one timestamp
+     * on demand. This command connection exists only for the selected entry
+     * being inspected; creation time is never added to Scry's resident
+     * FileEntry corpus, SearchIndex, or persistent remote index.
+     */
+    let destination = target.openssh_destination();
+
+    let connect_timeout = Duration::from_secs(ssh_config.connect_timeout_seconds);
+
+    let server_alive_interval = Duration::from_secs(ssh_config.server_alive_interval_seconds);
+
+    runtime.block_on(async {
+        let mut builder = SessionBuilder::default();
+
+        builder
+            .known_hosts_check(KnownHosts::Strict)
+            .connect_timeout(connect_timeout);
+
+        if !server_alive_interval.is_zero() {
+            builder.server_alive_interval(server_alive_interval);
+        }
+
+        if let Some(identity_file) = &target.identity_file {
+            builder.keyfile(identity_file);
+        }
+
+        let session = builder.connect_mux(&destination).await.map_err(|error| {
+            io::Error::other(format!(
+                "unable to open remote metadata command connection: {error}"
+            ))
+        })?;
+
+        /*
+         * Detect the remote stat dialect rather than assuming that the machine
+         * running Scry and the machine being browsed use the same operating
+         * system.
+         */
+        let uname_output = session
+            .command("uname")
+            .arg("-s")
+            .output()
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "unable to identify the remote operating system: {error}"
+                ))
+            })?;
+
+        if !uname_output.status.success() {
+            return Ok(None);
+        }
+
+        let operating_system = String::from_utf8_lossy(&uname_output.stdout);
+
+        let path_text = path.to_string_lossy();
+
+        let stat_output = if operating_system.trim() == "FreeBSD" {
+            /*
+             * FreeBSD stat:
+             *
+             *     %B  st_birthtime as Unix seconds
+             *
+             * Its default operation uses lstat(), so a symbolic link reports
+             * its own birth time rather than following its target.
+             */
+            session
+                .command("stat")
+                .arg("-f")
+                .arg("%B")
+                .arg(path_text.as_ref())
+                .output()
+                .await
+        } else {
+            /*
+             * GNU stat:
+             *
+             *     %W  birth time as Unix seconds, or 0 when unavailable
+             *
+             * Linux is Scry's other explicitly supported platform. Unknown
+             * Unix hosts may also provide GNU stat, so trying this form is
+             * preferable to fabricating a creation timestamp.
+             */
+            session
+                .command("stat")
+                .arg("-c")
+                .arg("%W")
+                .arg(path_text.as_ref())
+                .output()
+                .await
+        }
+        .map_err(|error| {
+            io::Error::other(format!("unable to inspect remote creation time: {error}"))
+        })?;
+
+        if !stat_output.status.success() {
+            return Ok(None);
+        }
+
+        let timestamp_text = String::from_utf8_lossy(&stat_output.stdout);
+
+        let timestamp_seconds = match timestamp_text.trim().parse::<u64>() {
+            Ok(0) | Err(_) => {
+                return Ok(None);
+            }
+
+            Ok(seconds) => seconds,
+        };
+
+        Ok(UNIX_EPOCH.checked_add(Duration::from_secs(timestamp_seconds)))
+    })
+}
+
 fn collect_remote_file_info(
     target: SshTarget,
     ssh_config: SshConfig,
@@ -782,10 +972,19 @@ fn collect_remote_file_info(
     let (_, source) = SftpSource::connect(&target, &ssh_config)
         .map_err(|error| io::Error::other(error.to_string()))?;
 
+    /*
+     * Inspect the remote entry itself rather than following symbolic links.
+     *
+     * File Information must remain available for dangling links. Their missing
+     * target is useful link state, not a failure to inspect the link itself.
+     */
     let remote_metadata = source.runtime.block_on(async {
         let mut filesystem = source.sftp.fs();
 
-        filesystem.metadata(&info.path).await.map_err(sftp_io_error)
+        filesystem
+            .symlink_metadata(&info.path)
+            .await
+            .map_err(sftp_io_error)
     })?;
 
     info.kind = remote_entry_kind(remote_metadata.file_type());
@@ -812,12 +1011,30 @@ fn collect_remote_file_info(
     info.modified_time = remote_metadata.modified().map(|time| time.as_system_time());
 
     /*
-     * The SFTP metadata exposed by the current source does not reliably provide
-     * access or birth time.
+     * SFTP v3 reports access and modification time together when the server
+     * supplies timestamp attributes.
      */
-    info.accessed_time = None;
+    info.accessed_time = remote_metadata.accessed().map(|time| time.as_system_time());
 
-    info.created_time = None;
+    /*
+     * SFTP v3 has no creation/birth-time field.
+     *
+     * Ask the remote operating system for this one selected entry only. Failure
+     * or an unsupported filesystem remains nonfatal and is represented truthfully
+     * as an unavailable creation time.
+     */
+    match remote_created_time(&source.runtime, &target, &ssh_config, &info.path) {
+        Ok(created_time) => {
+            info.created_time = created_time;
+        }
+
+        Err(error) => {
+            info.created_time = None;
+
+            info.notes
+                .push(format!("Unable to read remote creation time: {}", error,));
+        }
+    }
 
     if info.kind == EntryKind::Directory {
         match summarize_remote_directory(&source, &info.path) {
@@ -834,14 +1051,68 @@ fn collect_remote_file_info(
         }
     }
 
-    /*
-     * Symlink target inspection is intentionally left unavailable when the
-     * server does not expose a reliable link-target operation through the
-     * current SFTP abstraction.
-     */
     if info.kind == EntryKind::Symlink {
-        info.notes
-            .push("The remote symlink target was not reported by the SFTP source".to_string());
+        /*
+         * READLINK describes the link itself and therefore works even when its
+         * destination no longer exists.
+         */
+        let target_result = source.runtime.block_on(async {
+            let mut filesystem = source.sftp.fs();
+
+            filesystem.read_link(&info.path).await
+        });
+
+        match target_result {
+            Ok(target) => {
+                let resolved_target = if target.is_absolute() {
+                    target.clone()
+                } else {
+                    info.path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("/"))
+                        .join(&target)
+                };
+
+                info.symlink_target = Some(target);
+
+                /*
+                 * Target inspection is deliberately nonfatal.
+                 *
+                 * A dangling or otherwise inaccessible target must never prevent
+                 * Scry from reporting metadata for the symlink itself.
+                 */
+                let target_result = source.runtime.block_on(async {
+                    let mut filesystem = source.sftp.fs();
+
+                    filesystem.metadata(&resolved_target).await
+                });
+
+                match target_result {
+                    Ok(_) => {
+                        info.symlink_target_exists = Some(true);
+                    }
+
+                    Err(error) => {
+                        /*
+                         * Target inspection is optional.
+                         *
+                         * A dangling, inaccessible, or otherwise unresolved target must never
+                         * turn inspection of the symlink itself into a FileInfo failure.
+                         */
+                        info.symlink_target_exists = Some(false);
+
+                        info.notes
+                            .push(format!("Symlink target is unavailable: {error:#}",));
+                    }
+                }
+            }
+
+            Err(error) => {
+                info.notes.push(format!(
+                    "Unable to read the remote symlink target: {error:#}",
+                ));
+            }
+        }
     }
 
     info.cache_info = Some(remote_cache_info(
@@ -1303,6 +1574,10 @@ impl FileSource for SftpSource {
         self.remote_path_is_directory(path)
     }
 
+    fn owner_name(&mut self, owner_id: u32) -> io::Result<Option<String>> {
+        self.remote_owner_name(owner_id)
+    }
+
     fn start_file_info(
         &mut self,
         initial_info: FileInfo,
@@ -1325,6 +1600,8 @@ impl FileSource for SftpSource {
         &mut self,
         root: PathBuf,
         show_hidden: bool,
+        _hidden_only: bool,
+        _excluded_subtree: Option<PathBuf>,
         generation: u64,
         mode: RecursiveScanMode,
     ) -> io::Result<Receiver<ScanMessage>> {
@@ -1408,10 +1685,6 @@ fn remote_file_entry(directory: &Path, entry: DirEntry) -> Option<FileEntry> {
         owner_id: metadata.uid(),
     };
 
-    let permissions = format_remote_permissions(&entry_metadata);
-
-    let modified = format_remote_modified_date(entry_metadata.modified_time);
-
     let class = classify(&path, &entry_metadata);
 
     let relative_path = PathBuf::from(&name);
@@ -1435,9 +1708,9 @@ fn remote_file_entry(directory: &Path, entry: DirEntry) -> Option<FileEntry> {
 
         is_symlink: kind.is_symlink(),
 
-        permissions,
+        kind,
 
-        modified,
+        permissions_mode: entry_metadata.permissions_mode,
 
         modified_time: entry_metadata.modified_time,
 
@@ -1529,59 +1802,6 @@ fn remote_permissions_mode(permissions: Option<Permissions>) -> u32 {
     }
 
     mode
-}
-
-fn format_remote_modified_date(modified_time: Option<SystemTime>) -> String {
-    let Some(modified_time) = modified_time else {
-        return "—".to_string();
-    };
-
-    let modified: DateTime<Local> = DateTime::from(modified_time);
-
-    modified.format("%Y-%m-%d %H:%M").to_string()
-}
-
-fn format_remote_permissions(metadata: &EntryMetadata) -> String {
-    let mut permissions = String::with_capacity(10);
-
-    permissions.push(metadata.kind.permission_type_character());
-
-    let mode = metadata.permissions_mode;
-
-    permissions.push(if mode & 0o400 != 0 { 'r' } else { '-' });
-
-    permissions.push(if mode & 0o200 != 0 { 'w' } else { '-' });
-
-    permissions.push(match (mode & 0o100 != 0, mode & 0o4000 != 0) {
-        (true, true) => 's',
-        (false, true) => 'S',
-        (true, false) => 'x',
-        (false, false) => '-',
-    });
-
-    permissions.push(if mode & 0o040 != 0 { 'r' } else { '-' });
-
-    permissions.push(if mode & 0o020 != 0 { 'w' } else { '-' });
-
-    permissions.push(match (mode & 0o010 != 0, mode & 0o2000 != 0) {
-        (true, true) => 's',
-        (false, true) => 'S',
-        (true, false) => 'x',
-        (false, false) => '-',
-    });
-
-    permissions.push(if mode & 0o004 != 0 { 'r' } else { '-' });
-
-    permissions.push(if mode & 0o002 != 0 { 'w' } else { '-' });
-
-    permissions.push(match (mode & 0o001 != 0, mode & 0o1000 != 0) {
-        (true, true) => 't',
-        (false, true) => 'T',
-        (true, false) => 'x',
-        (false, false) => '-',
-    });
-
-    permissions
 }
 
 fn cache_metadata_path(cache_path: &Path) -> PathBuf {
@@ -1890,56 +2110,6 @@ fn parse_port(value: &str) -> Result<u16, SshTargetError> {
     Ok(port)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_hostname() {
-        let target = SshTarget::parse("nosferatu").unwrap();
-
-        assert_eq!(target.host, "nosferatu",);
-
-        assert_eq!(target.user, None,);
-
-        assert_eq!(target.port, 22,);
-    }
-
-    #[test]
-    fn parses_user_and_hostname() {
-        let target = SshTarget::parse("ferusx@nosferatu").unwrap();
-
-        assert_eq!(target.host, "nosferatu",);
-
-        assert_eq!(target.user.as_deref(), Some("ferusx"),);
-
-        assert_eq!(target.port, 22,);
-    }
-
-    #[test]
-    fn parses_custom_port() {
-        let target = SshTarget::parse("ferusx@nosferatu:2222").unwrap();
-
-        assert_eq!(target.host, "nosferatu",);
-
-        assert_eq!(target.port, 2222,);
-    }
-
-    #[test]
-    fn parses_bracketed_ipv6() {
-        let target = SshTarget::parse("ferusx@[2001:db8::10]:2222").unwrap();
-
-        assert_eq!(target.host, "2001:db8::10",);
-
-        assert_eq!(target.port, 2222,);
-    }
-
-    #[test]
-    fn rejects_zero_port() {
-        assert!(SshTarget::parse("nosferatu:0",).is_err(),);
-    }
-}
-
 fn scry_remote_cache_root() -> io::Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_CACHE_HOME") {
         return Ok(PathBuf::from(path).join("scry").join("remote-files"));
@@ -2019,5 +2189,55 @@ fn sanitize_cache_component(value: &str) -> String {
         "_".to_string()
     } else {
         sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hostname() {
+        let target = SshTarget::parse("nosferatu").unwrap();
+
+        assert_eq!(target.host, "nosferatu",);
+
+        assert_eq!(target.user, None,);
+
+        assert_eq!(target.port, 22,);
+    }
+
+    #[test]
+    fn parses_user_and_hostname() {
+        let target = SshTarget::parse("ferusx@nosferatu").unwrap();
+
+        assert_eq!(target.host, "nosferatu",);
+
+        assert_eq!(target.user.as_deref(), Some("ferusx"),);
+
+        assert_eq!(target.port, 22,);
+    }
+
+    #[test]
+    fn parses_custom_port() {
+        let target = SshTarget::parse("ferusx@nosferatu:2222").unwrap();
+
+        assert_eq!(target.host, "nosferatu",);
+
+        assert_eq!(target.port, 2222,);
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6() {
+        let target = SshTarget::parse("ferusx@[2001:db8::10]:2222").unwrap();
+
+        assert_eq!(target.host, "2001:db8::10",);
+
+        assert_eq!(target.port, 2222,);
+    }
+
+    #[test]
+    fn rejects_zero_port() {
+        assert!(SshTarget::parse("nosferatu:0",).is_err(),);
     }
 }

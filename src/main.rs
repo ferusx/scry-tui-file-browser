@@ -1,11 +1,25 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+/*
+ * FreeBSD's jemalloc normally retains large unused virtual-memory extents for
+ * reuse. Scry can temporarily allocate multi-gigabyte recursive SSH indexes,
+ * so retaining those extents leaves an unnecessarily large resident footprint
+ * after the remote corpus has been discarded.
+ *
+ * Disable jemalloc extent retention for Scry on FreeBSD so released index
+ * memory is returned promptly to the operating system.
+ */
+#[cfg(target_os = "freebsd")]
+#[unsafe(no_mangle)]
+pub static mut malloc_conf: *const std::os::raw::c_char = b"retain:false\0".as_ptr().cast();
+
 mod app;
 mod args;
 mod classify;
 mod clipboard;
 mod config;
 mod connection;
+mod deletion_journal;
 mod entry;
 mod external_help;
 mod file_info;
@@ -21,8 +35,12 @@ mod source;
 mod ssh;
 mod themes;
 mod ui;
+mod ui_state;
 
-use app::{App, DeletionChoice, EntryFilter, RemoteIndexDialogFocus, ViewMode};
+use app::{
+    App, DeletionChoice, EntryFilter, RemoteIndexDialogFocus, TreeExpandAllDialogFocus,
+    TreeExpandAllDialogKind, ViewMode,
+};
 use args::Cli;
 use clap::Parser;
 use connection::ConnectionField;
@@ -34,11 +52,12 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
-    execute,
+    execute, terminal,
 };
 
 /*
@@ -52,6 +71,8 @@ fn apply_session_to_startup_config(config: &mut config::ScryConfig, state: &Sess
     config.display.show_hidden = state.show_hidden;
 
     config.display.show_icons = state.show_icons;
+
+    config.display.show_file_colors = state.show_file_colors;
 
     config.display.show_details = state.show_details;
 
@@ -77,6 +98,8 @@ fn apply_session_to_startup_config(config: &mut config::ScryConfig, state: &Sess
     config.browser.fuzzy = state.search_mode == "fuzzy";
 
     config.browser.recursive = state.recursive;
+
+    config.browser.hidden_only = state.hidden_only;
 
     config.browser.entry_filter = match state.entry_filter.as_str() {
         "files" => "files",
@@ -409,22 +432,60 @@ fn main() -> io::Result<()> {
 
     if let Some(state) = restored_session.as_ref() {
         /*
-         * Session state overrides the browser/display defaults from scry.toml.
+         * scry.toml supplies startup defaults when no session is restored.
          *
-         * Explicit command-line switches are applied afterward and therefore remain
-         * the final authority for this launch.
+         * A restored session represents the user's most recent interactive state
+         * and therefore overrides those defaults. Explicit command-line options
+         * are applied afterward and remain authoritative for this launch.
          */
         apply_session_to_startup_config(&mut startup_config, state);
     }
 
+    let ui_state = ui_state::load().unwrap_or_else(|error| {
+        eprintln!(
+            "scry: unable to load persistent interface state: {}; using defaults",
+            error,
+        );
+
+        ui_state::UiState::default()
+    });
+
+    app.apply_ui_state(ui_state);
+
     app.apply_startup_config(&startup_config);
+
+    /*
+     * Adopt recoverable local deletions before restoring selection and query state.
+     *
+     * SSH sessions never load the local deletion journal. Invalid journals remain
+     * untouched and produce a visible startup warning rather than being acted upon.
+     */
+    match app.recover_staged_deletions() {
+        Ok(0) => {}
+
+        Ok(count) => {
+            startup_warning = Some(format!(
+                "Recovered {} staged deletion{} from an interrupted Scry session. Press Ctrl+Z to restore.",
+                count,
+                if count == 1 { "" } else { "s" },
+            ));
+        }
+
+        Err(error) => {
+            startup_warning = Some(format!("Unable to load deletion recovery: {}", error,));
+        }
+    }
 
     if let Some(state) = restored_session.as_ref() {
         app.restore_session_state(state);
     }
 
     if let Some(message) = startup_warning {
-        app.show_error_message(message);
+        if message.starts_with("Recovered ") {
+            app.show_persistent_info_message(message);
+        } else {
+            app.show_error_message(message);
+        }
     }
 
     if cli.preserve_hierarchy {
@@ -448,6 +509,10 @@ fn main() -> io::Result<()> {
 
     if cli.fuzzy {
         app.enable_fuzzy_mode();
+    }
+
+    if cli.hidden_only && !app.hidden_only_active() {
+        app.toggle_hidden_only();
     }
 
     if cli.files_only {
@@ -498,16 +563,42 @@ fn main() -> io::Result<()> {
     execute!(
         stdout(),
         EnableMouseCapture,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
 
     let run_result = ratatui::run(|terminal| run_app(terminal, &mut app));
 
-    let disable_result = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture,);
+    let disable_result = execute!(
+        stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+    );
 
     run_result?;
 
     disable_result?;
+
+    /*
+     * Staged deletions become permanent only after Scry has left raw terminal mode.
+     *
+     * Any failure can therefore be printed normally and remains visible to the user.
+     * This runs for every orderly exit route, including Ctrl+C and exit-on-open.
+     */
+    let (finalized_deletions, deletion_failures) = app.finalize_staged_deletions();
+
+    if finalized_deletions > 0 {
+        eprintln!(
+            "scry: permanently deleted {} staged entr{}",
+            finalized_deletions,
+            if finalized_deletions == 1 { "y" } else { "ies" },
+        );
+    }
+
+    for failure in deletion_failures {
+        eprintln!("scry: {}", failure);
+    }
 
     if save_session_on_exit {
         match app.session_state() {
@@ -550,12 +641,56 @@ struct ScrollbarDragState {
     selected_viewport_row: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollbarTrackDirection {
+    Up,
+
+    Down,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarTrackHoldState {
+    direction: ScrollbarTrackDirection,
+
+    /*
+     * Pointer position inside the scrollbar track, excluding panel borders.
+     */
+    target_track_position: usize,
+
+    next_repeat: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OverlayScrollbarTrackHoldState {
+    direction: ScrollbarTrackDirection,
+
+    /*
+     * Pointer position inside the Help/Legend scrollbar track.
+     */
+    target_track_position: usize,
+
+    next_repeat: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HorizontalScrollbarDragState {
+    start_mouse_column: u16,
+
+    start_thumb_left: usize,
+}
+
 fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
     let mut ui_regions = ui::UiRegions::default();
 
     let mut last_left_click: Option<(Instant, u16, u16)> = None;
 
     let mut scrollbar_drag: Option<ScrollbarDragState> = None;
+
+    let mut scrollbar_track_hold: Option<ScrollbarTrackHoldState> = None;
+
+    let mut overlay_scrollbar_track_hold: Option<OverlayScrollbarTrackHoldState> = None;
+
+    let mut horizontal_scrollbar_drag: Option<HorizontalScrollbarDragState> = None;
 
     let mut help_scrollbar_drag = false;
 
@@ -571,6 +706,10 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
         }
 
         if app.process_notification_timeouts() {
+            needs_redraw = true;
+        }
+
+        if app.process_rapid_navigation_timeout() {
             needs_redraw = true;
         }
 
@@ -605,10 +744,44 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
             needs_redraw = true;
         }
 
+        if process_scrollbar_track_hold(app, ui_regions.entries, &mut scrollbar_track_hold) {
+            needs_redraw = true;
+        }
+
+        if process_overlay_scrollbar_track_hold(
+            app,
+            ui_regions.help_scrollbar,
+            &mut overlay_scrollbar_track_hold,
+        ) {
+            needs_redraw = true;
+        }
+
         if event::poll(Duration::from_millis(25))? {
             match event::read()? {
                 Event::Key(key_event) => {
                     if key_event.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    let terminal_is_large_enough = terminal::size()
+                        .map(|(width, height)| ui::terminal_size_is_sufficient(width, height))
+                        .unwrap_or(true);
+
+                    if !terminal_is_large_enough {
+                        /*
+                         * While the normal interface is hidden, do not allow invisible browser
+                         * operations to modify application state.
+                         *
+                         * Ctrl+C remains available so Scry can always be exited.
+                         */
+                        if key_event.code == KeyCode::Char('c')
+                            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            app.quit();
+                        }
+
+                        needs_redraw = true;
+
                         continue;
                     }
 
@@ -617,15 +790,36 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
                     needs_redraw = true;
                 }
 
+                Event::Paste(text) => {
+                    let terminal_is_large_enough = terminal::size()
+                        .map(|(width, height)| ui::terminal_size_is_sufficient(width, height))
+                        .unwrap_or(true);
+
+                    if terminal_is_large_enough {
+                        handle_paste_event(app, &text);
+                    }
+
+                    needs_redraw = true;
+                }
+
                 Event::Mouse(mouse_event) => {
-                    handle_mouse_event(
-                        app,
-                        mouse_event,
-                        ui_regions,
-                        &mut last_left_click,
-                        &mut scrollbar_drag,
-                        &mut help_scrollbar_drag,
-                    );
+                    let terminal_is_large_enough = terminal::size()
+                        .map(|(width, height)| ui::terminal_size_is_sufficient(width, height))
+                        .unwrap_or(true);
+
+                    if terminal_is_large_enough {
+                        handle_mouse_event(
+                            app,
+                            mouse_event,
+                            ui_regions,
+                            &mut last_left_click,
+                            &mut scrollbar_drag,
+                            &mut scrollbar_track_hold,
+                            &mut overlay_scrollbar_track_hold,
+                            &mut horizontal_scrollbar_drag,
+                            &mut help_scrollbar_drag,
+                        );
+                    }
 
                     needs_redraw = true;
                 }
@@ -686,6 +880,67 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
     }
 
     Ok(())
+}
+
+fn handle_paste_event(app: &mut App, text: &str) {
+    /*
+     * Bracketed paste must never reinterpret clipboard contents as Scry commands.
+     *
+     * In particular, newlines from a multiline clipboard must not become Enter
+     * presses that activate files or enter directories.
+     *
+     * Scry's editable fields are single-line, so pasted line breaks and tabs are
+     * normalized to ordinary spaces. Other control characters are discarded.
+     */
+    let paste_into_connection = app.connection_visible();
+
+    /*
+     * Paste is ignored while a non-editable overlay or modal operation owns input.
+     */
+    if !paste_into_connection
+        && (app.file_info_visible()
+            || app.tree_expand_all_dialog_visible()
+            || app.remote_index_setup_visible()
+            || app.deletion_visible()
+            || app.transfer_visible()
+            || app.about_visible()
+            || app.legend_visible()
+            || app.help_visible())
+    {
+        return;
+    }
+
+    let mut previous_was_separator = false;
+
+    for character in text.chars() {
+        let character = match character {
+            '\r' | '\n' | '\t' => {
+                if previous_was_separator {
+                    continue;
+                }
+
+                previous_was_separator = true;
+
+                ' '
+            }
+
+            character if character.is_control() => {
+                continue;
+            }
+
+            character => {
+                previous_was_separator = false;
+
+                character
+            }
+        };
+
+        if paste_into_connection {
+            app.connection_push_character(character);
+        } else {
+            app.push_query_character(character);
+        }
+    }
 }
 
 fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
@@ -751,6 +1006,57 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
 
             (KeyCode::End, _) => {
                 app.file_info_scroll_to_end();
+            }
+
+            _ => {}
+        }
+
+        return;
+    }
+
+    if app.tree_expand_all_dialog_visible() {
+        let dialog_kind = app
+            .tree_expand_all_dialog
+            .as_ref()
+            .map(|dialog| dialog.kind);
+
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.quit();
+            }
+
+            (KeyCode::Esc, _) => {
+                app.cancel_tree_expand_all_dialog();
+            }
+
+            /*
+             * The refusal window has no button or selectable action.
+             *
+             * Enter simply acknowledges and closes it.
+             */
+            (KeyCode::Enter, _)
+                if matches!(
+                    dialog_kind,
+                    Some(TreeExpandAllDialogKind::Refusal | TreeExpandAllDialogKind::DisplayLimit)
+                ) =>
+            {
+                app.confirm_tree_expand_all_dialog();
+            }
+
+            /*
+             * Space toggles persistent suppression only in the local warning.
+             *
+             * The App method rejects the action for every other dialog kind.
+             */
+            (KeyCode::Char(' '), _) => {
+                app.toggle_tree_expand_all_warning_suppression();
+            }
+
+            /*
+             * Local and SSH confirmations continue through their single OK action.
+             */
+            (KeyCode::Enter, _) => {
+                app.confirm_tree_expand_all_dialog();
             }
 
             _ => {}
@@ -909,6 +1215,22 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
                 app.connection_next_profile();
             }
 
+            (KeyCode::Left, _) => {
+                app.connection_move_cursor_left();
+            }
+
+            (KeyCode::Right, _) => {
+                app.connection_move_cursor_right();
+            }
+
+            (KeyCode::Home, _) => {
+                app.connection_move_cursor_to_start();
+            }
+
+            (KeyCode::End, _) => {
+                app.connection_move_cursor_to_end();
+            }
+
             (KeyCode::Enter, _) => {
                 use crate::connection::ConnectionField;
 
@@ -921,20 +1243,21 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
                         app.save_connection_profile();
                     }
 
-                    ConnectionField::Disconnect => {
-                        app.disconnect_remote();
-                    }
-
-                    /*
-                     * Connect, Delete, and Disconnect receive their real actions in the
-                     * upcoming connection-management stages.
-                     */
                     ConnectionField::Delete => {
                         app.delete_connection_profile();
                     }
 
+                    ConnectionField::Disconnect => {
+                        app.disconnect_remote();
+                    }
+
+                    ConnectionField::Close => {
+                        app.close_connection_dialog();
+                    }
+
                     /*
-                     * Enter inside an editable field advances to the next enabled control.
+                     * Enter inside an editable field or the profile selector advances to
+                     * the next enabled control.
                      */
                     _ => {
                         app.connection_focus_next();
@@ -997,7 +1320,7 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
                 app.quit();
             }
 
-            (KeyCode::Char('!'), _) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+            (KeyCode::Char('?'), _) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
                 app.close_legend();
             }
 
@@ -1017,12 +1340,12 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
                 app.page_legend_down();
             }
 
-            (KeyCode::Home, _) => {
-                app.help_scroll = 0;
-            }
-
             (KeyCode::End, _) => {
                 app.legend_scroll_to_end();
+            }
+
+            (KeyCode::Home, _) => {
+                app.legend_scroll_to_home();
             }
 
             _ => {}
@@ -1061,10 +1384,7 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
                 app.help_scroll_to_end();
             }
 
-            (KeyCode::Char('?'), _)
-            | (KeyCode::F(1), _)
-            | (KeyCode::Esc, _)
-            | (KeyCode::Enter, _) => {
+            (KeyCode::F(1), _) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
                 app.close_help();
             }
 
@@ -1103,6 +1423,10 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
             app.open_remote_index_builder();
         }
 
+        (KeyCode::F(6), _) => {
+            app.toggle_hidden_only();
+        }
+
         (KeyCode::F(7), _) => {
             app.toggle_permissions_column();
         }
@@ -1117,6 +1441,16 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
 
         (KeyCode::F(10), _) => {
             app.toggle_user_column();
+        }
+
+        /*
+         * F11 remains available for a future feature.
+         *
+         * F12 toggles classified filename colors without changing icons,
+         * classification, sorting, filtering, or filesystem state.
+         */
+        (KeyCode::F(12), _) => {
+            app.toggle_file_colors();
         }
 
         (KeyCode::Char('u'), KeyModifiers::ALT) => {
@@ -1179,6 +1513,10 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
             app.toggle_tree_mode();
         }
 
+        (KeyCode::Char('e'), KeyModifiers::ALT) => {
+            app.request_toggle_all_tree_branches();
+        }
+
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
             app.toggle_search_mode();
         }
@@ -1196,28 +1534,53 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
         }
 
         /*
-         * Plain Left/Right edit the active query safely.
+         * Horizontal entry scrolling.
          *
-         * Hold Control to perform structural navigation. This prevents an accidental
-         * arrow press while editing a query from leaving the current directory or
-         * changing the active Tree branch.
+         * Shift+Left/Right moves the shared Metadata/filesystem viewport.
+         * Plain arrows remain dedicated to browser navigation, while Control-modified
+         * arrows edit the search-field caret.
+         */
+        (KeyCode::Left, modifiers)
+            if modifiers.contains(KeyModifiers::SHIFT)
+                && !modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.scroll_horizontal_left();
+        }
+
+        (KeyCode::Right, modifiers)
+            if modifiers.contains(KeyModifiers::SHIFT)
+                && !modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.scroll_horizontal_right();
+        }
+
+        /*
+         * Browser navigation follows conventional file-browser bindings.
+         *
+         * Plain Left/Right operate on the current directory or Tree structure.
+         * Control-modified arrows are reserved for editing the always-active query.
          */
         (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.enter_parent_directory();
-        }
-
-        (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.enter_selected_directory();
-        }
-
-        (KeyCode::Left, _) => {
             app.move_query_cursor_left();
         }
 
-        (KeyCode::Right, _) => {
+        (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             app.move_query_cursor_right();
         }
 
+        (KeyCode::Left, _) => {
+            app.enter_parent_directory();
+        }
+
+        (KeyCode::Right, _) => {
+            app.enter_selected_directory();
+        }
+
+        /*
+         * Home and End belong to browser navigation.
+         *
+         * Control moves the query caret to its corresponding boundary.
+         */
         (KeyCode::Home, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             app.move_query_cursor_to_start();
         }
@@ -1226,32 +1589,66 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
             app.move_query_cursor_to_end();
         }
 
+        (KeyCode::Home, _) => {
+            app.begin_rapid_navigation();
+
+            app.select_first();
+        }
+
+        (KeyCode::End, _) => {
+            app.begin_rapid_navigation();
+
+            app.select_last();
+        }
+
         (KeyCode::Esc, _) => {
             app.enter_parent_directory();
         }
 
         (KeyCode::Up, _) => {
+            app.begin_rapid_navigation();
+
             app.move_up();
         }
 
         (KeyCode::Down, _) => {
+            app.begin_rapid_navigation();
+
             app.move_down();
         }
 
+        (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.begin_rapid_navigation();
+
+            app.fast_page_up();
+        }
+
+        (KeyCode::PageDown, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.begin_rapid_navigation();
+
+            app.fast_page_down();
+        }
+
         (KeyCode::PageUp, _) => {
+            app.begin_rapid_navigation();
+
             app.page_up();
         }
 
         (KeyCode::PageDown, _) => {
+            app.begin_rapid_navigation();
+
             app.page_down();
         }
 
-        (KeyCode::Home, _) => {
-            app.select_first();
-        }
-
-        (KeyCode::End, _) => {
-            app.select_last();
+        /*
+         * Undo the most recently staged local deletion.
+         *
+         * Scry receives Ctrl+Z while its raw terminal interface is active, so the key
+         * is handled here rather than being passed to the shell as job suspension.
+         */
+        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+            app.restore_last_deletion();
         }
 
         (KeyCode::Delete, _) => {
@@ -1259,26 +1656,16 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
         }
 
         /*
-         * While browsing through SSH, marked files take precedence over ordinary
-         * activation.
+         * Enter always activates the currently highlighted entry.
          *
-         * This applies specifically to keyboard Enter. Mouse double-click continues
-         * activating the entry beneath the pointer rather than unexpectedly launching
-         * marks collected elsewhere.
+         * Remote files use the single-file transfer path independently from persistent
+         * batch marks. Marked files are downloaded only through Alt+D.
          */
         (KeyCode::Enter, KeyModifiers::NONE) => {
-            if app.source_is_remote() && app.marked_count() > 0 {
-                app.begin_marked_transfer_batch();
-            } else {
-                app.activate_selected();
-            }
+            app.activate_selected();
         }
 
         (KeyCode::Char('?'), _) => {
-            app.toggle_help();
-        }
-
-        (KeyCode::Char('!'), _) => {
             app.toggle_legend();
         }
 
@@ -1311,12 +1698,16 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse_event(
     app: &mut App,
     event: MouseEvent,
     regions: ui::UiRegions,
     last_left_click: &mut Option<(Instant, u16, u16)>,
     scrollbar_drag: &mut Option<ScrollbarDragState>,
+    scrollbar_track_hold: &mut Option<ScrollbarTrackHoldState>,
+    overlay_scrollbar_track_hold: &mut Option<OverlayScrollbarTrackHoldState>,
+    horizontal_scrollbar_drag: &mut Option<HorizontalScrollbarDragState>,
     help_scrollbar_drag: &mut bool,
 ) {
     /*
@@ -1342,6 +1733,54 @@ fn handle_mouse_event(
         return;
     }
 
+    if app.tree_expand_all_dialog_visible() {
+        /*
+         * The large-Tree dialog owns every mouse event while visible.
+         *
+         * Nothing may pass through into the Tree behind the popup.
+         */
+        *scrollbar_drag = None;
+
+        *scrollbar_track_hold = None;
+
+        *horizontal_scrollbar_drag = None;
+
+        *help_scrollbar_drag = false;
+
+        *last_left_click = None;
+
+        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        let Some(dialog_regions) = regions.tree_expand_all else {
+            return;
+        };
+
+        let inside = |area: Rect| {
+            event.column >= area.x
+                && event.column < area.x.saturating_add(area.width)
+                && event.row >= area.y
+                && event.row < area.y.saturating_add(area.height)
+        };
+
+        if dialog_regions.warning_checkbox.is_some_and(inside) {
+            app.toggle_tree_expand_all_warning_suppression();
+        } else if dialog_regions.expand_all.is_some_and(inside) {
+            app.select_tree_expand_all_dialog_focus(TreeExpandAllDialogFocus::ExpandAll);
+
+            app.confirm_tree_expand_all_dialog();
+        } else if dialog_regions.cancel.is_some_and(inside) {
+            app.select_tree_expand_all_dialog_focus(TreeExpandAllDialogFocus::Cancel);
+
+            app.cancel_tree_expand_all_dialog();
+        } else if dialog_regions.ok.is_some_and(inside) {
+            app.confirm_tree_expand_all_dialog();
+        }
+
+        return;
+    }
+
     if app.remote_index_setup_visible() {
         /*
          * The setup window owns every mouse event while visible.
@@ -1350,6 +1789,10 @@ fn handle_mouse_event(
          * rather than being passed to the browser underneath.
          */
         *scrollbar_drag = None;
+
+        *scrollbar_track_hold = None;
+
+        *horizontal_scrollbar_drag = None;
 
         *help_scrollbar_drag = false;
 
@@ -1394,6 +1837,10 @@ fn handle_mouse_event(
     if app.deletion_visible() {
         *scrollbar_drag = None;
 
+        *scrollbar_track_hold = None;
+
+        *horizontal_scrollbar_drag = None;
+
         *help_scrollbar_drag = false;
 
         *last_left_click = None;
@@ -1401,15 +1848,43 @@ fn handle_mouse_event(
         /*
          * Deletion confirmation is modal.
          *
-         * Mouse events must not select or activate entries behind the popup.
-         * Button hit testing will be added separately after keyboard behavior has
-         * been verified.
+         * Every mouse event is consumed here so the browser beneath the popup
+         * cannot be selected or activated.
          */
+        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        let Some(deletion_regions) = regions.deletion else {
+            return;
+        };
+
+        let inside = |area: Rect| {
+            event.column >= area.x
+                && event.column < area.x.saturating_add(area.width)
+                && event.row >= area.y
+                && event.row < area.y.saturating_add(area.height)
+        };
+
+        if inside(deletion_regions.delete) {
+            app.select_deletion_choice(DeletionChoice::Delete);
+
+            app.confirm_deletion();
+        } else if inside(deletion_regions.cancel) {
+            app.select_deletion_choice(DeletionChoice::Cancel);
+
+            app.cancel_deletion();
+        }
+
         return;
     }
 
     if app.transfer_visible() {
         *scrollbar_drag = None;
+
+        *scrollbar_track_hold = None;
+
+        *horizontal_scrollbar_drag = None;
 
         *last_left_click = None;
 
@@ -1427,6 +1902,10 @@ fn handle_mouse_event(
     if app.connection_visible() {
         *scrollbar_drag = None;
 
+        *scrollbar_track_hold = None;
+
+        *horizontal_scrollbar_drag = None;
+
         *last_left_click = None;
 
         handle_connection_mouse_event(app, event, regions.connection);
@@ -1436,6 +1915,10 @@ fn handle_mouse_event(
 
     if app.about_visible() {
         *scrollbar_drag = None;
+
+        *scrollbar_track_hold = None;
+
+        *horizontal_scrollbar_drag = None;
 
         *help_scrollbar_drag = false;
 
@@ -1451,6 +1934,10 @@ fn handle_mouse_event(
     if app.help_visible() || app.legend_visible() {
         *scrollbar_drag = None;
 
+        *scrollbar_track_hold = None;
+
+        *horizontal_scrollbar_drag = None;
+
         *last_left_click = None;
 
         let overlay_scrollbar = regions.help_scrollbar;
@@ -1461,6 +1948,22 @@ fn handle_mouse_event(
                 && event.row >= area.y
                 && event.row < area.y.saturating_add(area.height)
         });
+
+        let on_help_tips_link = app.help_visible()
+            && regions.help_tips_link.is_some_and(|area| {
+                event.column >= area.x
+                    && event.column < area.x.saturating_add(area.width)
+                    && event.row >= area.y
+                    && event.row < area.y.saturating_add(area.height)
+            });
+
+        let on_help_top_link = app.help_visible()
+            && regions.help_top_link.is_some_and(|area| {
+                event.column >= area.x
+                    && event.column < area.x.saturating_add(area.width)
+                    && event.row >= area.y
+                    && event.row < area.y.saturating_add(area.height)
+            });
 
         match event.kind {
             MouseEventKind::ScrollUp => {
@@ -1479,14 +1982,130 @@ fn handle_mouse_event(
                 }
             }
 
-            MouseEventKind::Down(MouseButton::Left) if on_overlay_scrollbar => {
-                *help_scrollbar_drag = true;
+            MouseEventKind::Down(MouseButton::Left) if on_help_tips_link => {
+                *last_left_click = None;
 
-                drag_overlay_scrollbar(
-                    app,
-                    event.row,
-                    overlay_scrollbar.expect("checked overlay scrollbar region"),
-                );
+                *help_scrollbar_drag = false;
+
+                *overlay_scrollbar_track_hold = None;
+
+                app.help_tips_hovered = false;
+
+                app.help_scroll_to_tips();
+            }
+
+            MouseEventKind::Down(MouseButton::Left) if on_help_top_link => {
+                *last_left_click = None;
+
+                *help_scrollbar_drag = false;
+
+                *overlay_scrollbar_track_hold = None;
+
+                app.help_top_hovered = false;
+
+                app.help_scroll_to_top();
+            }
+
+            MouseEventKind::Down(MouseButton::Left) if on_overlay_scrollbar => {
+                *last_left_click = None;
+
+                let area = overlay_scrollbar.expect("checked overlay scrollbar region");
+
+                let maximum_scroll = if app.legend_visible() {
+                    app.legend_max_scroll
+                } else {
+                    app.help_max_scroll
+                };
+
+                let viewport_length = area.height as usize;
+
+                let content_length = maximum_scroll as usize + viewport_length;
+
+                let track_length = area.height as usize;
+
+                if maximum_scroll == 0 || track_length == 0 {
+                    *help_scrollbar_drag = false;
+
+                    *overlay_scrollbar_track_hold = None;
+
+                    return;
+                }
+
+                let thumb_length =
+                    scrollbar_thumb_length(content_length, viewport_length, track_length);
+
+                let thumb_travel = track_length.saturating_sub(thumb_length);
+
+                if thumb_travel == 0 {
+                    *help_scrollbar_drag = false;
+
+                    *overlay_scrollbar_track_hold = None;
+
+                    return;
+                }
+
+                let current_scroll = if app.legend_visible() {
+                    app.legend_scroll
+                } else {
+                    app.help_scroll
+                } as usize;
+
+                let current_thumb_top = current_scroll
+                    .saturating_mul(thumb_travel)
+                    .saturating_add(maximum_scroll as usize / 2)
+                    / maximum_scroll as usize;
+
+                let clicked_track_position = event
+                    .row
+                    .saturating_sub(area.y)
+                    .min(area.height.saturating_sub(1))
+                    as usize;
+
+                let clicked_inside_thumb = clicked_track_position >= current_thumb_top
+                    && clicked_track_position < current_thumb_top.saturating_add(thumb_length);
+
+                if clicked_inside_thumb {
+                    /*
+                     * Clicking the thumb retains ordinary proportional dragging.
+                     */
+                    *overlay_scrollbar_track_hold = None;
+
+                    *help_scrollbar_drag = true;
+                } else {
+                    /*
+                     * Clicking the track moves exactly one viewport toward the pointer.
+                     *
+                     * Holding the button continues paging until the thumb reaches the
+                     * clicked position, matching the filesystem scrollbar.
+                     */
+                    *help_scrollbar_drag = false;
+
+                    let direction = if clicked_track_position < current_thumb_top {
+                        if app.legend_visible() {
+                            app.page_legend_up();
+                        } else {
+                            app.page_help_up();
+                        }
+
+                        ScrollbarTrackDirection::Up
+                    } else {
+                        if app.legend_visible() {
+                            app.page_legend_down();
+                        } else {
+                            app.page_help_down();
+                        }
+
+                        ScrollbarTrackDirection::Down
+                    };
+
+                    *overlay_scrollbar_track_hold = Some(OverlayScrollbarTrackHoldState {
+                        direction,
+
+                        target_track_position: clicked_track_position,
+
+                        next_repeat: Instant::now() + Duration::from_millis(300),
+                    });
+                }
             }
 
             MouseEventKind::Drag(MouseButton::Left) if *help_scrollbar_drag => {
@@ -1498,7 +2117,13 @@ fn handle_mouse_event(
             MouseEventKind::Up(MouseButton::Left) => {
                 *help_scrollbar_drag = false;
 
+                *overlay_scrollbar_track_hold = None;
+
                 *scrollbar_drag = None;
+
+                *scrollbar_track_hold = None;
+
+                *horizontal_scrollbar_drag = None;
 
                 app.scrollbar_drag_active = false;
             }
@@ -1549,12 +2174,21 @@ fn handle_mouse_event(
                 .y
                 .saturating_add(regions.home_button.height);
 
+    let horizontal_scrollbar_area = regions.horizontal_scrollbar;
+
+    let on_horizontal_scrollbar = horizontal_scrollbar_area.is_some_and(|area| {
+        event.column >= area.x
+            && event.column < area.x.saturating_add(area.width)
+            && event.row >= area.y
+            && event.row < area.y.saturating_add(area.height)
+    });
+
     /*
      * The terminal's visible mouse pointer may overlap the scrollbar while its
      * reported cell lies immediately to either side of the rendered column.
      *
-     * Test the scrollbar rows independently from inside_entries_panel so the
-     * cell immediately to the right of the panel remains a valid grab target.
+     * Test the scrollbar rows independently, from inside_entries_panel so the
+     * cell immediately to the right of the panel, remains a valid grab target.
      */
     let inside_scrollbar_rows =
         event.row > area.y && event.row < area.y.saturating_add(area.height).saturating_sub(1);
@@ -1568,34 +2202,137 @@ fn handle_mouse_event(
         && event.column <= scrollbar_hit_right;
 
     match event.kind {
+        MouseEventKind::Down(MouseButton::Left) if on_horizontal_scrollbar => {
+            *last_left_click = None;
+
+            *scrollbar_drag = None;
+
+            let Some(area) = horizontal_scrollbar_area else {
+                return;
+            };
+
+            const HORIZONTAL_THUMB_WIDTH: usize = 5;
+
+            let track_length = area.width as usize;
+
+            let thumb_width = HORIZONTAL_THUMB_WIDTH.min(track_length);
+
+            let thumb_travel = track_length.saturating_sub(thumb_width);
+
+            if thumb_travel == 0 || app.horizontal_max_offset == 0 {
+                return;
+            }
+
+            let current_thumb_left = app
+                .horizontal_offset
+                .saturating_mul(thumb_travel)
+                .saturating_add(app.horizontal_max_offset / 2)
+                / app.horizontal_max_offset;
+
+            let clicked_position = event.column.saturating_sub(area.x) as usize;
+
+            let clicked_inside_thumb = clicked_position >= current_thumb_left
+                && clicked_position < current_thumb_left.saturating_add(thumb_width);
+
+            /*
+             * Clicking outside the handle jumps it so its center lands beneath the
+             * pointer. Clicking the handle itself begins an ordinary relative drag.
+             */
+            let start_thumb_left = if clicked_inside_thumb {
+                current_thumb_left
+            } else {
+                let requested_thumb_left = clicked_position.saturating_sub(thumb_width / 2);
+
+                let requested_thumb_left = requested_thumb_left.min(thumb_travel);
+
+                app.horizontal_offset = requested_thumb_left
+                    .saturating_mul(app.horizontal_max_offset)
+                    .saturating_add(thumb_travel / 2)
+                    / thumb_travel;
+
+                requested_thumb_left
+            };
+
+            *horizontal_scrollbar_drag = Some(HorizontalScrollbarDragState {
+                start_mouse_column: event.column,
+
+                start_thumb_left,
+            });
+
+            app.scrollbar_drag_active = true;
+        }
+
+        MouseEventKind::Drag(MouseButton::Left) if horizontal_scrollbar_drag.is_some() => {
+            let Some(area) = horizontal_scrollbar_area else {
+                *horizontal_scrollbar_drag = None;
+
+                app.scrollbar_drag_active = false;
+
+                return;
+            };
+
+            let Some(drag) = *horizontal_scrollbar_drag else {
+                return;
+            };
+
+            drag_horizontal_scrollbar(app, event.column, area, drag);
+        }
+
         MouseEventKind::Down(MouseButton::Left) if on_parent_button => {
             *scrollbar_drag = None;
 
+            *scrollbar_track_hold = None;
+
+            *horizontal_scrollbar_drag = None;
+
+            app.scrollbar_drag_active = false;
+
             *last_left_click = None;
 
-            app.enter_parent_directory();
+            app.enter_previous_directory();
         }
 
         MouseEventKind::ScrollUp => {
+            app.begin_rapid_navigation();
+
             app.scroll_selection(-WHEEL_STEP);
         }
 
         MouseEventKind::ScrollDown => {
+            app.begin_rapid_navigation();
+
             app.scroll_selection(WHEEL_STEP);
         }
 
         /*
-         * Clicking the scrollbar begins a drag immediately and moves the
-         * selection to the clicked proportional position.
+         * Clicking the vertical scrollbar behaves like the horizontal scrollbar:
+         *
+         * - clicking the thumb begins a relative drag;
+         * - clicking elsewhere on the track jumps the thumb beneath the pointer,
+         *   then allows dragging to continue from that new position.
          */
         MouseEventKind::Down(MouseButton::Left) if on_scrollbar => {
             *last_left_click = None;
+
+            /*
+             * A vertical-scrollbar interaction cancels any horizontal drag that may
+             * still be active from an unusual mouse-event sequence.
+             */
+            *horizontal_scrollbar_drag = None;
 
             let content_length = app.current_visible_entry_count();
 
             let viewport_length = app.viewport_rows;
 
             let track_length = area.height.saturating_sub(2) as usize;
+
+            if content_length <= viewport_length || track_length == 0 {
+                *scrollbar_drag = None;
+
+                app.scrollbar_drag_active = false;
+
+                return;
+            }
 
             let thumb_length =
                 scrollbar_thumb_length(content_length, viewport_length, track_length);
@@ -1604,34 +2341,105 @@ fn handle_mouse_event(
 
             let maximum_offset = content_length.saturating_sub(viewport_length);
 
-            /*
-             * Convert the current viewport offset into the thumb's actual track position.
-             *
-             * Rounded division keeps this coordinate consistent with the rendered handle.
-             */
-            let start_thumb_top = if maximum_offset == 0 || thumb_travel == 0 {
-                0
-            } else {
-                app.list_offset
-                    .saturating_mul(thumb_travel)
-                    .saturating_add(maximum_offset / 2)
-                    / maximum_offset
-            };
+            if thumb_travel == 0 || maximum_offset == 0 {
+                *scrollbar_drag = None;
 
+                app.scrollbar_drag_active = false;
+
+                return;
+            }
+
+            /*
+             * Match ui::render_vertical_scrollbar() and Ratatui's proportional
+             * placement scale.
+             *
+             * The rendered scrollbar first maps list_offset onto
+             * content_length - 1. Reusing that intermediate scale here prevents
+             * the mouse hitbox from sitting one row above the visible one-cell thumb.
+             */
+            let scrollbar_position = app
+                .list_offset
+                .saturating_mul(content_length.saturating_sub(1))
+                .checked_div(maximum_offset)
+                .unwrap_or(0);
+
+            let current_thumb_top = scrollbar_position
+                .saturating_mul(track_length)
+                .saturating_add(content_length / 2)
+                .checked_div(content_length)
+                .unwrap_or(0)
+                .min(thumb_travel);
+
+            /*
+             * Preserve where the selected row currently appears inside the viewport.
+             *
+             * After a track jump, the selector therefore moves with the viewport rather
+             * than unexpectedly snapping to its first or final visible row.
+             */
             let selected_viewport_row = app
                 .selected
                 .saturating_sub(app.list_offset)
-                .min(app.viewport_rows.saturating_sub(1));
+                .min(viewport_length.saturating_sub(1));
 
-            *scrollbar_drag = Some(ScrollbarDragState {
-                start_mouse_row: event.row,
+            /*
+             * The track begins one row below the panel's top border.
+             */
+            let clicked_track_position =
+                event.row.saturating_sub(area.y).saturating_sub(1) as usize;
 
-                start_thumb_top,
+            let clicked_track_position = clicked_track_position.min(track_length.saturating_sub(1));
 
-                selected_viewport_row,
-            });
+            let clicked_inside_thumb = clicked_track_position >= current_thumb_top
+                && clicked_track_position < current_thumb_top.saturating_add(thumb_length);
 
-            app.scrollbar_drag_active = true;
+            if clicked_inside_thumb {
+                /*
+                 * Grabbing the thumb starts ordinary proportional dragging.
+                 */
+                *scrollbar_track_hold = None;
+
+                *scrollbar_drag = Some(ScrollbarDragState {
+                    start_mouse_row: event.row,
+
+                    start_thumb_top: current_thumb_top,
+
+                    selected_viewport_row,
+                });
+
+                app.scrollbar_drag_active = true;
+            } else {
+                /*
+                 * Clicking the track moves one viewport immediately. Keeping the button
+                 * held continues paging toward the pointer after a short initial delay.
+                 */
+                *scrollbar_drag = None;
+
+                app.scrollbar_drag_active = true;
+
+                app.begin_rapid_navigation();
+
+                let direction = if clicked_track_position < current_thumb_top {
+                    app.page_up();
+
+                    ScrollbarTrackDirection::Up
+                } else {
+                    app.page_down();
+
+                    ScrollbarTrackDirection::Down
+                };
+
+                *scrollbar_track_hold = Some(ScrollbarTrackHoldState {
+                    direction,
+
+                    target_track_position: clicked_track_position,
+
+                    /*
+                     * Preserve an ordinary click as one page. Repetition begins only when
+                     * the button remains held for a noticeable moment.
+                     */
+                    next_repeat: Instant::now() + Duration::from_millis(300),
+                });
+            }
         }
 
         /*
@@ -1651,11 +2459,19 @@ fn handle_mouse_event(
         MouseEventKind::Up(MouseButton::Left) => {
             *scrollbar_drag = None;
 
+            *scrollbar_track_hold = None;
+
+            *horizontal_scrollbar_drag = None;
+
             app.scrollbar_drag_active = false;
         }
 
         MouseEventKind::Down(MouseButton::Left) => {
             *scrollbar_drag = None;
+
+            *scrollbar_track_hold = None;
+
+            *horizontal_scrollbar_drag = None;
 
             app.scrollbar_drag_active = false;
 
@@ -1696,7 +2512,39 @@ fn handle_mouse_event(
                 });
 
             if is_double_click {
-                app.activate_selected();
+                let selected_tree_directory_state = if app.view_mode == ViewMode::Tree {
+                    app.tree_row_at_filtered_position(app.selected)
+                        .filter(|row| row.entry.is_directory)
+                        .map(|row| row.expanded)
+                } else {
+                    None
+                };
+
+                match selected_tree_directory_state {
+                    /*
+                     * Double-clicking an expanded Tree directory collapses its branch
+                     * without changing the active Tree root.
+                     */
+                    Some(true) => {
+                        app.enter_parent_directory();
+                    }
+
+                    /*
+                     * Double-clicking a closed Tree directory expands its branch
+                     * without changing the active Tree root.
+                     */
+                    Some(false) => {
+                        app.enter_selected_directory();
+                    }
+
+                    /*
+                     * List directories and ordinary files retain their normal
+                     * double-click activation.
+                     */
+                    None => {
+                        app.activate_selected();
+                    }
+                }
 
                 *last_left_click = None;
             } else {
@@ -1852,6 +2700,42 @@ fn scrollbar_thumb_length(
     thumb_length.max(1).min(track_length)
 }
 
+fn drag_horizontal_scrollbar(
+    app: &mut App,
+    mouse_column: u16,
+    area: Rect,
+    drag: HorizontalScrollbarDragState,
+) {
+    const HORIZONTAL_THUMB_WIDTH: usize = 5;
+
+    let track_length = area.width as usize;
+
+    let thumb_width = HORIZONTAL_THUMB_WIDTH.min(track_length);
+
+    let thumb_travel = track_length.saturating_sub(thumb_width);
+
+    if thumb_travel == 0 || app.horizontal_max_offset == 0 {
+        app.horizontal_offset = 0;
+
+        return;
+    }
+
+    let mouse_delta = i32::from(mouse_column) - i32::from(drag.start_mouse_column);
+
+    let requested_thumb_left = if mouse_delta < 0 {
+        drag.start_thumb_left
+            .saturating_sub(mouse_delta.unsigned_abs() as usize)
+    } else {
+        drag.start_thumb_left.saturating_add(mouse_delta as usize)
+    }
+    .min(thumb_travel);
+
+    app.horizontal_offset = requested_thumb_left
+        .saturating_mul(app.horizontal_max_offset)
+        .saturating_add(thumb_travel / 2)
+        / thumb_travel;
+}
+
 fn drag_scrollbar(
     app: &mut App,
     mouse_row: u16,
@@ -1907,4 +2791,209 @@ fn drag_scrollbar(
     app.list_offset = new_offset;
 
     app.selected = new_selected;
+}
+
+fn process_scrollbar_track_hold(
+    app: &mut App,
+    area: ratatui::layout::Rect,
+    track_hold: &mut Option<ScrollbarTrackHoldState>,
+) -> bool {
+    let Some(mut hold) = *track_hold else {
+        return false;
+    };
+
+    let now = Instant::now();
+
+    if now < hold.next_repeat {
+        return false;
+    }
+
+    let content_length = app.current_visible_entry_count();
+
+    let viewport_length = app.viewport_rows;
+
+    let track_length = area.height.saturating_sub(2) as usize;
+
+    if content_length <= viewport_length || track_length == 0 {
+        *track_hold = None;
+
+        app.scrollbar_drag_active = false;
+
+        return false;
+    }
+
+    let thumb_length = scrollbar_thumb_length(content_length, viewport_length, track_length);
+
+    let thumb_travel = track_length.saturating_sub(thumb_length);
+
+    let maximum_offset = content_length.saturating_sub(viewport_length);
+
+    if thumb_travel == 0 || maximum_offset == 0 {
+        *track_hold = None;
+
+        app.scrollbar_drag_active = false;
+
+        return false;
+    }
+
+    let current_thumb_top = app
+        .list_offset
+        .saturating_mul(thumb_travel)
+        .saturating_add(maximum_offset / 2)
+        / maximum_offset;
+
+    let current_thumb_bottom = current_thumb_top.saturating_add(thumb_length.saturating_sub(1));
+
+    /*
+     * Stop once the thumb reaches or crosses the pointer.
+     */
+    let target_reached = match hold.direction {
+        ScrollbarTrackDirection::Up => hold.target_track_position >= current_thumb_top,
+
+        ScrollbarTrackDirection::Down => hold.target_track_position <= current_thumb_bottom,
+    };
+
+    if target_reached {
+        *track_hold = None;
+
+        app.scrollbar_drag_active = false;
+
+        return false;
+    }
+
+    app.begin_rapid_navigation();
+
+    match hold.direction {
+        ScrollbarTrackDirection::Up => {
+            app.page_up();
+        }
+
+        ScrollbarTrackDirection::Down => {
+            app.page_down();
+        }
+    }
+
+    /*
+     * Roughly fourteen viewport movements per second: considerably faster than
+     * repeated manual clicks, but still controlled and visibly gradual.
+     */
+    hold.next_repeat = now + Duration::from_millis(70);
+
+    *track_hold = Some(hold);
+
+    true
+}
+
+fn process_overlay_scrollbar_track_hold(
+    app: &mut App,
+    area: Option<Rect>,
+    track_hold: &mut Option<OverlayScrollbarTrackHoldState>,
+) -> bool {
+    let Some(mut hold) = *track_hold else {
+        return false;
+    };
+
+    /*
+     * Closing Help/Legend or losing its scrollbar immediately ends the hold.
+     */
+    if !app.help_visible() && !app.legend_visible() {
+        *track_hold = None;
+
+        return false;
+    }
+
+    let Some(area) = area else {
+        *track_hold = None;
+
+        return false;
+    };
+
+    let now = Instant::now();
+
+    if now < hold.next_repeat {
+        return false;
+    }
+
+    let maximum_scroll = if app.legend_visible() {
+        app.legend_max_scroll
+    } else {
+        app.help_max_scroll
+    };
+
+    let viewport_length = area.height as usize;
+
+    let content_length = maximum_scroll as usize + viewport_length;
+
+    let track_length = area.height as usize;
+
+    if maximum_scroll == 0 || track_length == 0 {
+        *track_hold = None;
+
+        return false;
+    }
+
+    let thumb_length = scrollbar_thumb_length(content_length, viewport_length, track_length);
+
+    let thumb_travel = track_length.saturating_sub(thumb_length);
+
+    if thumb_travel == 0 {
+        *track_hold = None;
+
+        return false;
+    }
+
+    let current_scroll = if app.legend_visible() {
+        app.legend_scroll
+    } else {
+        app.help_scroll
+    } as usize;
+
+    let current_thumb_top = current_scroll
+        .saturating_mul(thumb_travel)
+        .saturating_add(maximum_scroll as usize / 2)
+        / maximum_scroll as usize;
+
+    let current_thumb_bottom = current_thumb_top.saturating_add(thumb_length.saturating_sub(1));
+
+    /*
+     * Stop as soon as the thumb reaches or crosses the original click.
+     */
+    let target_reached = match hold.direction {
+        ScrollbarTrackDirection::Up => hold.target_track_position >= current_thumb_top,
+
+        ScrollbarTrackDirection::Down => hold.target_track_position <= current_thumb_bottom,
+    };
+
+    if target_reached {
+        *track_hold = None;
+
+        return false;
+    }
+
+    match hold.direction {
+        ScrollbarTrackDirection::Up => {
+            if app.legend_visible() {
+                app.page_legend_up();
+            } else {
+                app.page_help_up();
+            }
+        }
+
+        ScrollbarTrackDirection::Down => {
+            if app.legend_visible() {
+                app.page_legend_down();
+            } else {
+                app.page_help_down();
+            }
+        }
+    }
+
+    /*
+     * Match the filesystem scrollbar's established repeat cadence.
+     */
+    hold.next_repeat = now + Duration::from_millis(70);
+
+    *track_hold = Some(hold);
+
+    true
 }

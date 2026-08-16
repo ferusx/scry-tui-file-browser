@@ -36,6 +36,9 @@ pub struct SessionState {
 
     pub list_offset: usize,
 
+    #[serde(default)]
+    pub selected_viewport_row: Option<usize>,
+
     pub query: String,
 
     pub view_mode: String,
@@ -52,7 +55,23 @@ pub struct SessionState {
 
     pub show_hidden: bool,
 
+    /*
+     * Hidden Only was added after session format version 1.
+     *
+     * Older session files restore with the mode disabled.
+     */
+    #[serde(default)]
+    pub hidden_only: bool,
+
     pub show_icons: bool,
+
+    /*
+     * Added after session format version 1 was introduced.
+     *
+     * Older session files safely restore with classified filename colors disabled.
+     */
+    #[serde(default)]
+    pub show_file_colors: bool,
 
     pub show_details: bool,
 
@@ -68,6 +87,43 @@ pub struct SessionState {
 
     pub show_user: bool,
 
+    /*
+     * Tree branch state.
+     *
+     * serde(default) keeps existing version-1 session files compatible. Older
+     * files simply restore with no remembered branch state.
+     */
+
+    /*
+     * Compact bulk Tree states.
+     *
+     * Expand All or Collapse All may affect tens of thousands of directories.
+     * Saving one Boolean prevents session.json from containing the complete
+     * hierarchy as absolute paths.
+     */
+    #[serde(default)]
+    pub ordinary_expand_all: bool,
+
+    #[serde(default)]
+    pub recursive_expand_all: bool,
+
+    #[serde(default)]
+    pub search_collapse_all: bool,
+
+    /*
+     * Explicit manual branch state.
+     *
+     * These arrays remain useful when the Tree is only partially expanded or
+     * collapsed. They are empty when the corresponding bulk Boolean is true.
+     */
+    #[serde(default)]
+    pub expanded_directories: Vec<PathBuf>,
+
+    #[serde(default)]
+    pub recursive_expanded_directories: Vec<PathBuf>,
+
+    #[serde(default)]
+    pub search_collapsed_directories: Vec<PathBuf>,
     /*
      * Persistent SSH batch marks.
      *
@@ -191,10 +247,10 @@ pub fn session_file_path() -> io::Result<PathBuf> {
 }
 
 fn session_state_directory() -> io::Result<PathBuf> {
-    if let Some(xdg_state_home) = env::var_os("XDG_STATE_HOME") {
-        if !xdg_state_home.is_empty() {
-            return Ok(PathBuf::from(xdg_state_home).join(SESSION_DIRECTORY_NAME));
-        }
+    if let Some(xdg_state_home) = env::var_os("XDG_STATE_HOME")
+        && !xdg_state_home.is_empty()
+    {
+        return Ok(PathBuf::from(xdg_state_home).join(SESSION_DIRECTORY_NAME));
     }
 
     let home = env::var_os("HOME").ok_or_else(|| {
@@ -276,6 +332,8 @@ mod tests {
 
             list_offset: 14,
 
+            selected_viewport_row: Some(7),
+
             query: "type:source index".to_string(),
 
             view_mode: "tree".to_string(),
@@ -292,7 +350,11 @@ mod tests {
 
             show_hidden: true,
 
+            hidden_only: true,
+
             show_icons: true,
+
+            show_file_colors: true,
 
             show_details: true,
 
@@ -308,6 +370,19 @@ mod tests {
 
             show_user: false,
 
+            ordinary_expand_all: false,
+            recursive_expand_all: false,
+            search_collapse_all: false,
+
+            expanded_directories: vec![
+                PathBuf::from("/tmp/project/src"),
+                PathBuf::from("/tmp/project/themes"),
+            ],
+
+            recursive_expanded_directories: vec![PathBuf::from("/tmp/project/src/query")],
+
+            search_collapsed_directories: vec![PathBuf::from("/tmp/project/target")],
+
             marked_files: vec![SessionMarkedFile {
                 path: PathBuf::from("/srv/projects/example/archive.tar"),
 
@@ -322,6 +397,12 @@ mod tests {
         let restored: SessionState = serde_json::from_str(&serialized).unwrap();
 
         assert!(restored.is_supported());
+
+        assert!(restored.show_file_colors);
+
+        assert!(restored.hidden_only);
+
+        assert_eq!(restored.selected_viewport_row, Some(7));
 
         assert_eq!(restored.query, "type:source index");
 

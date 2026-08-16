@@ -51,6 +51,47 @@ impl EntryKind {
     }
 }
 
+pub fn format_permissions(kind: EntryKind, mode: u32) -> String {
+    let mut permissions = String::with_capacity(10);
+
+    permissions.push(kind.permission_type_character());
+
+    permissions.push(if mode & 0o400 != 0 { 'r' } else { '-' });
+
+    permissions.push(if mode & 0o200 != 0 { 'w' } else { '-' });
+
+    permissions.push(match (mode & 0o100 != 0, mode & 0o4000 != 0) {
+        (true, true) => 's',
+        (false, true) => 'S',
+        (true, false) => 'x',
+        (false, false) => '-',
+    });
+
+    permissions.push(if mode & 0o040 != 0 { 'r' } else { '-' });
+
+    permissions.push(if mode & 0o020 != 0 { 'w' } else { '-' });
+
+    permissions.push(match (mode & 0o010 != 0, mode & 0o2000 != 0) {
+        (true, true) => 's',
+        (false, true) => 'S',
+        (true, false) => 'x',
+        (false, false) => '-',
+    });
+
+    permissions.push(if mode & 0o004 != 0 { 'r' } else { '-' });
+
+    permissions.push(if mode & 0o002 != 0 { 'w' } else { '-' });
+
+    permissions.push(match (mode & 0o001 != 0, mode & 0o1000 != 0) {
+        (true, true) => 't',
+        (false, true) => 'T',
+        (true, false) => 'x',
+        (false, false) => '-',
+    });
+
+    permissions
+}
+
 #[derive(Debug, Clone)]
 pub struct EntryMetadata {
     pub kind: EntryKind,

@@ -1,17 +1,12 @@
 [package]
 name = "scry"
-version = "0.3.4"
+version = "1.0.0"
 edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
-arboard = {
-    version = "3.6.1",
-    features = ["wayland-data-control"]
-}
 bincode = { version = "2", features = ["serde"] }
 bytes = "1.12.1"
-cli-clipboard = "0.4"
 chrono = "0.4.45"
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
@@ -25,3 +20,6 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "process", "io-util
 toml = "0.8"
 users = "0.11.0"
 walkdir = "2.5.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cli-clipboard = "0.4"

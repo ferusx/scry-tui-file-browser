@@ -68,6 +68,11 @@ pub const OPTIONS: &[HelpOption] = &[
         description: "Show hidden files and directories",
     },
     HelpOption {
+        short: "",
+        long: "--hidden-only",
+        description: "Show hidden content exclusively",
+    },
+    HelpOption {
         short: "-r",
         long: "--recursive",
         description: "Start with a recursive listing",
@@ -130,12 +135,16 @@ pub const OPTIONS: &[HelpOption] = &[
 ];
 pub const EXAMPLES: &[HelpExample] = &[
     HelpExample {
+        command: "scry",
+        description: "Launch Scry's interactive interface and begin browsing",
+    },
+    HelpExample {
         command: "scry -T -p -s ~/Projects",
         description: "Browse ~/Projects in Tree mode with permissions and file sizes",
     },
     HelpExample {
-        command: "scry -r ~/",
-        description: "Browse home directory in recursive mode",
+        command: "scry -r --hidden-only ~/",
+        description: "Search hidden content recursively beneath the home directory",
     },
     HelpExample {
         command: "scry -rT ~/ -pds",
@@ -148,6 +157,18 @@ pub const EXAMPLES: &[HelpExample] = &[
     HelpExample {
         command: "scry --ssh example-host --preserve-hierarchy",
         description: "Preserve remote directory paths during marked batch downloads",
+    },
+    HelpExample {
+        command: "scry -r --query 'type:source AND (rust OR python) AND NOT test' ~/Projects",
+        description: "Recursively search source files using a grouped Boolean query",
+    },
+    HelpExample {
+        command: "scry -r --files-only --query 'ext:rs +session -test' ~/DevX",
+        description: "Search recursively for Rust files requiring session and excluding test",
+    },
+    HelpExample {
+        command: "scry --restore-session",
+        description: "Restore the most recently saved browsing session",
     },
 ];
 
@@ -329,7 +350,7 @@ pub fn print_help() -> io::Result<()> {
     println!(
         "{}",
         palette.muted(
-            "Run `scry --manual` for the complete manual and use Ctrl+! inside Scry \
+            "Run `scry --manual` for the complete manual and use ? inside Scry \
          for the interactive shortcut legend.",
         ),
     );
@@ -344,7 +365,19 @@ pub fn print_help() -> io::Result<()> {
 
     println!(
         "{}",
-        palette.muted("Type directly in Scry to begin a recursive search.",),
+        palette.muted("Type directly in Scry to begin searching.",),
+    );
+
+    println!();
+
+    println!(
+        "{}",
+        palette.muted("Launch Scry and let the files come to you.",),
+    );
+
+    println!(
+        "{}",
+        palette.muted("The advanced options can wait until everyone is properly caffeinated :)",),
     );
 
     println!();

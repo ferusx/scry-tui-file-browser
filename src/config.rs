@@ -12,6 +12,22 @@ const CONFIG_FILENAME: &str = "scry.toml";
 
 const GENERATED_CONFIG_FILENAME: &str = "scry.toml.generated";
 
+pub const DEFAULT_EXPAND_ALL_WARNING_ROWS: usize = 75_000;
+
+pub const DEFAULT_MAX_VISIBLE_TREE_ROWS: usize = 250_000;
+
+pub const DEFAULT_FUZZY_RESULT_LIMIT: usize = 500;
+
+pub const MIN_FUZZY_RESULT_LIMIT: usize = 100;
+
+pub const MAX_FUZZY_RESULT_LIMIT: usize = 10_000;
+
+pub const DEFAULT_EXACT_TREE_MATCH_LIMIT: usize = 5_000;
+
+pub const MIN_EXACT_TREE_MATCH_LIMIT: usize = 500;
+
+pub const MAX_EXACT_TREE_MATCH_LIMIT: usize = 15_000;
+
 const DEFAULT_CONFIG: &str = r#"# Scry configuration
 #
 # Command-line options override settings from this file.
@@ -27,17 +43,17 @@ theme = "default"
 
 # DISPLAY
 #
-# The five first entries enable hidden entries, icons 
-# and show/hide Scry's foldable sections: details panel,
-# selection panel, and the meta panel which holds the 
-# columns.
+# The first entries control hidden entries, optional icons,
+# classified filename colors, and Scry's foldable Details,
+# Selection, and Metadata panels.
 #
-# The last four entries show/hide the metal panel'S
+# The final four entries control the individual Metadata
 # columns.
 #
 [display]
 show_hidden = false
-show_icons = true
+show_icons = false
+show_file_colors = false
 show_details = true
 show_selection = true
 show_columns = true
@@ -48,13 +64,32 @@ show_user = false
 
 # BROWSER
 #
-# 'view' has two modes: list mode (normal view) and tree mode
-# 'sort' has four fields: name|size|date|type
+# 'view' has two modes: list mode (normal view) and tree mode.
+# 'hidden_only' restricts results to dot-prefixed entries and
+# every descendant beneath a hidden directory.
+#
+# 'fuzzy_result_limit' controls the maximum number of ranked
+# direct matches retained by Fuzzy mode. Valid range: 100..10000.
+#
+# 'exact_tree_match_limit' controls the maximum number of direct
+# matches retained by Exact Tree searches before contextual
+# ancestor directories are added. Valid range: 500..15000.
+#
+# Tree result counts may exceed either match limit because parent
+# directories are added to preserve hierarchy. Structural-only
+# Fuzzy+Recursive Tree queries use the Exact Tree limit until
+# textual search input is present. See the in-app Help for details.
+#
+# 'entry_filter' options: all|files|directories
+# 'sort' has four fields: name|size|date|type.
 #
 [browser]
 view = "list"
 recursive = false
 fuzzy = false
+fuzzy_result_limit = 500
+exact_tree_match_limit = 5000
+hidden_only = false
 entry_filter = "all"
 sort = "name"
 reverse = false
@@ -81,7 +116,7 @@ restore_session = false
 
 # SSH
 #
-# preserve_hierarchy preserves remote directory paths during marked batch downloads.
+# 'preserve_hierarchy' preserves remote directory paths during marked batch downloads.
 #
 # false places every downloaded file directly inside the new batch directory.
 # true recreates the remote directory hierarchy beneath that directory.
@@ -90,6 +125,56 @@ restore_session = false
 connect_timeout_seconds = 10
 server_alive_interval_seconds = 15
 preserve_hierarchy = false
+
+# ADVANCED TREE
+#
+# These settings control large Tree representations.
+#
+# They limit simultaneously visible Tree rows only. They do
+# not limit indexing, searching, or the number of filesystem
+# entries available to Scry.
+#
+[advanced.tree]
+
+# Ask for confirmation before Expand All displays more than
+# this many simultaneously visible Tree rows.
+#
+# This value must be lower than max_visible_tree_rows.
+expand_all_warning_rows = 75000
+
+# Maximum number of Tree rows that may be shown at one time.
+# In Tree mode this corresponds to the displayed "shown" count.
+# This value must be greater than expand_all_warning_rows.
+#
+# The ceiling applies regardless of whether rows become visible
+# through Expand All, manual branch expansion, Hidden, or another
+# guarded Tree-state transition.
+#
+# Scry's recommended default is 250000. Raising this value
+# may produce a hierarchy that consumes substantial memory
+# and is extremely difficult to navigate through ordinary
+# scrolling and keyboard controls.
+max_visible_tree_rows = 250000
+
+# Show the Large Tree confirmation before Expand All enters
+# the configured warning range.
+#
+# Disabling this skips the confirmation and allows the otherwise
+# valid expansion to continue immediately.
+show_expand_all_warning = true
+
+# Show the full Tree Display Limit refusal the first time an
+# Expand All operation would exceed max_visible_tree_rows.
+#
+# Disabling this hides only the dialog. The visible-row maximum
+# remains enforced and Scry reports the refusal as a notification.
+show_max_visible_tree_rows = true
+
+# Show the large-Tree confirmation when browsing through SSH.
+#
+# Disabling this skips the SSH confirmation only. The configured
+# visible Tree-row maximum continues to apply.
+show_ssh_expand_all_warning = true
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +196,8 @@ pub struct ScryConfig {
     pub session: SessionConfig,
 
     pub ssh: SshConfig,
+
+    pub advanced: AdvancedConfig,
 }
 
 impl Default for ScryConfig {
@@ -127,6 +214,8 @@ impl Default for ScryConfig {
             session: SessionConfig::default(),
 
             ssh: SshConfig::default(),
+
+            advanced: AdvancedConfig::default(),
         }
     }
 }
@@ -137,6 +226,13 @@ pub struct DisplayConfig {
     pub show_hidden: bool,
 
     pub show_icons: bool,
+
+    /*
+     * Color ordinary filenames according to their established FileClass.
+     *
+     * Directories and symbolic links retain their structural colors.
+     */
+    pub show_file_colors: bool,
 
     pub show_details: bool,
 
@@ -158,7 +254,9 @@ impl Default for DisplayConfig {
         Self {
             show_hidden: false,
 
-            show_icons: true,
+            show_icons: false,
+
+            show_file_colors: false,
 
             show_details: true,
 
@@ -186,6 +284,12 @@ pub struct BrowserConfig {
 
     pub fuzzy: bool,
 
+    pub fuzzy_result_limit: usize,
+
+    pub exact_tree_match_limit: usize,
+
+    pub hidden_only: bool,
+
     pub entry_filter: String,
 
     pub sort: String,
@@ -202,11 +306,90 @@ impl Default for BrowserConfig {
 
             fuzzy: false,
 
+            fuzzy_result_limit: DEFAULT_FUZZY_RESULT_LIMIT,
+
+            exact_tree_match_limit: DEFAULT_EXACT_TREE_MATCH_LIMIT,
+
+            hidden_only: false,
+
             entry_filter: "all".to_string(),
 
             sort: "name".to_string(),
 
             reverse: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AdvancedConfig {
+    pub tree: AdvancedTreeConfig,
+}
+
+impl Default for AdvancedConfig {
+    fn default() -> Self {
+        Self {
+            tree: AdvancedTreeConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct AdvancedTreeConfig {
+    /*
+     * Projected visible-row count above which Alt+E Expand All asks for
+     * confirmation.
+     */
+    pub expand_all_warning_rows: usize,
+
+    /*
+     * Absolute ceiling for simultaneously visible Tree rows.
+     *
+     * The old expand_all_max_rows spelling remains accepted as a compatibility
+     * alias for existing configuration files.
+     */
+    #[serde(alias = "expand_all_max_rows")]
+    pub max_visible_tree_rows: usize,
+
+    /*
+     * Show the confirmation-range Expand All warning.
+     *
+     * Disabling this affects only the warning dialog. It does not bypass
+     * max_visible_tree_rows.
+     */
+    pub show_expand_all_warning: bool,
+
+    /*
+     * Show the explanatory dialog when Expand All exceeds
+     * max_visible_tree_rows.
+     *
+     * Disabling this affects only the dialog. The configured maximum remains
+     * authoritative and refused expansion is reported through a notification.
+     */
+    pub show_max_visible_tree_rows: bool,
+
+    /*
+     * Show the confirmation-range warning while browsing through SSH.
+     *
+     * Disabling this does not bypass max_visible_tree_rows.
+     */
+    pub show_ssh_expand_all_warning: bool,
+}
+
+impl Default for AdvancedTreeConfig {
+    fn default() -> Self {
+        Self {
+            expand_all_warning_rows: DEFAULT_EXPAND_ALL_WARNING_ROWS,
+
+            max_visible_tree_rows: DEFAULT_MAX_VISIBLE_TREE_ROWS,
+
+            show_expand_all_warning: true,
+
+            show_max_visible_tree_rows: true,
+
+            show_ssh_expand_all_warning: true,
         }
     }
 }
@@ -249,7 +432,7 @@ impl Default for FeatureConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default)]
 pub struct SessionConfig {
     /*
@@ -260,14 +443,6 @@ pub struct SessionConfig {
      * the user deliberately opts in through scry.toml or --restore-session.
      */
     pub restore_session: bool,
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            restore_session: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -364,6 +539,16 @@ impl ScryConfig {
     fn normalize(&mut self) {
         self.theme = normalized_nonempty(&self.theme, "default");
 
+        self.browser.fuzzy_result_limit = self
+            .browser
+            .fuzzy_result_limit
+            .clamp(MIN_FUZZY_RESULT_LIMIT, MAX_FUZZY_RESULT_LIMIT);
+
+        self.browser.exact_tree_match_limit = self
+            .browser
+            .exact_tree_match_limit
+            .clamp(MIN_EXACT_TREE_MATCH_LIMIT, MAX_EXACT_TREE_MATCH_LIMIT);
+
         self.browser.view = match self.browser.view.trim().to_lowercase().as_str() {
             "list" => "list".to_string(),
 
@@ -447,6 +632,33 @@ impl ScryConfig {
             );
 
             self.ssh.server_alive_interval_seconds = MAX_SERVER_ALIVE_INTERVAL_SECONDS;
+        }
+
+        /*
+         * Expand All uses two ordered thresholds:
+         *
+         * - warning_rows begins the confirmation range;
+         * - max_rows refuses complete expansion under the current policy.
+         *
+         * Reset both values together when the pair is invalid. This avoids
+         * combining one custom threshold with one repaired threshold and producing
+         * a policy the user never requested.
+         */
+        let tree_thresholds_are_invalid = self.advanced.tree.expand_all_warning_rows == 0
+            || self.advanced.tree.max_visible_tree_rows == 0
+            || self.advanced.tree.expand_all_warning_rows
+                >= self.advanced.tree.max_visible_tree_rows;
+
+        if tree_thresholds_are_invalid {
+            eprintln!(
+                "scry: advanced.tree thresholds are invalid; \
+                 using defaults {} and {}",
+                DEFAULT_EXPAND_ALL_WARNING_ROWS, DEFAULT_MAX_VISIBLE_TREE_ROWS,
+            );
+
+            self.advanced.tree.expand_all_warning_rows = DEFAULT_EXPAND_ALL_WARNING_ROWS;
+
+            self.advanced.tree.max_visible_tree_rows = DEFAULT_MAX_VISIBLE_TREE_ROWS;
         }
     }
 }

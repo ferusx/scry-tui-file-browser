@@ -1,10 +1,6 @@
-# Scry TUI File Browser
+# Scry Terminal File Browser
 
-> **Project status: unreleased**
->
-> Scry is under active development and has not yet published a stable release.
-> Interfaces, configuration fields, shortcuts, and stored data formats may still
-> change before the first release.
+## Version 1.0.0
 
 **Scry** is a fast, richly featured terminal file browser, recursive finder, and
 SSH/SFTP filesystem explorer written in Rust. It combines responsive List and
@@ -68,7 +64,7 @@ interface.
 - Detailed File Information window with extended metadata
 - Local file opening through terminal programs or desktop-default applications
 - Optional keep-open or exit-after-open behavior
-- Optional local deletion with confirmation and path-safety checks
+- Optional staged local deletion with confirmation, `Ctrl+Z` restoration, and interrupted-session recovery
 - Persistent local and SSH session restoration
 - Restored directories, selection, viewport, query, modes, panels, sorting, and SSH marks
 - Configurable startup behavior through `scry.toml`
@@ -105,7 +101,7 @@ Fuzzy+Recursive mode searches complete directory trees while ranking the most
 useful approximate matches.
 
 <p align="center">
-  <img src="screenshots/scry-fuzzy-recursive.png" alt="Scry performing a Fuzzy and Recursive search in the Downloads directory" width="95%">
+  <img src="screenshots/scry-fuzzy-recursive-search.png" alt="Scry performing a Fuzzy and Recursive search in the Downloads directory" width="95%">
 </p>
 
 ### Structured query modifiers
@@ -173,14 +169,23 @@ remote workflows, file operations, sessions, and configuration in detail.
   <img src="screenshots/scry-help.png" alt="Scry Help window displaying the interface documentation" width="95%">
 </p>
 
+### Minimum Terminal Size
+
+When the terminal falls below Scry’s minimum usable size, the interface is replaced by a centered resize screen showing the required and current dimensions.
+
+<p align="center">
+  <img src="screenshots/scry-resize.png" alt="Scry displaying the minimum size screen" width="95%">
+</p>
+
 ## Building
 
-Scry currently has no published release package. Build it directly from the
-source repository with a recent stable Rust toolchain:
+Scry 1.0.0 may be built directly from the source repository with a recent stable
+Rust toolchain:
 
 ```sh
 git clone https://github.com/ferusx/scry-tui-file-browser.git
 cd scry-tui-file-browser
+git checkout v1.0.0
 cargo build --release
 ```
 
@@ -279,13 +284,15 @@ scry --generate-config
 
 ## Help and manual
 
-Scry provides three complementary documentation routes:
+Scry provides four complementary documentation routes:
 
 - `scry --help` prints a concise command-line reference and startup examples.
 - `scry --manual` prints the complete explanatory manual used by the F1 Help
   window. Its output is suitable for pagers, redirection, and text editors.
-- `Ctrl+!` opens the in-app Shortcut Legend, including the complete query
+- `?` opens the in-app Shortcut Legend, including the complete query
   modifier and `type:` alias reference.
+- Scry also includes a complete `scry(1)` manual page for traditional Unix
+reference.
 
 Examples:
 
@@ -293,6 +300,7 @@ Examples:
 scry --manual | less
 scry --manual > scry-manual.txt
 scry --manual | bat
+man scry
 ```
 
 ## Searching
@@ -324,14 +332,14 @@ Recursive Tree mode retains a bounded Exact result set for safe hierarchy
 construction, while ordinary Exact List mode remains unlimited.
 
 The query caret may be moved with `Left` and `Right`, sent to the
-beginning or end with `Ctrl+Home` and `Ctrl+End`, and cleared together with the
+beginning or end with `Home` and `End`, and cleared together with the
 complete query using `Ctrl+U`.
 
 ## Query language
 
 Scry supports both a compact query syntax and advanced Boolean expressions.
 
-Open the in-app Shortcut Legend with `Ctrl+!` for the complete parser-backed
+Open the in-app Shortcut Legend with `?` for the complete parser-backed
 reference containing every supported query form, every accepted `type:` value,
 and all aliases.
 
@@ -476,7 +484,7 @@ typed and does not repeatedly disturb the current result set.
 
 Modifiers and Boolean expressions are evaluated live as they are typed. Incomplete
 forms remain harmless until they become valid. `Enter` is reserved for activating
-the selected entry.
+the selected entry in the search results.
 
 Incomplete Boolean expressions such as these are harmless during live typing:
 
@@ -500,6 +508,7 @@ They begin filtering only after they form a valid expression.
 | `--ssh TARGET` | Browse a remote computer through SSH/SFTP |
 | `--preserve-hierarchy` | Preserve remote paths during marked batch downloads |
 | `-a`, `--all` | Show hidden files and directories |
+| `--hidden-only` | Show only hidden entries |
 | `-r`, `--recursive` | Start with a recursive listing |
 | `--fuzzy` | Start in Fuzzy search mode |
 | `--query TEXT` | Start with `TEXT` in the Search field |
@@ -522,31 +531,40 @@ session state for the current launch.
 
 ## Keyboard and mouse
 
-Press `Ctrl+!` inside Scry to open the complete Shortcut Legend. Press `F1` to
+Press `?` inside Scry to open the complete Shortcut Legend. Press `F1` to
 open the full internal Help.
 
-Some important controls:
+Scry controls:
 
 | Shortcut | Action |
 |---|---|
 | `↑` / `↓` | Move the selection |
 | `PgUp` / `PgDn` | Move one visible page |
+| `Ctrl+PgUp` / `Ctrl+PgDn` | Move ten visible pages (for very large Trees) |
 | `Home` / `End` | Select the first or last entry |
 | `Ctrl+←` / `Esc` | Move to the parent or collapse a Tree branch |
 | `Ctrl+→` | Enter a directory or expand a Tree branch |
-| `Enter` | Open the selected file or establish a Tree directory as the new root |
+| `Enter` | Open or download (remote) a single, selected file, or establish a Tree directory as the new root |
+| `Delete` | Delete the selected local entry when enabled |
+| `Ctrl+Z` | Restore the most recently staged deletion |
 | `Left` / `Right` | Move the query caret |
 | `Ctrl+Home` / `Ctrl+End` | Move the caret to the beginning or end |
 | `Ctrl+T` | Switch between List and Tree views |
+| `Alt+E` | Expand or collapse all Tree branches |
 | `Ctrl+F` | Switch between Exact and Fuzzy search |
 | `Alt+R` | Toggle recursive searching |
 | `Ctrl+O` | Cycle the sort mode |
-| `Ctrl+R` | Reverse the sort direction |
+| `Ctrl+R` | Toggle reverse sort direction |
 | `Ctrl+U` | Clear the current query |
+| `Ctrl+Space` | Mark or unmark the selected remote file |
+| `Alt+D` | Download all marked remote files |
+| `Alt+U` | Clear all marked remote files |
 | `Ctrl+D` | Toggle the Details panel |
 | `Ctrl+S` | Toggle the Selection panel |
 | `Alt+M` | Toggle the Metadata panel |
 | `Alt+H` | Toggle hidden entries |
+| `F1` | Open the Help window |
+| `F2` / `Alt+I` | Show detailed information about the selected entry |
 | `F3` | Toggle file and directory icons |
 | `F4` | Open the SSH Connection window |
 | `F5` | Open the Remote Index Builder |
@@ -554,12 +572,12 @@ Some important controls:
 | `F8` | Toggle the Size column |
 | `F9` | Toggle the Date column |
 | `F10` | Toggle the User column |
-| `Alt+A` | Open About Scry |
-| `Ctrl+!` | Open the Shortcut Legend |
+| `F12` | Toggle file colors |
+| `?` | Open the Shortcut Legend |
 | `Ctrl+C` | Exit |
 
 Mouse support includes wheel scrolling, left-click selection, double-click
-activation, middle-click paste clipboard, clickable controls where
+activation, clickable controls where
 available, and draggable scrollbars.
 
 ## SSH and remote files
@@ -636,16 +654,27 @@ the same way as local files.
 ## Deletion
 
 Deletion is disabled by default and must be explicitly enabled in `scry.toml`.
-It is currently available only for local files and directories.
+It is currently available only for local files, directories, and symbolic
+links.
 
 Every deletion request opens a confirmation window with Cancel selected by
-default. Ordinary files and symbolic links are removed directly. Directories and
-their contents are removed recursively. Symbolic links are removed as links and
-are never followed into their targets.
+default. When confirmed, Scry renames the selected entry to a hidden staged path
+beside its original location. Files, directories, and symbolic links are all
+staged through the same rename-based mechanism. Symbolic links are handled as
+links and are never followed into their targets.
+
+Staged deletions form a last-in, first-out undo stack. Press `Ctrl+Z` to restore
+the most recently deleted entry, then press it again to restore the deletion
+before that. Scry never overwrites an entry that has been recreated at the
+original path.
+
+Scry records staged deletions in a journal so that an interrupted session does
+not silently abandon them. When Scry starts again, valid staged deletions from
+the interrupted process are recovered into the undo stack. Entries that remain
+staged when Scry exits cleanly are removed permanently.
 
 Scry refuses unsafe targets such as the filesystem root, the active browsing
-root, and paths outside the permitted root. Confirmed deletion is permanent and
-does not use a desktop trash or recovery area.
+root, paths outside the permitted root, and paths without a valid filename.
 
 Enable it with:
 
@@ -683,7 +712,8 @@ theme = "default"
 
 [display]
 show_hidden = false
-show_icons = true
+show_icons = false
+show_file_colors = false
 show_details = true
 show_selection = true
 show_columns = true
@@ -696,6 +726,8 @@ show_user = false
 view = "list"
 recursive = false
 fuzzy = false
+fuzzy_result_limit = 500
+hidden_only = false
 sort = "name"
 reverse = false
 entry_filter = "all"
@@ -705,11 +737,23 @@ enable_deletion = true
 allow_file_opening = true
 exit_on_open = false
 
+[session]
+restore_session = false
+
 [ssh]
 connect_timeout_seconds = 10
 server_alive_interval_seconds = 15
 preserve_hierarchy = false
+
+[advanced.tree]
+expand_all_warning_rows = 75000
+expand_all_max_rows = 250000
+show_ssh_expand_all_warning = true
 ```
+
+
+### Configuration and session precedence:
+When session restoration is enabled and a saved session is available, the restored interactive state takes precedence over corresponding browser and display defaults in `scry.toml`. This includes view and search modes, hidden-entry visibility, sorting, panels, metadata columns, selection, viewport, and expanded Tree branches. Explicit command-line options remain authoritative for the current launch. Disable session restoration to make the configuration file determine the startup state without applying a previous session.
 
 ## Themes
 
@@ -721,6 +765,11 @@ scrollbars, and other interface elements.
 Missing themes, malformed files, absent color groups, and invalid individual
 color values fall back safely to Scry's built-in palette. A broken theme cannot
 prevent the application from starting. In such an event, the application will start with the default theme loaded.
+
+Users can create their own Scry themes by copying one of the existing theme files, renaming the copy, and changing its color values. Starting from an existing theme is recommended because it shows the complete set of available color settings and provides a ready-made example of the expected structure.
+
+Custom themes should be placed in `~/.config/scry/themes` and can then be selected with the top-level theme setting in `scry.toml`.
+
 
 ## Platform support
 

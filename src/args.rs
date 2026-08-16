@@ -98,10 +98,30 @@ pub struct Cli {
     pub restore_session: bool,
 
     /*
-     * Begin with hidden files and directories visible.
+     * Begin with hidden files and directories visible alongside ordinary entries.
      */
-    #[arg(short = 'a', long = "all", help = "Show hidden files and directories")]
+    #[arg(
+        short = 'a',
+        long = "all",
+        conflicts_with = "hidden_only",
+        help = "Show hidden files and directories"
+    )]
     pub all: bool,
+
+    /*
+     * Restrict visible results to hidden content.
+     *
+     * This includes:
+     *
+     * - entries whose own names begin with a dot;
+     * - every descendant beneath a hidden directory.
+     */
+    #[arg(
+        long = "hidden-only",
+        conflicts_with = "all",
+        help = "Show hidden content exclusively"
+    )]
+    pub hidden_only: bool,
 
     /*
      * Begin with all descendants beneath the starting directory.

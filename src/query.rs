@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use crate::classify::{FileClass, classify_extension};
+use crate::classify::FileClass;
 use crate::scan::FileEntry;
 use crate::search_index::SearchRecord;
 
@@ -530,7 +530,17 @@ pub(crate) struct QueryHighlightTerm {
  */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BooleanExpression {
-    Term(SignedQueryTerm),
+    Term {
+        term: SignedQueryTerm,
+
+        /*
+         * Original positive operand text available for path highlighting.
+         *
+         * Explicit structural forms such as type:source and ext:rs leave this
+         * as None because those strings are selectors, not literal path text.
+         */
+        highlight: Option<QueryHighlightTerm>,
+    },
 
     Not(Box<BooleanExpression>),
 
@@ -845,12 +855,33 @@ impl BooleanParser {
         Some(expression)
     }
 
-    /*
-     * Highest precedence:
-     *
-     *     NOT expression
-     */
     fn parse_unary_expression(&mut self) -> Option<BooleanExpression> {
+        /*
+         * type:sensitive changes how later textual operands are parsed rather than
+         * contributing a Boolean value of its own.
+         *
+         * Accept both documented forms:
+         *
+         *     type:sensitive Makefile
+         *     type:sensitive AND Makefile
+         *
+         * The optional AND expresses the user's natural reading of the directive:
+         * enable sensitive matching and then evaluate the following operand.
+         */
+        if matches!(self.peek(), Some(BooleanToken::Sensitive)) {
+            while matches!(self.peek(), Some(BooleanToken::Sensitive)) {
+                self.advance();
+
+                self.case_sensitive = true;
+            }
+
+            if matches!(self.peek(), Some(BooleanToken::And)) {
+                self.advance();
+            }
+
+            return self.parse_unary_expression();
+        }
+
         if matches!(self.peek(), Some(BooleanToken::Not)) {
             self.advance();
 
@@ -863,18 +894,6 @@ impl BooleanParser {
     }
 
     fn parse_primary_expression(&mut self) -> Option<BooleanExpression> {
-        /*
-         * type:sensitive is a state-changing directive, not an expression.
-         *
-         * It applies to the next textual operand and every textual operand after
-         * it for the remainder of the query.
-         */
-        while matches!(self.peek(), Some(BooleanToken::Sensitive)) {
-            self.advance();
-
-            self.case_sensitive = true;
-        }
-
         match self.advance()? {
             BooleanToken::LeftParenthesis => {
                 let expression = self.parse_or_expression()?;
@@ -903,10 +922,12 @@ impl BooleanParser {
 
 fn parse_boolean_word(word: &str, case_sensitive: bool) -> Option<BooleanExpression> {
     /*
-     * Explicit classification operand:
+     * Explicit classification operands are structural selectors.
      *
      *     type:source
      *     type:image
+     *
+     * Their complete source text must not be painted as a literal path match.
      */
     if let Some((prefix, value)) = word.split_once(':')
         && prefix.eq_ignore_ascii_case("type")
@@ -915,11 +936,15 @@ fn parse_boolean_word(word: &str, case_sensitive: bool) -> Option<BooleanExpress
 
         let filter = parse_query_type_filter(&normalized)?;
 
-        return Some(BooleanExpression::Term(SignedQueryTerm::Type(filter)));
+        return Some(BooleanExpression::Term {
+            term: SignedQueryTerm::Type(filter),
+
+            highlight: None,
+        });
     }
 
     /*
-     * Explicit extension operand:
+     * Explicit extension operands are also structural selectors.
      *
      *     ext:rs
      *     ext:.jpg
@@ -929,50 +954,81 @@ fn parse_boolean_word(word: &str, case_sensitive: bool) -> Option<BooleanExpress
     {
         let extension = normalize_query_extension(value)?;
 
-        return Some(BooleanExpression::Term(SignedQueryTerm::Extension(
-            extension,
-        )));
+        return Some(BooleanExpression::Term {
+            term: SignedQueryTerm::Extension(extension),
+
+            highlight: None,
+        });
     }
 
     /*
-     * A leading plus remains a positive compact-style operand even inside a
-     * Boolean expression:
+     * A leading plus remains a positive compact-style operand inside Boolean
+     * syntax. Preserve the visible value even when it parses as a known type or
+     * extension alias.
      *
      *     +rs OR +cpp
      */
     if let Some(value) = word.strip_prefix('+') {
-        let term = parse_signed_query_term(value, false)?;
+        let term = parse_signed_query_term(value, case_sensitive)?;
 
-        return Some(BooleanExpression::Term(term));
+        return Some(BooleanExpression::Term {
+            term,
+
+            highlight: boolean_operand_highlight(value, case_sensitive),
+        });
     }
 
     /*
-     * A leading minus keeps its compact exclusion meaning:
+     * A leading minus remains an explicit negative operand.
      *
-     *     rs AND -test
-     *
-     * It is represented as Boolean NOT so evaluation remains explicit.
+     * Its original text may be retained in the leaf, but the surrounding NOT
+     * branch prevents it from contributing any highlight.
      */
     if let Some(value) = word.strip_prefix('-') {
         let term = parse_signed_query_term(value, case_sensitive)?;
 
-        return Some(BooleanExpression::Not(Box::new(BooleanExpression::Term(
+        return Some(BooleanExpression::Not(Box::new(BooleanExpression::Term {
             term,
-        ))));
+
+            highlight: boolean_operand_highlight(value, case_sensitive),
+        })));
     }
 
     /*
-     * Bare known aliases become classification or extension operands:
+     * Bare known aliases may retain classification or extension semantics:
      *
      *     rs
      *     cpp
      *     image
      *
-     * Every other word becomes ordinary path text.
+     * Preserve the exact operand separately so matching path text can still be
+     * highlighted.
      */
     let term = parse_signed_query_term(word, case_sensitive)?;
 
-    Some(BooleanExpression::Term(term))
+    Some(BooleanExpression::Term {
+        term,
+
+        highlight: boolean_operand_highlight(word, case_sensitive),
+    })
+}
+
+fn boolean_operand_highlight(value: &str, case_sensitive: bool) -> Option<QueryHighlightTerm> {
+    let value = value.trim();
+
+    if value.is_empty() {
+        return None;
+    }
+
+    Some(QueryHighlightTerm {
+        value: if case_sensitive {
+            value.to_string()
+        } else {
+            value.to_lowercase()
+        },
+
+        case_sensitive,
+    })
 }
 
 fn parse_compact_query(query: &str) -> ParsedQuery {
@@ -1020,25 +1076,46 @@ fn parse_compact_query(query: &str) -> ParsedQuery {
          *     type:python
          */
         if let Some(value) = token.strip_prefix("type:") {
-            if !value.is_empty() {
-                if let Some(filter) = parse_query_type_filter(&value.to_lowercase()) {
+            let normalized = value.to_lowercase();
+
+            if !normalized.is_empty() {
+                if let Some(filter) = parse_query_type_filter(&normalized) {
                     type_filter = Some(filter);
 
                     index += 1;
 
                     continue;
                 }
-            } else if let Some(next_token) = tokens.get(index + 1) {
-                if let Some(filter) = parse_query_type_filter(&next_token.to_lowercase()) {
-                    type_filter = Some(filter);
 
-                    index += 2;
+                /*
+                 * Live type: editing remains harmless while the current value is still
+                 * a possible prefix of a documented type name or alias.
+                 *
+                 * Examples:
+                 *
+                 *     type:t
+                 *     type:tor
+                 *     type:torren
+                 *
+                 * The ordinary listing therefore remains visible until the modifier
+                 * becomes complete.
+                 */
+                if query_type_prefix_is_incomplete(&normalized) {
+                    index += 1;
 
                     continue;
                 }
+            } else if let Some(next_token) = tokens.get(index + 1)
+                && let Some(filter) = parse_query_type_filter(&next_token.to_lowercase())
+            {
+                type_filter = Some(filter);
+
+                index += 2;
+
+                continue;
             }
 
-            if value.is_empty() {
+            if normalized.is_empty() {
                 index += 1;
 
                 continue;
@@ -1067,14 +1144,14 @@ fn parse_compact_query(query: &str) -> ParsedQuery {
                  *     ext: rs
                  *     ext: .rs
                  */
-                if let Some(next_token) = tokens.get(index + 1) {
-                    if let Some(extension) = normalize_query_extension(next_token) {
-                        extension_filter = Some(extension);
+                if let Some(next_token) = tokens.get(index + 1)
+                    && let Some(extension) = normalize_query_extension(next_token)
+                {
+                    extension_filter = Some(extension);
 
-                        index += 2;
+                    index += 2;
 
-                        continue;
-                    }
+                    continue;
                 }
             }
 
@@ -1113,14 +1190,14 @@ fn parse_compact_query(query: &str) -> ParsedQuery {
              *     + .jpg
              */
             if value.is_empty() {
-                if let Some(next_token) = tokens.get(index + 1) {
-                    if let Some(term) = parse_signed_query_term(next_token, case_sensitive) {
-                        include_terms.push(term);
+                if let Some(next_token) = tokens.get(index + 1)
+                    && let Some(term) = parse_signed_query_term(next_token, case_sensitive)
+                {
+                    include_terms.push(term);
 
-                        index += 2;
+                    index += 2;
 
-                        continue;
-                    }
+                    continue;
                 }
 
                 /*
@@ -1148,14 +1225,14 @@ fn parse_compact_query(query: &str) -> ParsedQuery {
              *     - .cache
              */
             if value.is_empty() {
-                if let Some(next_token) = tokens.get(index + 1) {
-                    if let Some(term) = parse_signed_query_term(next_token, case_sensitive) {
-                        exclude_terms.push(term);
+                if let Some(next_token) = tokens.get(index + 1)
+                    && let Some(term) = parse_signed_query_term(next_token, case_sensitive)
+                {
+                    exclude_terms.push(term);
 
-                        index += 2;
+                    index += 2;
 
-                        continue;
-                    }
+                    continue;
                 }
 
                 /*
@@ -1229,41 +1306,23 @@ fn parse_signed_query_term(value: &str, case_sensitive: bool) -> Option<SignedQu
     }
 
     /*
-     * Type and language aliases win over extension aliases.
+     * Compact +term and -term operators always describe path text.
      *
-     * Therefore:
+     * Structural filtering already has explicit, unambiguous syntax:
      *
-     *     +python
-     *     -java
-     *     +cpp
+     *     type:source
+     *     type:python
+     *     ext:jpg
+     *     ext:target
      *
-     * are classification filters.
+     * Inferring a type or extension from an unsigned word creates surprising
+     * collisions. For example, "target" is a valid systemd file extension, but
+     * users naturally expect:
+     *
+     *     +target
+     *
+     * to match directories and paths containing the word "target".
      */
-    if let Some(filter) = parse_query_type_filter(&normalized) {
-        return Some(SignedQueryTerm::Type(filter));
-    }
-
-    /*
-     * A known extension becomes an extension filter.
-     *
-     * Both forms are accepted:
-     *
-     *     +jpg
-     *     +.jpg
-     *
-     * A value such as ".cache" remains text because "cache"
-     * is not a recognized file extension.
-     */
-    if let Some(extension) = normalize_query_extension(&normalized) {
-        if classify_extension(&extension).is_some() {
-            return Some(SignedQueryTerm::Extension(extension));
-        }
-    }
-
-    /*
-
-    * Everything else is ordinary filename/path text.
-        */
     Some(SignedQueryTerm::Text {
         value: if case_sensitive {
             trimmed.to_string()
@@ -1280,6 +1339,20 @@ pub(crate) fn parse_query_type_filter(value: &str) -> Option<QueryTypeFilter> {
         .iter()
         .find(|reference| reference.canonical == value || reference.aliases.contains(&value))
         .map(|reference| reference.filter)
+}
+
+fn query_type_prefix_is_incomplete(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+
+    QUERY_TYPE_REFERENCES.iter().any(|reference| {
+        reference.canonical.starts_with(value)
+            || reference
+                .aliases
+                .iter()
+                .any(|alias| alias.starts_with(value))
+    })
 }
 
 fn entry_matches_type_filter(entry: &FileEntry, filter: QueryTypeFilter) -> bool {
@@ -1666,11 +1739,14 @@ fn entry_matches_extension_filter(entry: &FileEntry, extension_filter: &str) -> 
 }
 
 fn record_matches_extension_filter(record: &SearchRecord, extension_filter: &str) -> bool {
-    !record.is_directory
-        && record
-            .extension
-            .as_ref()
-            .eq_ignore_ascii_case(extension_filter)
+    if record.is_directory {
+        return false;
+    }
+
+    std::path::Path::new(record.searchable_name.as_ref())
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(extension_filter))
 }
 
 fn entry_matches_signed_query_term(entry: &FileEntry, term: &SignedQueryTerm) -> bool {
@@ -1694,7 +1770,7 @@ fn entry_matches_signed_query_term(entry: &FileEntry, term: &SignedQueryTerm) ->
 
 fn entry_matches_boolean_expression(entry: &FileEntry, expression: &BooleanExpression) -> bool {
     match expression {
-        BooleanExpression::Term(term) => entry_matches_signed_query_term(entry, term),
+        BooleanExpression::Term { term, .. } => entry_matches_signed_query_term(entry, term),
 
         BooleanExpression::Not(expression) => !entry_matches_boolean_expression(entry, expression),
 
@@ -1768,12 +1844,39 @@ fn record_matches_signed_query_term(record: &SearchRecord, term: &SignedQueryTer
     }
 }
 
+fn record_matches_signed_query_term_with(
+    record: &SearchRecord,
+    term: &SignedQueryTerm,
+    text_matches: &impl Fn(&SearchRecord, &str, bool) -> bool,
+) -> bool {
+    match term {
+        /*
+         * Structural terms remain exact in every search mode.
+         */
+        SignedQueryTerm::Type(filter) => record_matches_type_filter(record, *filter),
+
+        SignedQueryTerm::Extension(extension) => record_matches_extension_filter(record, extension),
+
+        /*
+         * Only signed path-text operands delegate their interpretation to the
+         * caller.
+         *
+         * Exact workers pass literal substring semantics. Fuzzy workers pass
+         * Scry's normal component-aware fuzzy matcher.
+         */
+        SignedQueryTerm::Text {
+            value,
+            case_sensitive,
+        } => text_matches(record, value, *case_sensitive),
+    }
+}
+
 fn record_matches_boolean_expression(
     record: &SearchRecord,
     expression: &BooleanExpression,
 ) -> bool {
     match expression {
-        BooleanExpression::Term(term) => record_matches_signed_query_term(record, term),
+        BooleanExpression::Term { term, .. } => record_matches_signed_query_term(record, term),
 
         BooleanExpression::Not(expression) => {
             !record_matches_boolean_expression(record, expression)
@@ -1788,6 +1891,127 @@ fn record_matches_boolean_expression(
             record_matches_boolean_expression(record, left)
                 || record_matches_boolean_expression(record, right)
         }
+    }
+}
+
+/*
+ * Evaluate one Boolean expression while allowing the caller to define how
+ * textual operands match.
+ *
+ * Exact mode retains literal substring semantics through
+ * record_matches_boolean_expression(). Fuzzy mode supplies its component-aware
+ * matcher here instead.
+ *
+ * Structural type and extension operands always remain exact.
+ */
+fn record_matches_boolean_expression_with(
+    record: &SearchRecord,
+    expression: &BooleanExpression,
+    text_matches: &impl Fn(&SearchRecord, &str, bool) -> bool,
+) -> bool {
+    match expression {
+        BooleanExpression::Term { term, .. } => {
+            record_matches_signed_query_term_with(record, term, text_matches)
+        }
+
+        BooleanExpression::Not(expression) => {
+            !record_matches_boolean_expression_with(record, expression, text_matches)
+        }
+
+        BooleanExpression::And(left, right) => {
+            record_matches_boolean_expression_with(record, left, text_matches)
+                && record_matches_boolean_expression_with(record, right, text_matches)
+        }
+
+        BooleanExpression::Or(left, right) => {
+            record_matches_boolean_expression_with(record, left, text_matches)
+                || record_matches_boolean_expression_with(record, right, text_matches)
+        }
+    }
+}
+
+/*
+ * Calculate the relevance contributed by a matching Boolean expression.
+ *
+ * Return values:
+ *
+ *     None        expression does not match
+ *     Some(score) expression matches
+ *
+ * Structural operands contribute zero because they restrict eligibility rather
+ * than describe textual similarity.
+ *
+ * AND adds the relevance of both required branches.
+ * OR keeps the strongest matching branch.
+ * NOT controls eligibility but contributes no positive relevance.
+ */
+fn record_boolean_expression_score_with(
+    record: &SearchRecord,
+    expression: &BooleanExpression,
+    text_score: &impl Fn(&SearchRecord, &str, bool) -> Option<i64>,
+) -> Option<i64> {
+    match expression {
+        BooleanExpression::Term { term, .. } => match term {
+            SignedQueryTerm::Type(filter) => {
+                record_matches_type_filter(record, *filter).then_some(0)
+            }
+
+            SignedQueryTerm::Extension(extension) => {
+                record_matches_extension_filter(record, extension).then_some(0)
+            }
+
+            SignedQueryTerm::Text {
+                value,
+                case_sensitive,
+            } => text_score(record, value, *case_sensitive),
+        },
+
+        BooleanExpression::Not(expression) => {
+            if record_boolean_expression_score_with(record, expression, text_score).is_some() {
+                None
+            } else {
+                Some(0)
+            }
+        }
+
+        BooleanExpression::And(left, right) => {
+            let left_score = record_boolean_expression_score_with(record, left, text_score)?;
+
+            let right_score = record_boolean_expression_score_with(record, right, text_score)?;
+
+            Some(left_score.saturating_add(right_score))
+        }
+
+        BooleanExpression::Or(left, right) => {
+            let left_score = record_boolean_expression_score_with(record, left, text_score);
+
+            let right_score = record_boolean_expression_score_with(record, right, text_score);
+
+            match (left_score, right_score) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+
+                (Some(score), None) | (None, Some(score)) => Some(score),
+
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/*
+ * Return the relevance contributed by the query's Boolean expression.
+ *
+ * A compact query has no Boolean expression and therefore contributes zero.
+ */
+pub(crate) fn record_boolean_score_with_text(
+    record: &SearchRecord,
+    query: &ParsedQuery,
+    text_score: impl Fn(&SearchRecord, &str, bool) -> Option<i64>,
+) -> Option<i64> {
+    match query.boolean_expression.as_ref() {
+        Some(expression) => record_boolean_expression_score_with(record, expression, &text_score),
+
+        None => Some(0),
     }
 }
 
@@ -1823,31 +2047,79 @@ fn record_matches_positive_terms(record: &SearchRecord, terms: &[SignedQueryTerm
     !has_selector || selector_matched
 }
 
+fn record_matches_positive_terms_with(
+    record: &SearchRecord,
+    terms: &[SignedQueryTerm],
+    text_matches: &impl Fn(&SearchRecord, &str, bool) -> bool,
+) -> bool {
+    /*
+     * Structural selectors retain their existing OR-group behavior.
+     *
+     * Ordinary +text operands remain cumulative requirements:
+     *
+     *     +session +restore
+     *
+     * requires both fuzzy text matches while Fuzzy mode is active.
+     */
+    let mut has_selector = false;
+
+    let mut selector_matched = false;
+
+    for term in terms {
+        match term {
+            SignedQueryTerm::Type(_) | SignedQueryTerm::Extension(_) => {
+                has_selector = true;
+
+                if record_matches_signed_query_term_with(record, term, text_matches) {
+                    selector_matched = true;
+                }
+            }
+
+            SignedQueryTerm::Text { .. } => {
+                if !record_matches_signed_query_term_with(record, term, text_matches) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    !has_selector || selector_matched
+}
+
 fn collect_boolean_highlight_terms(
     expression: &BooleanExpression,
     terms: &mut Vec<QueryHighlightTerm>,
 ) {
     match expression {
-        BooleanExpression::Term(SignedQueryTerm::Text {
-            value,
-            case_sensitive,
-        }) => {
-            terms.push(QueryHighlightTerm {
-                value: value.clone(),
-
-                case_sensitive: *case_sensitive,
-            });
+        /*
+         * Every positive Boolean operand retains its original visible spelling.
+         *
+         * This includes bare aliases such as:
+         *
+         *     rs
+         *     cpp
+         *     jpg
+         *
+         * even when filtering interprets them structurally as types or
+         * extensions.
+         */
+        BooleanExpression::Term {
+            highlight: Some(highlight),
+            ..
+        } => {
+            terms.push(highlight.clone());
         }
 
         /*
-         * Type and extension operands select entries structurally. Their text
-         * should not be painted as though it were a literal path match.
+         * Explicit structural operands such as type:source and ext:rs have no
+         * literal highlight text.
          */
-        BooleanExpression::Term(SignedQueryTerm::Type(_) | SignedQueryTerm::Extension(_)) => {}
+        BooleanExpression::Term {
+            highlight: None, ..
+        } => {}
 
         /*
-         * Negative Boolean operands exclude matches and therefore must never
-         * contribute highlight text.
+         * Everything beneath NOT is negative and must remain unpainted.
          */
         BooleanExpression::Not(_) => {}
 
@@ -1855,6 +2127,58 @@ fn collect_boolean_highlight_terms(
             collect_boolean_highlight_terms(left, terms);
 
             collect_boolean_highlight_terms(right, terms);
+        }
+    }
+}
+
+fn collect_boolean_extension_highlights(
+    expression: &BooleanExpression,
+    negated: bool,
+    extensions: &mut Vec<String>,
+) {
+    match expression {
+        BooleanExpression::Term { term, .. } => {
+            /*
+             * Only positive extension selectors explain why a visible result
+             * matched.
+             *
+             * An extension beneath NOT describes exclusion and must not be
+             * highlighted.
+             */
+            if !negated
+                && let SignedQueryTerm::Extension(extension) = term
+                && !extensions.contains(extension)
+            {
+                extensions.push(extension.clone());
+            }
+        }
+
+        BooleanExpression::Not(expression) => {
+            collect_boolean_extension_highlights(expression, !negated, extensions);
+        }
+
+        BooleanExpression::And(left, right) | BooleanExpression::Or(left, right) => {
+            collect_boolean_extension_highlights(left, negated, extensions);
+
+            collect_boolean_extension_highlights(right, negated, extensions);
+        }
+    }
+}
+
+fn boolean_expression_contains_text(expression: &BooleanExpression) -> bool {
+    match expression {
+        BooleanExpression::Term {
+            term: SignedQueryTerm::Text { .. },
+            ..
+        } => true,
+
+        BooleanExpression::Term { .. } => false,
+
+        BooleanExpression::Not(inner) => boolean_expression_contains_text(inner),
+
+        BooleanExpression::And(left, right) | BooleanExpression::Or(left, right) => {
+            boolean_expression_contains_text(left)
+                || boolean_expression_contains_text(right)
         }
     }
 }
@@ -1868,6 +2192,77 @@ impl ParsedQuery {
      */
     pub(crate) fn search_text(&self) -> &str {
         &self.text
+    }
+
+    /*
+     * Final filename extension selected by an explicit ext: modifier.
+     *
+     * The renderer uses this separately from ordinary text highlighting so only
+     * the actual trailing extension is painted, including its leading dot.
+     */
+
+    /*
+     * True when the query contains filename/path text whose interpretation can
+     * genuinely differ between Exact and Fuzzy modes.
+     *
+     * Structural selectors such as type: and ext: do not count. With no textual
+     * operand present, Fuzzy mode has nothing to score approximately and should
+     * therefore preserve Exact Tree semantics.
+     */
+    pub(crate) fn has_textual_operands(&self) -> bool {
+        if !self.text.is_empty() && self.text != "." {
+            return true;
+        }
+
+        if self
+            .include_terms
+            .iter()
+            .chain(self.exclude_terms.iter())
+            .any(|term| matches!(term, SignedQueryTerm::Text { .. }))
+        {
+            return true;
+        }
+
+        self.boolean_expression
+            .as_ref()
+            .is_some_and(boolean_expression_contains_text)
+    }
+
+    pub(crate) fn extension_highlights(&self) -> Vec<String> {
+        let mut extensions = Vec::new();
+
+        /*
+         * Compact syntax:
+         *
+         *     ext:rs
+         */
+        if let Some(extension) = &self.extension_filter {
+            extensions.push(extension.clone());
+        }
+
+        /*
+         * Retain compatibility with any explicit positive extension selectors
+         * represented as compact signed terms.
+         */
+        for term in &self.include_terms {
+            if let SignedQueryTerm::Extension(extension) = term
+                && !extensions.contains(extension)
+            {
+                extensions.push(extension.clone());
+            }
+        }
+
+        /*
+         * Boolean syntax:
+         *
+         *     ext:rs OR ext:py
+         *     ext:rs AND NOT ext:test
+         */
+        if let Some(expression) = &self.boolean_expression {
+            collect_boolean_extension_highlights(expression, false, &mut extensions);
+        }
+
+        extensions
     }
 
     pub(crate) fn highlight_terms(&self) -> Vec<QueryHighlightTerm> {
@@ -1916,6 +2311,55 @@ impl ParsedQuery {
         /*
          * Avoid painting the same textual operand twice.
          */
+        terms.dedup();
+
+        terms
+    }
+
+    /*
+     * Positive compact text operands that are cumulative requirements in Fuzzy
+     * mode.
+     *
+     * Boolean operands are deliberately excluded. Their AND/OR/NOT eligibility
+     * and relevance are evaluated by the Boolean expression scorer.
+     */
+    pub(crate) fn fuzzy_signed_highlight_terms(&self) -> Vec<QueryHighlightTerm> {
+        self.include_terms
+            .iter()
+            .filter_map(|term| {
+                let SignedQueryTerm::Text {
+                    value,
+                    case_sensitive,
+                } = term
+                else {
+                    return None;
+                };
+
+                Some(QueryHighlightTerm {
+                    value: value.clone(),
+                    case_sensitive: *case_sensitive,
+                })
+            })
+            .collect()
+    }
+
+    /*
+     * Positive Boolean text operands that should be painted through Fuzzy
+     * highlighting.
+     *
+     * This collection is for rendering only. It must never be reused as the
+     * worker's cumulative required-term list because OR operands are alternatives,
+     * not simultaneous requirements.
+     *
+     * collect_boolean_highlight_terms() already excludes operands beneath NOT.
+     */
+    pub(crate) fn fuzzy_boolean_highlight_terms(&self) -> Vec<QueryHighlightTerm> {
+        let mut terms = Vec::new();
+
+        if let Some(expression) = &self.boolean_expression {
+            collect_boolean_highlight_terms(expression, &mut terms);
+        }
+
         terms.dedup();
 
         terms
@@ -2037,6 +2481,56 @@ pub(crate) fn record_matches_query_filters(record: &SearchRecord, query: &Parsed
     true
 }
 
+pub(crate) fn record_matches_query_filters_with_signed_text(
+    record: &SearchRecord,
+    query: &ParsedQuery,
+    text_matches: impl Fn(&SearchRecord, &str, bool) -> bool,
+) -> bool {
+    /*
+     * Boolean structure retains its ordinary truth semantics, while textual leaves
+     * use the caller's Exact or Fuzzy interpretation.
+     *
+     * Structural type and extension operands remain exact.
+     */
+    if query.boolean_expression.as_ref().is_some_and(|expression| {
+        !record_matches_boolean_expression_with(record, expression, &text_matches)
+    }) {
+        return false;
+    }
+
+    if query
+        .type_filter
+        .is_some_and(|filter| !record_matches_type_filter(record, filter))
+    {
+        return false;
+    }
+
+    if query
+        .extension_filter
+        .as_deref()
+        .is_some_and(|extension| !record_matches_extension_filter(record, extension))
+    {
+        return false;
+    }
+
+    if !record_matches_positive_terms_with(record, &query.include_terms, &text_matches) {
+        return false;
+    }
+
+    /*
+     * Any fuzzy match against a compact -term excludes the record.
+     */
+    if query
+        .exclude_terms
+        .iter()
+        .any(|term| record_matches_signed_query_term_with(record, term, &text_matches))
+    {
+        return false;
+    }
+
+    true
+}
+
 pub(crate) fn entry_matches_query(entry: &FileEntry, query: &ParsedQuery) -> bool {
     if !entry_matches_query_filters(entry, query) {
         return false;
@@ -2059,6 +2553,28 @@ mod tests {
         let query = parse_query("type:");
 
         assert!(query.is_effectively_empty());
+    }
+
+    #[test]
+    fn partial_type_modifier_is_effectively_empty() {
+        for source in [
+            "type:t",
+            "type:to",
+            "type:tor",
+            "type:torr",
+            "type:torre",
+            "type:torren",
+        ] {
+            assert!(
+                parse_query(source).is_effectively_empty(),
+                "expected partial type modifier to remain inactive: {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn complete_type_modifier_becomes_active() {
+        assert!(!parse_query("type:torrent").is_effectively_empty());
     }
 
     #[test]
@@ -2175,12 +2691,36 @@ mod tests {
 
         assert!(matches!(
             right.as_ref(),
-            BooleanExpression::Term(
-                SignedQueryTerm::Text {
+            BooleanExpression::Term {
+                term: SignedQueryTerm::Text {
                     value,
                     case_sensitive: true,
-                }
-            ) if value == "TeSt"
+                },
+                ..
+            } if value == "TeSt"
+        ));
+    }
+
+    #[test]
+    fn boolean_sensitive_and_without_operand_is_effectively_empty() {
+        let parsed = parse_query("type:sensitive AND");
+
+        assert!(parsed.is_effectively_empty());
+    }
+
+    #[test]
+    fn boolean_sensitive_directive_accepts_explicit_and() {
+        let parsed = parse_query("type:sensitive AND Makefile");
+
+        assert!(matches!(
+            parsed.boolean_expression.as_ref(),
+            Some(BooleanExpression::Term {
+                term: SignedQueryTerm::Text {
+                    value,
+                    case_sensitive: true,
+                },
+                ..
+            }) if value == "Makefile"
         ));
     }
 
@@ -2305,5 +2845,143 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn all_positive_boolean_operands_are_highlighted_across_precedence() {
+        for source in [
+            "session OR map AND rs",
+            "(session OR map) AND rs",
+            "session OR (map AND rs)",
+        ] {
+            let query = parse_query(source);
+
+            assert_eq!(
+                query.highlight_terms(),
+                vec![
+                    QueryHighlightTerm {
+                        value: "session".to_string(),
+
+                        case_sensitive: false,
+                    },
+                    QueryHighlightTerm {
+                        value: "map".to_string(),
+
+                        case_sensitive: false,
+                    },
+                    QueryHighlightTerm {
+                        value: "rs".to_string(),
+
+                        case_sensitive: false,
+                    },
+                ],
+                "unexpected highlight terms for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_boolean_selectors_are_not_highlighted_as_path_text() {
+        let query = parse_query("type:source AND ext:rs");
+
+        assert!(query.highlight_terms().is_empty());
+    }
+
+    #[test]
+    fn negative_boolean_operands_are_not_highlighted() {
+        let query = parse_query("session AND NOT map AND -target");
+
+        assert_eq!(
+            query.highlight_terms(),
+            vec![QueryHighlightTerm {
+                value: "session".to_string(),
+
+                case_sensitive: false,
+            }],
+        );
+    }
+
+    #[test]
+    fn boolean_operands_remain_available_for_general_highlighting() {
+        let query = parse_query("hlep OR hlelo");
+
+        assert_eq!(
+            query.highlight_terms(),
+            vec![
+                QueryHighlightTerm {
+                    value: "hlep".to_string(),
+                    case_sensitive: false,
+                },
+                QueryHighlightTerm {
+                    value: "hlelo".to_string(),
+                    case_sensitive: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn boolean_operands_are_not_cumulative_fuzzy_signed_terms() {
+        let query = parse_query("hlep OR hlelo");
+
+        assert!(query.fuzzy_signed_highlight_terms().is_empty());
+    }
+
+    #[test]
+    fn positive_boolean_operands_are_available_for_fuzzy_highlighting() {
+        let query = parse_query("hlep OR hlelo");
+
+        assert_eq!(
+            query.fuzzy_boolean_highlight_terms(),
+            vec![
+                QueryHighlightTerm {
+                    value: "hlep".to_string(),
+                    case_sensitive: false,
+                },
+                QueryHighlightTerm {
+                    value: "hlelo".to_string(),
+                    case_sensitive: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn negated_boolean_operands_are_not_fuzzy_highlighted() {
+        let query = parse_query("(hlep OR hlelo) AND NOT java");
+
+        assert_eq!(
+            query.fuzzy_boolean_highlight_terms(),
+            vec![
+                QueryHighlightTerm {
+                    value: "hlep".to_string(),
+                    case_sensitive: false,
+                },
+                QueryHighlightTerm {
+                    value: "hlelo".to_string(),
+                    case_sensitive: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn boolean_operands_are_not_returned_as_cumulative_fuzzy_signed_terms() {
+        let query = parse_query("hlep OR hlelo");
+
+        assert!(query.fuzzy_signed_highlight_terms().is_empty());
+    }
+
+    #[test]
+    fn sensitive_boolean_operand_retains_original_case() {
+        let query = parse_query("type:sensitive Hlep OR Help");
+
+        let terms = query.highlight_terms();
+
+        assert!(terms.iter().all(|term| term.case_sensitive));
+
+        assert!(terms.iter().any(|term| term.value == "Hlep"));
+
+        assert!(terms.iter().any(|term| term.value == "Help"));
     }
 }

@@ -397,11 +397,18 @@ impl FileInfoState {
 
 #[derive(Debug)]
 pub enum FileInfoMessage {
-    Finished { generation: u64, info: FileInfo },
+    Finished {
+        generation: u64,
 
-    Failed { generation: u64, message: String },
+        info: Box<FileInfo>,
+    },
+
+    Failed {
+        generation: u64,
+
+        message: String,
+    },
 }
-
 /*
  * Gather complete metadata for a local filesystem path without blocking the
  * terminal event loop.
@@ -414,7 +421,11 @@ pub fn start_local_file_info(initial_info: FileInfo, generation: u64) -> Receive
 
         match collect_local_file_info(initial_info) {
             Ok(info) => {
-                let _ = sender.send(FileInfoMessage::Finished { generation, info });
+                let _ = sender.send(FileInfoMessage::Finished {
+                    generation,
+
+                    info: Box::new(info),
+                });
             }
 
             Err(error) => {
@@ -706,7 +717,7 @@ pub fn format_integer(value: u64) -> String {
     );
 
     for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             result.push(',');
         }
 

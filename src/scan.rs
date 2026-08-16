@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use chrono::{DateTime, Local};
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -25,7 +24,6 @@ const ROOT_SKIPPED_DIRECTORIES: &[&str] = &["proc", "sys", "dev", "run"];
 pub enum RecursiveScanMode {
     Fast,
 
-    #[allow(dead_code)]
     Total,
 }
 
@@ -78,9 +76,9 @@ pub struct FileEntry {
 
     pub is_symlink: bool,
 
-    pub permissions: String,
+    pub kind: EntryKind,
 
-    pub modified: String,
+    pub permissions_mode: u32,
 
     pub modified_time: Option<SystemTime>,
 
@@ -145,13 +143,23 @@ pub fn read_directory(
 pub fn start_recursive_scan(
     root: PathBuf,
     show_hidden: bool,
+    hidden_only: bool,
+    excluded_subtree: Option<PathBuf>,
     generation: u64,
     mode: RecursiveScanMode,
 ) -> Receiver<ScanMessage> {
     let (sender, receiver) = mpsc::channel();
 
     thread::spawn(move || {
-        scan_directory_tree(root, show_hidden, generation, mode, sender);
+        scan_directory_tree(
+            root,
+            show_hidden,
+            hidden_only,
+            excluded_subtree,
+            generation,
+            mode,
+            sender,
+        );
     });
 
     receiver
@@ -209,17 +217,49 @@ pub fn sort_entries(entries: &mut [FileEntry], mode: SortMode, descending: bool)
 fn scan_directory_tree(
     root: PathBuf,
     show_hidden: bool,
+    hidden_only: bool,
+    excluded_subtree: Option<PathBuf>,
     generation: u64,
     mode: RecursiveScanMode,
     sender: Sender<ScanMessage>,
 ) {
-    let mut pending_directories = VecDeque::from([root.clone()]);
+    /*
+     * Ordinary and hidden directory trees are traversed in separate phases.
+     *
+     * When hidden entries are enabled, hidden entries themselves are still emitted
+     * as soon as they are encountered. Descending into their directory trees is
+     * deferred until the ordinary tree has been exhausted.
+     *
+     * This prevents large hidden trees from consuming the Fast-scan allowance
+     * before ordinary filesystem coverage has been completed.
+     */
+    let root_is_inside_hidden_tree = path_contains_hidden_component(&root);
+
+    let mut pending_directories = if root_is_inside_hidden_tree {
+        VecDeque::new()
+    } else {
+        VecDeque::from([root.clone()])
+    };
+
+    let mut pending_hidden_directories = if root_is_inside_hidden_tree {
+        VecDeque::from([root.clone()])
+    } else {
+        VecDeque::new()
+    };
 
     let mut scanned_entries = 0_usize;
 
     let mut batch = Vec::with_capacity(SCAN_BATCH_SIZE);
 
-    while let Some(directory) = pending_directories.pop_front() {
+    while let Some((directory, inside_hidden_tree)) = pending_directories
+        .pop_front()
+        .map(|directory| (directory, false))
+        .or_else(|| {
+            pending_hidden_directories
+                .pop_front()
+                .map(|directory| (directory, true))
+        })
+    {
         let directory_entries = match fs::read_dir(&directory) {
             Ok(directory_entries) => directory_entries,
 
@@ -249,28 +289,87 @@ fn scan_directory_tree(
 
             let name = dir_entry.file_name().to_string_lossy().into_owned();
 
-            if !show_hidden && name.starts_with('.') {
-                continue;
-            }
-
             let path = dir_entry.path();
 
             if should_skip_directory(&root, &path, &name) {
                 continue;
             }
 
-            let Some(entry) = make_file_entry(path.clone(), &root, name) else {
+            /*
+             * App may already own a complete recursive corpus for one child subtree after
+             * rerooting an Exact Recursive Tree upward.
+             *
+             * In that case the old subtree is retained and rebased by App. Do not stat,
+             * classify, emit, or descend into it again.
+             *
+             * Only the exact subtree root is tested here. Because it is never queued for
+             * traversal, none of its descendants can subsequently be visited.
+             */
+            if excluded_subtree
+                .as_ref()
+                .is_some_and(|excluded| path == *excluded)
+            {
+                continue;
+            }
+
+            let Some(entry) = make_file_entry(path.clone(), &root, name.clone()) else {
                 continue;
             };
 
             /*
+             * An entry belongs to hidden content when either:
+             *
+             * - its own name begins with a dot; or
+             * - traversal has already entered a hidden directory.
+             *
+             * Therefore every descendant beneath a hidden directory remains part of the
+             * hidden domain even when its own filename is not dot-prefixed.
+             */
+            let entry_is_inside_hidden_tree = inside_hidden_tree || name.starts_with('.');
+
+            /*
              * symlink_metadata() does not follow symlinks.
              *
-             * Directory symlinks therefore appear in the results but are not
-             * traversed, preventing recursive symlink loops.
+             * Directory symlinks therefore appear in results but are never traversed,
+             * preventing recursive symlink loops.
              */
             if entry.is_directory && !entry.is_symlink {
-                pending_directories.push_back(path);
+                if entry_is_inside_hidden_tree {
+                    /*
+                     * Hidden subtrees are traversed only when hidden content is relevant.
+                     *
+                     * In Hidden Only mode, every descendant of this directory belongs to
+                     * the hidden corpus.
+                     */
+                    if show_hidden || hidden_only {
+                        pending_hidden_directories.push_back(path);
+                    }
+                } else {
+                    /*
+                     * Ordinary directories must still be traversed in Hidden Only mode so
+                     * Scry can discover hidden directories located deeper in the ordinary
+                     * hierarchy.
+                     *
+                     * These ordinary directories are traversal corridors only; they are
+                     * not emitted into the Hidden Only result corpus.
+                     */
+                    pending_directories.push_back(path);
+                }
+            }
+
+            /*
+             * Decide whether this filesystem entry belongs in the published corpus.
+             */
+            let include_entry = if hidden_only {
+                entry_is_inside_hidden_tree
+            } else if show_hidden {
+                true
+            } else {
+                !entry_is_inside_hidden_tree
+            };
+
+            if !include_entry {
+                continue;
             }
 
             batch.push(entry);
@@ -291,14 +390,14 @@ fn scan_directory_tree(
                 return;
             }
 
-            if batch.len() >= SCAN_BATCH_SIZE {
-                if send_batch(&sender, generation, &mut batch).is_err() {
-                    /*
-                     * The App discarded the receiver, usually because the user
-                     * changed directory or started a newer scan.
-                     */
-                    return;
-                }
+            if batch.len() >= SCAN_BATCH_SIZE
+                && send_batch(&sender, generation, &mut batch).is_err()
+            {
+                /*
+                 * The App discarded the receiver, usually because the user
+                 * changed directory or started a newer scan.
+                 */
+                return;
             }
         }
     }
@@ -312,6 +411,14 @@ fn scan_directory_tree(
 
         partial: false,
     });
+}
+
+fn path_contains_hidden_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy();
+
+        component != "." && component != ".." && component.starts_with('.')
+    })
 }
 
 pub(crate) fn should_skip_directory(root: &Path, path: &Path, name: &str) -> bool {
@@ -416,26 +523,12 @@ fn local_owner_id(_metadata: &fs::Metadata) -> Option<u32> {
     None
 }
 
-fn format_modified_date(modified_time: Option<SystemTime>) -> String {
-    let Some(modified) = modified_time else {
-        return "—".to_string();
-    };
-
-    let modified: DateTime<Local> = DateTime::from(modified);
-
-    modified.format("%Y-%m-%d %H:%M").to_string()
-}
-
 fn make_file_entry(path: PathBuf, root: &Path, name: String) -> Option<FileEntry> {
     let metadata = fs::symlink_metadata(&path).ok()?;
 
     let is_symlink = metadata.file_type().is_symlink();
 
     let entry_metadata = local_entry_metadata(&metadata, is_symlink);
-
-    let permissions = format_permissions(&entry_metadata);
-
-    let modified = format_modified_date(entry_metadata.modified_time);
 
     let modified_time = entry_metadata.modified_time;
 
@@ -466,9 +559,9 @@ fn make_file_entry(path: PathBuf, root: &Path, name: String) -> Option<FileEntry
 
         is_symlink: entry_metadata.kind.is_symlink(),
 
-        permissions,
+        kind: entry_metadata.kind,
 
-        modified,
+        permissions_mode: entry_metadata.permissions_mode,
 
         modified_time,
 
@@ -478,55 +571,4 @@ fn make_file_entry(path: PathBuf, root: &Path, name: String) -> Option<FileEntry
 
         class,
     })
-}
-
-#[cfg(unix)]
-fn format_permissions(metadata: &EntryMetadata) -> String {
-    let type_character = metadata.kind.permission_type_character();
-
-    let mode = metadata.permissions_mode;
-
-    let mut permissions = String::with_capacity(10);
-
-    permissions.push(type_character);
-
-    permissions.push(if mode & 0o400 != 0 { 'r' } else { '-' });
-
-    permissions.push(if mode & 0o200 != 0 { 'w' } else { '-' });
-
-    permissions.push(match (mode & 0o100 != 0, mode & 0o4000 != 0) {
-        (true, true) => 's',
-        (false, true) => 'S',
-        (true, false) => 'x',
-        (false, false) => '-',
-    });
-
-    permissions.push(if mode & 0o040 != 0 { 'r' } else { '-' });
-
-    permissions.push(if mode & 0o020 != 0 { 'w' } else { '-' });
-
-    permissions.push(match (mode & 0o010 != 0, mode & 0o2000 != 0) {
-        (true, true) => 's',
-        (false, true) => 'S',
-        (true, false) => 'x',
-        (false, false) => '-',
-    });
-
-    permissions.push(if mode & 0o004 != 0 { 'r' } else { '-' });
-
-    permissions.push(if mode & 0o002 != 0 { 'w' } else { '-' });
-
-    permissions.push(match (mode & 0o001 != 0, mode & 0o1000 != 0) {
-        (true, true) => 't',
-        (false, true) => 'T',
-        (true, false) => 'x',
-        (false, false) => '-',
-    });
-
-    permissions
-}
-
-#[cfg(not(unix))]
-fn format_permissions(metadata: &EntryMetadata) -> String {
-    format!("{}---------", metadata.kind.permission_type_character(),)
 }

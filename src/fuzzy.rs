@@ -11,13 +11,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    query::{ParsedQuery, record_matches_query_filters},
-    search_index::{SearchIndex, character_mask},
+    query::{
+        ParsedQuery, record_boolean_score_with_text, record_matches_query_filters,
+        record_matches_query_filters_with_signed_text,
+    },
+    scan::SortMode,
+    search_index::{SearchIndex, SearchRecord, character_mask},
 };
 
 const CANCELLATION_CHECK_INTERVAL: usize = 1024;
-
-const FUZZY_RESULT_LIMIT: usize = 500;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(75);
 
@@ -81,9 +83,17 @@ pub struct FuzzyWorkerResult {
 /*
  * A larger RankedMatch is always a better result.
  *
- * Directory status comes first so every retained directory remains above
- * ordinary files. Within each group, relevance controls ordering. The original
- * entry index gives deterministic ordering for equal scores.
+ * Fuzzy results retain Scry's ordinary two-group listing structure:
+ *
+ * - directories appear first;
+ * - files follow afterward.
+ *
+ * Relevance controls ordering independently inside each group. A weak directory
+ * therefore cannot outrank a stronger directory, and a weak file cannot outrank
+ * a stronger file, while the complete list remains visually predictable.
+ *
+ * The original entry index provides deterministic ordering for otherwise equal
+ * results.
  */
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RankedMatch {
@@ -109,19 +119,59 @@ impl PartialOrd for RankedMatch {
     }
 }
 
+fn score_fuzzy_text(
+    record: &crate::search_index::SearchRecord,
+    value: &str,
+    case_sensitive: bool,
+) -> Option<i64> {
+    if value.is_empty() {
+        return None;
+    }
+
+    if case_sensitive {
+        let original_name = record
+            .original_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(record.original_path.as_ref());
+
+        score_candidate(original_name, &record.original_path, value)
+    } else {
+        score_candidate(&record.searchable_name, &record.searchable_path, value)
+    }
+}
+
+fn record_matches_fuzzy_signed_text(
+    record: &crate::search_index::SearchRecord,
+    value: &str,
+    case_sensitive: bool,
+) -> bool {
+    score_fuzzy_text(record, value, case_sensitive).is_some()
+}
+
+fn score_fuzzy_signed_term(
+    record: &crate::search_index::SearchRecord,
+    term: &crate::query::QueryHighlightTerm,
+) -> Option<i64> {
+    score_fuzzy_text(record, &term.value, term.case_sensitive)
+}
+
 /*
  * Search a stable shared index.
  *
- * The worker retains only the best FUZZY_RESULT_LIMIT matches. It never builds
- * a vector containing every technically matching path.
+ * The worker retains only the configured number of highest-ranked matches.
+ * It never builds a vector containing every technically matching path.
  */
+#[allow(clippy::too_many_arguments)]
 pub fn start_fuzzy_worker(
     index: Arc<SearchIndex>,
     parsed_query: ParsedQuery,
     generation: u64,
     show_hidden: bool,
+    hidden_only: bool,
     scope_prefix: Option<String>,
     entry_filter: WorkerEntryFilter,
+    result_limit: usize,
     cancel_signal: Arc<AtomicBool>,
 ) -> Receiver<FuzzyWorkerResult> {
     let (sender, receiver) = mpsc::channel();
@@ -134,6 +184,12 @@ pub fn start_fuzzy_worker(
          * against SearchRecord inside this worker.
          */
         let folded_query = parsed_query.search_text().to_string();
+
+        /*
+         * Positive compact +terms participate in relevance ranking as well as
+         * eligibility while Fuzzy mode is active.
+         */
+        let fuzzy_signed_terms = parsed_query.fuzzy_signed_highlight_terms();
 
         let query_mask = character_mask(&folded_query);
 
@@ -148,7 +204,7 @@ pub fn start_fuzzy_worker(
          * match only when it ranks higher.
          */
         let mut best_matches: BinaryHeap<Reverse<RankedMatch>> =
-            BinaryHeap::with_capacity(FUZZY_RESULT_LIMIT.saturating_add(1));
+            BinaryHeap::with_capacity(result_limit.saturating_add(1));
 
         let mut last_progress = Instant::now();
 
@@ -177,23 +233,26 @@ pub fn start_fuzzy_worker(
             /*
              * Scope is checked before every more expensive query operation.
              */
-            if let Some(scope_prefix) = scope_prefix.as_deref() {
-                if !scope_prefix.is_empty()
-                    && record.searchable_path.as_ref() != scope_prefix
-                    && !record
-                        .searchable_path
-                        .strip_prefix(scope_prefix)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-                {
-                    continue;
-                }
+            if let Some(scope_prefix) = scope_prefix.as_deref()
+                && !scope_prefix.is_empty()
+                && record.searchable_path.as_ref() != scope_prefix
+                && !record
+                    .searchable_path
+                    .strip_prefix(scope_prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                continue;
             }
 
             /*
-             * Hidden state was prepared once when SearchRecord entered the
-             * resident index.
+             * Hidden Only accepts entries whose searchable path contains at least one
+             * hidden component. This includes every descendant beneath a dot-directory.
              */
-            if !show_hidden && record.contains_hidden_component {
+            if hidden_only {
+                if !record.contains_hidden_component {
+                    continue;
+                }
+            } else if !show_hidden && record.contains_hidden_component {
                 continue;
             }
 
@@ -206,7 +265,49 @@ pub fn start_fuzzy_worker(
              * here rather than through a corpus-sized Boolean mask constructed
              * by App.
              */
-            if !record_matches_query_filters(record, &parsed_query) {
+            if !record_matches_query_filters_with_signed_text(
+                record,
+                &parsed_query,
+                record_matches_fuzzy_signed_text,
+            ) {
+                continue;
+            }
+
+            /*
+             * Boolean text operands participate in relevance ranking as well as
+             * eligibility.
+             *
+             * OR keeps the strongest matching branch, AND combines required branches, and
+             * NOT contributes no positive score.
+             */
+            let Some(boolean_score) =
+                record_boolean_score_with_text(record, &parsed_query, score_fuzzy_text)
+            else {
+                continue;
+            };
+
+            /*
+             * Every positive fuzzy +term is a required match.
+             *
+             * Add the quality of all those matches so an entry that strongly satisfies
+             * every requirement ranks above one containing widely scattered accidental
+             * matches.
+             */
+            let mut signed_terms_score = 0_i64;
+
+            let mut signed_terms_rankable = true;
+
+            for term in &fuzzy_signed_terms {
+                let Some(score) = score_fuzzy_signed_term(record, term) else {
+                    signed_terms_rankable = false;
+
+                    break;
+                };
+
+                signed_terms_score = signed_terms_score.saturating_add(score);
+            }
+
+            if !signed_terms_rankable {
                 continue;
             }
 
@@ -224,8 +325,9 @@ pub fn start_fuzzy_worker(
 
                         is_directory: record.is_directory,
 
-                        score: 0,
+                        score: signed_terms_score.saturating_add(boolean_score),
                     },
+                    result_limit,
                 );
             } else {
                 /*
@@ -250,13 +352,17 @@ pub fn start_fuzzy_worker(
                     }
                 }
 
-                let Some(score) = score_candidate(
+                let Some(base_score) = score_candidate(
                     &record.searchable_name,
                     &record.searchable_path,
                     &folded_query,
                 ) else {
                     continue;
                 };
+
+                let score = base_score
+                    .saturating_add(signed_terms_score)
+                    .saturating_add(boolean_score);
 
                 retain_ranked_match(
                     &mut best_matches,
@@ -267,6 +373,7 @@ pub fn start_fuzzy_worker(
 
                         score,
                     },
+                    result_limit,
                 );
             }
 
@@ -340,14 +447,24 @@ pub fn start_fuzzy_worker(
     receiver
 }
 
+/*
+ * Every argument describes an independent part of one Exact worker request.
+ *
+ * Keeping them explicit mirrors start_fuzzy_worker() and avoids introducing a
+ * one-use configuration structure that would merely move these fields elsewhere.
+ */
+#[allow(clippy::too_many_arguments)]
 pub fn start_exact_worker(
     index: Arc<SearchIndex>,
     parsed_query: ParsedQuery,
     generation: u64,
     show_hidden: bool,
+    hidden_only: bool,
     scope_prefix: Option<String>,
     entry_filter: WorkerEntryFilter,
     result_limit: Option<usize>,
+    sort_mode: SortMode,
+    sort_descending: bool,
     cancel_signal: Arc<AtomicBool>,
 ) -> Receiver<FuzzyWorkerResult> {
     let (sender, receiver) = mpsc::channel();
@@ -393,19 +510,22 @@ pub fn start_exact_worker(
              * Restrict a host-wide persistent index to the currently selected
              * recursive root.
              */
-            if let Some(scope_prefix) = scope_prefix.as_deref() {
-                if !scope_prefix.is_empty()
-                    && record.searchable_path.as_ref() != scope_prefix
-                    && !record
-                        .searchable_path
-                        .strip_prefix(scope_prefix)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-                {
-                    continue;
-                }
+            if let Some(scope_prefix) = scope_prefix.as_deref()
+                && !scope_prefix.is_empty()
+                && record.searchable_path.as_ref() != scope_prefix
+                && !record
+                    .searchable_path
+                    .strip_prefix(scope_prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                continue;
             }
 
-            if !show_hidden && record.contains_hidden_component {
+            if hidden_only {
+                if !record.contains_hidden_component {
+                    continue;
+                }
+            } else if !show_hidden && record.contains_hidden_component {
                 continue;
             }
 
@@ -513,6 +633,25 @@ pub fn start_exact_worker(
             return;
         }
 
+        /*
+         * The backing index remains in stable scanner order.
+         *
+         * Sort only the matching entry indices, here on the worker thread. Changing
+         * Exact/Fuzzy mode or Reverse therefore never needs to rearrange the complete
+         * recursive FileEntry corpus or rebuild SearchIndex on the UI thread.
+         */
+        matching_indices.sort_unstable_by(|left_index, right_index| {
+            let Some(left) = index.records().get(*left_index) else {
+                return ComparisonOrdering::Equal;
+            };
+
+            let Some(right) = index.records().get(*right_index) else {
+                return ComparisonOrdering::Equal;
+            };
+
+            compare_exact_records(left, right, sort_mode, sort_descending)
+        });
+
         let _ = sender.send(FuzzyWorkerResult {
             generation,
 
@@ -533,8 +672,62 @@ pub fn start_exact_worker(
     receiver
 }
 
-fn retain_ranked_match(matches: &mut BinaryHeap<Reverse<RankedMatch>>, candidate: RankedMatch) {
-    if matches.len() < FUZZY_RESULT_LIMIT {
+fn compare_exact_records(
+    left: &SearchRecord,
+    right: &SearchRecord,
+    sort_mode: SortMode,
+    descending: bool,
+) -> ComparisonOrdering {
+    /*
+     * Directories always remain above ordinary files, regardless of direction.
+     */
+    match (left.is_directory, right.is_directory) {
+        (true, false) => {
+            return ComparisonOrdering::Less;
+        }
+
+        (false, true) => {
+            return ComparisonOrdering::Greater;
+        }
+
+        _ => {}
+    }
+
+    /*
+     * Match scan::sort_entries():
+     *
+     * directories use their paths for every sort mode, while files use the
+     * selected metadata and fall back to path for deterministic ordering.
+     */
+    let ordering = if left.is_directory && right.is_directory {
+        left.searchable_path.cmp(&right.searchable_path)
+    } else {
+        let primary_ordering = match sort_mode {
+            SortMode::Name => left.searchable_path.cmp(&right.searchable_path),
+
+            SortMode::Size => left.size_bytes.cmp(&right.size_bytes),
+
+            SortMode::Modified => left.modified_time.cmp(&right.modified_time),
+
+            SortMode::Type => left.class.label().cmp(right.class.label()),
+        };
+
+        primary_ordering.then_with(|| left.searchable_path.cmp(&right.searchable_path))
+    };
+
+    if descending {
+        ordering.reverse()
+    } else {
+        ordering
+    }
+}
+
+fn retain_ranked_match(
+    matches: &mut BinaryHeap<Reverse<RankedMatch>>,
+    candidate: RankedMatch,
+    result_limit: usize,
+) {
+    if matches.len() < result_limit {
         matches.push(Reverse(candidate));
 
         return;
@@ -587,7 +780,19 @@ fn score_candidate(name: &str, path: &str, query: &str) -> Option<i64> {
         return Some(0);
     }
 
-    let mut best_score = score_component(name, query).map(|score| score + 1_000);
+    /*
+     * Prefer filename matches, but do not let location outweigh substantially
+     * better textual similarity.
+     *
+     * An obvious typo correction in a path component, such as:
+     *
+     *     hlep -> help
+     *
+     * should rank above a loosely scattered filename match such as:
+     *
+     *     shlex.py
+     */
+    let mut best_score = score_component(name, query).map(|score| score + 600);
 
     for component in path.split(['/', '\\']) {
         if component.is_empty() || component == name {
@@ -608,6 +813,196 @@ fn score_candidate(name: &str, path: &str, query: &str) -> Option<i64> {
     best_score
 }
 
+/*
+ * Find a contiguous candidate substring produced by correcting one adjacent
+ * transposition in the query.
+ *
+ * Examples:
+ *
+ *     coed  -> code
+ *     cdoe  -> code
+ *     hlep  -> help
+ *     hlelo -> hello
+ *
+ * Unlike general subsequence matching, every corrected character must remain
+ * contiguous inside one path component. This allows typo-corrected words to
+ * match larger names such as `pycodestyle` without admitting widely scattered
+ * character combinations.
+ */
+fn adjacent_transposition_substring_position(candidate: &[u8], query: &[u8]) -> Option<usize> {
+    if query.len() < 2 || candidate.len() < query.len() {
+        return None;
+    }
+
+    let mut best_position = None;
+
+    for swap_index in 0..query.len().saturating_sub(1) {
+        /*
+         * Swapping identical adjacent characters would reproduce the original
+         * query and therefore adds no new fuzzy interpretation.
+         */
+        if query[swap_index] == query[swap_index + 1] {
+            continue;
+        }
+
+        for (position, window) in candidate.windows(query.len()).enumerate() {
+            let matches = window.iter().enumerate().all(|(index, character)| {
+                let expected = if index == swap_index {
+                    query[swap_index + 1]
+                } else if index == swap_index + 1 {
+                    query[swap_index]
+                } else {
+                    query[index]
+                };
+
+                *character == expected
+            });
+
+            if matches {
+                best_position = Some(
+                    best_position
+                        .map(|current: usize| current.min(position))
+                        .unwrap_or(position),
+                );
+            }
+        }
+    }
+
+    best_position
+}
+
+/*
+ * Find a contiguous candidate substring produced by inserting exactly one
+ * missing character into the query.
+ *
+ * Examples:
+ *
+ *     REDME -> README     -> README.md
+ *     helo  -> hello      -> hello_world.txt
+ *     sorce -> source     -> source-code.rs
+ *
+ * Embedded replacements are deliberately not accepted here. Allowing any
+ * same-length substring one edit away would reintroduce accidental matches such
+ * as:
+ *
+ *     hlep  -> hlex       -> shlex.py
+ *     hlelo -> hlelf      -> shlelf_nto.xwe
+ *
+ * Equal-length transpositions are already handled by the dedicated adjacent
+ * transposition matcher, while whole-component replacements remain available
+ * through typo_score().
+ *
+ * The returned values are:
+ *
+ *     byte position
+ *     matched window length
+ *     edit distance
+ */
+/*
+ * Test whether removing exactly one byte from a candidate window makes the
+ * remaining bytes equal the query, optionally after correcting one adjacent
+ * transposition in the query.
+ *
+ * No allocation is performed. Every remaining candidate byte is compared
+ * directly with its expected query byte.
+ */
+fn matches_after_one_removal(
+    window: &[u8],
+    query: &[u8],
+    removed_index: usize,
+    swap_index: Option<usize>,
+) -> bool {
+    if window.len() != query.len().saturating_add(1) || removed_index >= window.len() {
+        return false;
+    }
+
+    for query_index in 0..query.len() {
+        let window_index = if query_index < removed_index {
+            query_index
+        } else {
+            query_index.saturating_add(1)
+        };
+
+        let expected = match swap_index {
+            Some(swap_index) if query_index == swap_index => query[swap_index + 1],
+
+            Some(swap_index) if query_index == swap_index + 1 => query[swap_index],
+
+            _ => query[query_index],
+        };
+
+        if window[window_index] != expected {
+            return false;
+        }
+    }
+
+    true
+}
+
+/*
+ * Find a corrected contiguous candidate word containing exactly one character
+ * omitted from the query.
+ *
+ * Two narrowly defined forms are accepted:
+ *
+ *     REDME -> README
+ *     REDEM -> REDME -> README
+ *
+ * The second form combines one missing character with one adjacent
+ * transposition. General distance-two replacements remain excluded so noisy
+ * matches such as arbitrary altered substrings are not reintroduced.
+ *
+ * The returned values are:
+ *
+ *     byte position
+ *     matched window length
+ *     edit cost: 1 for omission only, 2 for omission plus transposition
+ */
+fn missing_character_substring_match(
+    candidate: &[u8],
+    query: &[u8],
+) -> Option<(usize, usize, usize)> {
+    if query.len() < 3 {
+        return None;
+    }
+
+    let window_length = query.len().saturating_add(1);
+
+    if candidate.len() < window_length {
+        return None;
+    }
+
+    for (position, window) in candidate.windows(window_length).enumerate() {
+        /*
+         * First accept an ordinary one-character omission.
+         */
+        for removed_index in 0..window.len() {
+            if matches_after_one_removal(window, query, removed_index, None) {
+                return Some((position, window_length, 1));
+            }
+        }
+
+        /*
+         * Then accept one omission combined with exactly one adjacent swap.
+         *
+         * Swapping identical bytes changes nothing and is therefore skipped.
+         */
+        for swap_index in 0..query.len().saturating_sub(1) {
+            if query[swap_index] == query[swap_index + 1] {
+                continue;
+            }
+
+            for removed_index in 0..window.len() {
+                if matches_after_one_removal(window, query, removed_index, Some(swap_index)) {
+                    return Some((position, window_length, 2));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn score_component(candidate: &str, query: &str) -> Option<i64> {
     if candidate.is_empty() {
         return None;
@@ -625,88 +1020,40 @@ fn score_component(candidate: &str, query: &str) -> Option<i64> {
         return Some(6_000 - position as i64);
     }
 
-    let subsequence_score = compact_subsequence_score(candidate.as_bytes(), query.as_bytes());
-
-    let typo_score = typo_score(candidate.as_bytes(), query.as_bytes());
-
-    match (subsequence_score, typo_score) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-
-        (Some(score), None) | (None, Some(score)) => Some(score),
-
-        (None, None) => None,
+    /*
+     * A corrected adjacent transposition may occur inside a larger component:
+     *
+     *     coed -> code -> pycodestyle
+     *
+     * Keep this below an ordinary contiguous substring but above general
+     * whole-component edit-distance matching.
+     */
+    if let Some(position) =
+        adjacent_transposition_substring_position(candidate.as_bytes(), query.as_bytes())
+    {
+        return Some(5_500 - position as i64);
     }
-}
-
-/*
- * Ordered abbreviation matching:
- *
- *     nct  -> noct
- *     cpuf -> cpuforge
- *
- * Reject matches whose characters are scattered too widely.
- */
-fn compact_subsequence_score(candidate: &[u8], query: &[u8]) -> Option<i64> {
-    if query.is_empty() {
-        return Some(0);
-    }
-
-    let mut query_position = 0_usize;
-
-    let mut first_match = None;
-
-    let mut previous_match = None;
-
-    let mut consecutive_pairs = 0_usize;
-
-    for (candidate_position, character) in candidate.iter().copied().enumerate() {
-        if query_position == query.len() {
-            break;
-        }
-
-        if character != query[query_position] {
-            continue;
-        }
-
-        first_match.get_or_insert(candidate_position);
-
-        if previous_match.is_some_and(|previous| previous + 1 == candidate_position) {
-            consecutive_pairs += 1;
-        }
-
-        previous_match = Some(candidate_position);
-
-        query_position += 1;
-    }
-
-    if query_position != query.len() {
-        return None;
-    }
-
-    let first = first_match?;
-
-    let last = previous_match?;
-
-    let span = last.saturating_sub(first).saturating_add(1);
 
     /*
-     * Four query characters spread across a forty-character component are
-     * accidental noise, not a useful fuzzy result.
+     * Permit one corrected contiguous word inside a larger component:
+     *
+     *     REDME -> README -> README.md
+     *
+     * Keep this below the specialized adjacent-transposition route, but above the
+     * ordinary whole-component typo fallback.
      */
-    let maximum_span = query.len().saturating_mul(3).saturating_add(2);
-
-    if span > maximum_span {
-        return None;
+    if let Some((position, window_length, distance)) =
+        missing_character_substring_match(candidate.as_bytes(), query.as_bytes())
+    {
+        return Some(
+            5_300
+                - distance as i64 * 300
+                - window_length.abs_diff(query.len()) as i64 * 40
+                - position as i64 * 10,
+        );
     }
 
-    let gap_count = span.saturating_sub(query.len());
-
-    Some(
-        4_000 + consecutive_pairs as i64 * 120
-            - gap_count as i64 * 80
-            - first as i64 * 10
-            - candidate.len().saturating_sub(query.len()) as i64,
-    )
+    typo_score(candidate.as_bytes(), query.as_bytes())
 }
 
 /*
@@ -892,21 +1239,36 @@ fn component_highlight_positions(candidate: &str, query: &str) -> Vec<usize> {
         return (character_start..character_start + query.chars().count()).collect();
     }
 
-    let subsequence_score = compact_subsequence_score(candidate.as_bytes(), query.as_bytes());
-
-    let typo_match = typo_score(candidate.as_bytes(), query.as_bytes());
-
-    /*
-     * Follow the same winning strategy as score_component().
-     */
-    if subsequence_score.is_some() && subsequence_score >= typo_match {
-        return compact_subsequence_positions(candidate, query).unwrap_or_default();
+    if let Some(position) =
+        adjacent_transposition_substring_position(candidate.as_bytes(), query.as_bytes())
+    {
+        /*
+         * Highlight the complete corrected substring.
+         *
+         * The returned position is a byte offset. This is safe for the ASCII query
+         * spellings handled by the byte-based fuzzy scorer.
+         */
+        return (position..position.saturating_add(query.len())).collect();
     }
 
-    if typo_match.is_some() {
+    if let Some((position, window_length, _distance)) =
+        missing_character_substring_match(candidate.as_bytes(), query.as_bytes())
+    {
         /*
-         * For help matched by hlpe, hlep, or hepl, highlight "help" as the
-         * component that satisfied the typo-aware match.
+         * Highlight the complete corrected contiguous word.
+         *
+         * For REDME matched against README.md, this paints README rather than the
+         * entire filename or only the five typed characters.
+         */
+        return (position..position.saturating_add(window_length)).collect();
+    }
+
+    if typo_score(candidate.as_bytes(), query.as_bytes()).is_some() {
+        /*
+         * For help matched by hlpe, hlep, or hepl, highlight the complete component.
+         *
+         * Inserted, removed, replaced, and transposed characters do not have one
+         * reliable character-for-character highlight mapping.
          */
         return (0..candidate.chars().count()).collect();
     }
@@ -914,37 +1276,96 @@ fn component_highlight_positions(candidate: &str, query: &str) -> Vec<usize> {
     Vec::new()
 }
 
-fn compact_subsequence_positions(candidate: &str, query: &str) -> Option<Vec<usize>> {
-    let query_characters: Vec<char> = query.chars().collect();
-
-    if query_characters.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut query_position = 0_usize;
-
-    let mut positions = Vec::with_capacity(query_characters.len());
-
-    for (candidate_position, candidate_character) in candidate.chars().enumerate() {
-        if candidate_character != query_characters[query_position] {
-            continue;
-        }
-
-        positions.push(candidate_position);
-
-        query_position += 1;
-
-        if query_position == query_characters.len() {
-            return Some(positions);
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::score_component;
+    use super::{RankedMatch, score_component};
+
+    #[test]
+    fn directories_form_the_first_fuzzy_result_group() {
+        let strong_file = RankedMatch {
+            entry_index: 1,
+
+            is_directory: false,
+
+            score: 10_000,
+        };
+
+        let weak_directory = RankedMatch {
+            entry_index: 2,
+
+            is_directory: true,
+
+            score: 4_000,
+        };
+
+        assert!(weak_directory > strong_file);
+    }
+
+    #[test]
+    fn relevance_orders_results_inside_the_same_group() {
+        let weaker_directory = RankedMatch {
+            entry_index: 1,
+
+            is_directory: true,
+
+            score: 4_000,
+        };
+
+        let stronger_directory = RankedMatch {
+            entry_index: 2,
+
+            is_directory: true,
+
+            score: 8_000,
+        };
+
+        let weaker_file = RankedMatch {
+            entry_index: 3,
+
+            is_directory: false,
+
+            score: 4_000,
+        };
+
+        let stronger_file = RankedMatch {
+            entry_index: 4,
+
+            is_directory: false,
+
+            score: 8_000,
+        };
+
+        assert!(stronger_directory > weaker_directory);
+
+        assert!(stronger_file > weaker_file);
+    }
+
+    #[test]
+    fn transposed_query_matches_corrected_word_inside_larger_component() {
+        assert!(score_component("pycodestyle", "coed").is_some());
+
+        assert!(score_component("sourcecodelookup", "cdoe").is_some());
+
+        assert!(score_component("secure_code", "coed").is_some());
+    }
+
+    #[test]
+    fn multiple_adjacent_transposition_forms_find_the_same_word() {
+        assert!(score_component("code", "coed").is_some());
+
+        assert!(score_component("code", "cdoe").is_some());
+
+        assert!(score_component("help", "hlep").is_some());
+
+        assert!(score_component("hello", "hlelo").is_some());
+    }
+
+    #[test]
+    fn transposed_substring_matching_does_not_restore_scattered_results() {
+        assert!(score_component("shlelf_nto.xwe", "hlelo").is_none());
+
+        assert!(score_component("hook-google-cloud-bigquery.py", "hlelo").is_none());
+    }
 
     #[test]
     fn exact_match_is_strongest() {
@@ -961,13 +1382,20 @@ mod tests {
     }
 
     #[test]
-    fn replacement_typo_matches() {
-        assert!(score_component("help", "halp").is_some());
+    fn scattered_filename_characters_are_rejected() {
+        assert!(score_component("shlex.py", "hlep").is_none());
+
+        assert!(score_component("shlelf_nto.xwe", "hlelo").is_none());
     }
 
     #[test]
-    fn compact_abbreviation_matches() {
-        assert!(score_component("cpuforge", "cpuf").is_some());
+    fn unrelated_long_component_is_rejected() {
+        assert!(score_component("hook-google-cloud-bigquery.py", "hlelo").is_none());
+    }
+
+    #[test]
+    fn replacement_typo_matches() {
+        assert!(score_component("help", "halp").is_some());
     }
 
     #[test]
@@ -978,5 +1406,79 @@ mod tests {
     #[test]
     fn unrelated_component_is_rejected() {
         assert!(score_component("deleteaction", "tstf").is_none());
+    }
+
+    #[test]
+    fn inserted_character_typo_matches() {
+        assert!(score_component("hello", "hlelo").is_some());
+    }
+
+    #[test]
+    fn complete_prefix_remains_a_match() {
+        assert!(score_component("cpuforge", "cpuf").is_some());
+    }
+
+    #[test]
+    fn missing_character_typo_matches_word_inside_larger_component() {
+        assert!(score_component("README.md", "REDME").is_some());
+
+        assert!(score_component("README.txt", "REDME").is_some());
+
+        assert!(score_component("README.rst", "REDME").is_some());
+
+        assert!(score_component("README-old.md", "REDME").is_some());
+    }
+
+    #[test]
+    fn missing_query_character_matches_word_inside_larger_component() {
+        assert!(score_component("hello_world.txt", "helo").is_some());
+
+        assert!(score_component("source-code.rs", "sorce").is_some());
+
+        assert!(score_component("README.md", "REDME").is_some());
+    }
+
+    #[test]
+    fn sensitive_typo_matching_does_not_ignore_case() {
+        assert!(score_component("README.md", "REDME").is_some());
+
+        assert!(score_component("readme.md", "REDME").is_none());
+    }
+
+    #[test]
+    fn missing_character_typo_matches_readme_family() {
+        for candidate in ["readme", "readme.md", "readme.txt", "project-readme.html"] {
+            assert!(
+                score_component(candidate, "redme").is_some(),
+                "simple omission failed for {candidate}",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_character_plus_transposition_matches_readme_family() {
+        for candidate in ["readme", "readme.md", "readme.txt", "project-readme.html"] {
+            assert!(
+                score_component(candidate, "redem").is_some(),
+                "compound README typo failed for {candidate}",
+            );
+        }
+    }
+
+    #[test]
+    fn compound_typo_support_does_not_admit_arbitrary_two_edit_substrings() {
+        for candidate in ["shlex.py", "shlelf_nto.xwe", "random-redox.md"] {
+            assert!(
+                score_component(candidate, "redem").is_none(),
+                "unrelated two-edit substring was accepted: {candidate}",
+            );
+        }
+    }
+
+    #[test]
+    fn single_edit_substring_matching_does_not_restore_scattered_noise() {
+        assert!(score_component("shlelf_nto.xwe", "hlelo").is_none());
+
+        assert!(score_component("hook-google-cloud-bigquery.py", "hlelo",).is_none());
     }
 }

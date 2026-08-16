@@ -527,9 +527,8 @@ fn classify_compound_extension(filename: &str) -> Option<FileClass> {
         FileClass::Archive
     } else if filename.ends_with(".user.js") || filename.ends_with(".min.js") {
         FileClass::JavaScript
-    } else if filename.ends_with(".d.ts") {
-        FileClass::TypeScript
-    } else if filename.ends_with(".spec.ts")
+    } else if filename.ends_with(".d.ts")
+        || filename.ends_with(".spec.ts")
         || filename.ends_with(".test.ts")
         || filename.ends_with(".spec.tsx")
         || filename.ends_with(".test.tsx")
