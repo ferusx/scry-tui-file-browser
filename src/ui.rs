@@ -31,13 +31,7 @@ use crate::themes::Theme;
 // COLOR CONSTANTS
 const COLOR_FRAME: Color = Color::Rgb(160, 110, 220);
 
-const COLOR_DIRECTORY: Color = Color::Rgb(80, 155, 235);
-
 const COLOR_FILE: Color = Color::Rgb(195, 200, 210);
-
-// const COLOR_QUERY: Color = Color::Rgb(110, 220, 225);
-
-// const COLOR_SELECTED_BACKGROUND: Color = Color::Rgb(55, 40, 75);
 
 const COLOR_MUTED: Color = Color::Rgb(95, 105, 120);
 
@@ -46,19 +40,6 @@ const COLOR_ERROR: Color = Color::Rgb(220, 55, 70);
 const COLOR_QUERY: Color = Color::Rgb(110, 220, 225);
 
 const COLOR_MATCH: Color = Color::Rgb(166, 119, 199);
-
-// const COLOR_PERMISSIONS: Color = COLOR_FRAME; // Color::Rgb(255, 255, 255);
-
-const COLOR_DATE: Color = COLOR_DIRECTORY; // Color::Rgb(160, 110, 220);
-
-const COLOR_USER: Color = Color::Rgb(91, 93, 99); //rgb(91, 93, 99)
-
-const COLOR_SIZE: Color = COLOR_QUERY;
-
-// Horizontal scroll bar
-const COLOR_HORIZONTAL_SCROLLBAR_TRACK: Color = Color::Rgb(45, 50, 60);
-
-const COLOR_HORIZONTAL_SCROLLBAR_THUMB: Color = COLOR_FRAME;
 
 /*
  * Large-Tree policy dialogs deliberately use one stable green accent.
@@ -75,7 +56,7 @@ const COLOR_TREE_POLICY: Color = Color::Rgb(90, 205, 130);
  * Below this geometry the ordinary interface is replaced by a resize notice
  * rather than allowing panels and text to overlap or truncate unpredictably.
  */
-pub const MIN_TERMINAL_WIDTH: u16 = 110;
+pub const MIN_TERMINAL_WIDTH: u16 = 100; // 110
 
 pub const MIN_TERMINAL_HEIGHT: u16 = 22;
 
@@ -294,6 +275,146 @@ fn compact_logo_line() -> Line<'static> {
         Span::styled(" ─┐", Style::default().fg(COLOR_MUTED)),
     ])
     .alignment(Alignment::Center)
+}
+
+fn console_setup_logo_lines() -> Vec<Line<'static>> {
+    const LOGO_COLORS: [Color; 6] = [
+        Color::LightMagenta,
+        Color::LightMagenta,
+        Color::Magenta,
+        Color::Magenta,
+        Color::LightMagenta,
+        Color::Magenta,
+    ];
+
+    SCRY_LOGO_FULL
+        .iter()
+        .zip(LOGO_COLORS)
+        .map(|(text, color)| {
+            Line::styled(
+                (*text).to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center)
+        })
+        .collect()
+}
+
+/*
+ * Explain the required shell handoff before an unconfigured console launch.
+ *
+ * Only ANSI16 colors are used because this screen is rendered exclusively on
+ * FreeBSD's system console.
+ */
+pub fn render_console_setup(frame: &mut Frame) {
+    let area = frame.area();
+
+    frame.render_widget(Clear, area);
+
+    frame.render_widget(
+        Block::default().style(Style::default().fg(Color::Gray).bg(Color::Black)),
+        area,
+    );
+
+    let mut lines = console_setup_logo_lines();
+
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Console setup required",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Scry needs a shell helper to leave you at selected files and directories.",
+            Style::default().fg(Color::Gray),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(
+        Line::styled(
+            "The browser will not start until shell integration is configured.",
+            Style::default().fg(Color::Gray),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Print the complete setup instructions with:",
+            Style::default().fg(Color::Gray),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(
+        Line::styled(
+            "scry --console-config",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Enter on a file leaves at its containing directory.",
+            Style::default().fg(Color::Green),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(
+        Line::styled(
+            "F3 on a directory leaves at that directory.",
+            Style::default().fg(Color::Green),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Press any key to exit.",
+            Style::default().fg(Color::LightMagenta),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    let content_height = lines.len().min(u16::MAX as usize) as u16;
+
+    let message_area = Rect {
+        x: area.x,
+
+        y: area
+            .y
+            .saturating_add(area.height.saturating_sub(content_height) / 2),
+
+        width: area.width,
+
+        height: content_height.min(area.height),
+    };
+
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        message_area,
+    );
 }
 
 pub fn terminal_size_is_sufficient(width: u16, height: u16) -> bool {
@@ -718,7 +839,7 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 &app.query
             },
             Style::default().fg(if app.query.is_empty() {
-                theme.ui.muted
+                theme.ui.placeholder
             } else {
                 theme.ui.query
             }),
@@ -769,11 +890,23 @@ fn render_search(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
  * When classified colors are disabled, every ordinary file returns to the
  * theme's established neutral file color.
  */
-fn entry_name_color(entry: &FileEntry, show_file_colors: bool, theme: &Theme) -> Color {
+fn entry_name_color(
+    entry: &FileEntry,
+    show_file_colors: bool,
+    theme: &Theme,
+    console_mode: bool,
+) -> Color {
     if entry.is_directory {
         theme.ui.directory
     } else if entry.is_symlink {
         theme.ui.symlink
+    } else if console_mode {
+        /*
+         * Console mode deliberately collapses classified regular-file colors
+         * into one neutral filesystem color. Scry's RGB classification palette
+         * remains available unchanged on rich terminals.
+         */
+        theme.ui.file
     } else if show_file_colors {
         theme.file_class_color(entry.class)
     } else {
@@ -825,7 +958,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let age = format_file_age(entry.modified_time);
 
-    let name_color = entry_name_color(&entry, app.show_file_colors, &theme);
+    let name_color = entry_name_color(&entry, app.show_file_colors, &theme, app.console_mode());
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1191,6 +1324,22 @@ fn list_entry_display_width(app: &App, entry: &FileEntry) -> usize {
     selection_width + mark_width + marker_width + icon_width + path_width + suffix_width
 }
 
+fn list_highlight_style(app: &App) -> Style {
+    if app.console_mode() {
+        /*
+         * The system console uses a deliberately simple ANSI16 selection
+         * style. Avoid RGB colors and modifiers here because the selected row
+         * is repainted constantly while navigating.
+         */
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default()
+            .fg(app.theme.selection.text)
+            .bg(app.theme.selection.background)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
 fn tree_entry_display_width(app: &App, row: &TreeRow) -> usize {
     let selection_width = 1;
 
@@ -1337,11 +1486,11 @@ fn render_horizontal_entries_scrollbar(
     let track = Line::from(vec![
         Span::styled(
             "─".repeat(thumb_offset as usize),
-            Style::default().fg(COLOR_HORIZONTAL_SCROLLBAR_TRACK),
+            Style::default().fg(app.theme.scrollbar.track),
         ),
         Span::styled(
             "◼".repeat(thumb_width as usize),
-            Style::default().fg(COLOR_HORIZONTAL_SCROLLBAR_THUMB),
+            Style::default().fg(app.theme.scrollbar.thumb),
         ),
         Span::styled(
             "─".repeat(
@@ -1350,7 +1499,7 @@ fn render_horizontal_entries_scrollbar(
                     .saturating_sub(thumb_offset)
                     .saturating_sub(thumb_width) as usize,
             ),
-            Style::default().fg(COLOR_HORIZONTAL_SCROLLBAR_TRACK),
+            Style::default().fg(app.theme.scrollbar.track),
         ),
     ]);
 
@@ -1592,12 +1741,7 @@ fn render_metadata(
                 .border_style(Style::default().fg(app.theme.frames.entries)),
         )
         .highlight_symbol("▶")
-        .highlight_style(
-            Style::default()
-                .fg(app.theme.selection.text)
-                .bg(app.theme.selection.background)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(list_highlight_style(app));
 
     let mut state = ListState::default();
 
@@ -1714,9 +1858,9 @@ fn metadata_list_item(
         spans.push(Span::styled(
             format!("{:>width$}", size, width = widths.size as usize,),
             Style::default().fg(if is_directory {
-                COLOR_MUTED
+                app.theme.ui.muted
             } else {
-                COLOR_SIZE
+                app.theme.ui.size
             }),
         ));
 
@@ -1730,7 +1874,7 @@ fn metadata_list_item(
 
         spans.push(Span::styled(
             format!("{:<width$}", modified, width = widths.date as usize,),
-            Style::default().fg(COLOR_DATE),
+            Style::default().fg(app.theme.ui.date),
         ));
 
         needs_gap = true;
@@ -1745,7 +1889,7 @@ fn metadata_list_item(
 
         spans.push(Span::styled(
             truncate_and_pad(owner, widths.user as usize),
-            Style::default().fg(COLOR_USER),
+            Style::default().fg(app.theme.ui.user),
         ));
     }
 
@@ -1820,7 +1964,15 @@ fn format_file_size(bytes: u64) -> String {
     }
 }
 
-fn entries_title_with_parent_button(title: String, theme: &Theme) -> Line<'static> {
+fn entries_title_with_parent_button(
+    title: String,
+    theme: &Theme,
+    console_mode: bool,
+) -> Line<'static> {
+    if console_mode {
+        return Line::raw(title);
+    }
+
     Line::from(vec![
         Span::styled(
             PARENT_BUTTON_LEFT_BRACKET,
@@ -1840,7 +1992,11 @@ fn entries_title_with_parent_button(title: String, theme: &Theme) -> Line<'stati
     ])
 }
 
-fn entries_title_with_home_button(theme: &Theme) -> Line<'static> {
+fn entries_title_with_home_button(theme: &Theme, console_mode: bool) -> Line<'static> {
+    if console_mode {
+        return Line::raw("");
+    }
+
     Line::from(vec![
         Span::styled(
             HOME_BUTTON_LEFT_BRACKET,
@@ -1956,6 +2112,7 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             app.show_file_colors,
             &app.theme,
             app.horizontal_offset,
+            app.console_mode(),
         ));
     }
 
@@ -2017,18 +2174,20 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
     let list = List::new(items)
         .block(
             Block::default()
-                .title(entries_title_with_parent_button(title, &app.theme))
-                .title_bottom(entries_title_with_home_button(&app.theme))
+                .title(entries_title_with_parent_button(
+                    title,
+                    &app.theme,
+                    app.console_mode(),
+                ))
+                .title_bottom(entries_title_with_home_button(
+                    &app.theme,
+                    app.console_mode(),
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.frames.entries)),
         )
         .highlight_symbol("▶")
-        .highlight_style(
-            Style::default()
-                .fg(app.theme.selection.text)
-                .bg(app.theme.selection.background)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(list_highlight_style(app));
 
     let mut state = ListState::default();
 
@@ -2045,6 +2204,7 @@ fn render_list_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         visible_rows,
         app.list_offset,
         &app.theme,
+        app.console_mode(),
     );
 }
 
@@ -2055,6 +2215,7 @@ fn render_entries_scrollbar(
     viewport_length: usize,
     position: usize,
     theme: &Theme,
+    console_mode: bool,
 ) {
     /*
      * Do not render a scrollbar when every entry already fits inside
@@ -2067,7 +2228,7 @@ fn render_entries_scrollbar(
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
         .end_symbol(None)
-        .track_symbol(Some("│"))
+        .track_symbol(if console_mode { None } else { Some("│") })
         .thumb_symbol("█")
         .track_style(Style::default().fg(theme.scrollbar.track))
         .thumb_style(Style::default().fg(theme.scrollbar.thumb));
@@ -2173,6 +2334,7 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
             app.show_file_colors,
             &app.theme,
             app.horizontal_offset,
+            app.console_mode(),
         ));
     }
 
@@ -2215,18 +2377,20 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
     let list = List::new(items)
         .block(
             Block::default()
-                .title(entries_title_with_parent_button(title, &app.theme))
-                .title_bottom(entries_title_with_home_button(&app.theme))
+                .title(entries_title_with_parent_button(
+                    title,
+                    &app.theme,
+                    app.console_mode(),
+                ))
+                .title_bottom(entries_title_with_home_button(
+                    &app.theme,
+                    app.console_mode(),
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.frames.entries)),
         )
         .highlight_symbol("▶")
-        .highlight_style(
-            Style::default()
-                .fg(app.theme.selection.text)
-                .bg(app.theme.selection.background)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(list_highlight_style(app));
 
     let mut state = ListState::default();
 
@@ -2243,6 +2407,7 @@ fn render_tree_entries(frame: &mut Frame, app: &mut App, area: ratatui::layout::
         visible_rows,
         app.list_offset,
         &app.theme,
+        app.console_mode(),
     );
 }
 
@@ -2259,24 +2424,41 @@ fn tree_list_item(
     show_file_colors: bool,
     theme: &Theme,
     horizontal_offset: usize,
+    console_mode: bool,
 ) -> ListItem<'static> {
     let mut spans = Vec::new();
+
+    /*
+     * Tree connector glyphs use a plain ANSI16 structural color on the system
+     * console. Rich terminals retain Scry's established RGB connector color.
+     */
+    let tree_structure_color = if console_mode {
+        Color::Magenta
+    } else {
+        COLOR_MUTED
+    };
 
     for ancestor_has_more in &row.ancestor_has_more {
         spans.push(Span::styled(
             if *ancestor_has_more { "│ " } else { "  " },
-            Style::default().fg(COLOR_MUTED),
+            Style::default().fg(tree_structure_color),
         ));
     }
 
     spans.push(Span::styled(
         if row.is_last { "└─" } else { "├─" },
-        Style::default().fg(COLOR_MUTED),
+        Style::default().fg(tree_structure_color),
     ));
 
     let (marker, structural_color, suffix) = if row.entry.is_directory {
         (
-            if row.expanded { "▾" } else { "▸" },
+            if console_mode {
+                if row.expanded { "- " } else { "+ " }
+            } else if row.expanded {
+                "▾"
+            } else {
+                "▸"
+            },
             theme.ui.directory,
             if has_content && !row.expanded {
                 " →"
@@ -2285,12 +2467,12 @@ fn tree_list_item(
             },
         )
     } else if row.entry.is_symlink {
-        ("↪ ", theme.ui.symlink, "@")
+        (if console_mode { "" } else { "↪ " }, theme.ui.symlink, "@")
     } else {
         ("", theme.ui.file, "")
     };
 
-    let name_color = entry_name_color(&row.entry, show_file_colors, theme);
+    let name_color = entry_name_color(&row.entry, show_file_colors, theme, console_mode);
 
     /*
      * Tree markers remain structural. Only the filename receives its FileClass
@@ -2478,20 +2660,25 @@ fn entry_list_item(
     show_file_colors: bool,
     theme: &Theme,
     horizontal_offset: usize,
+    console_mode: bool,
 ) -> ListItem<'static> {
     let (prefix, structural_color, suffix) = if entry.is_directory {
         (
-            "▸",
+            if console_mode { "+ " } else { "▸" },
             theme.ui.directory,
             if has_content { " →" } else { "/" },
         )
     } else if entry.is_symlink {
-        ("↪ ", theme.ui.symlink, "@")
+        (
+            if console_mode { "->" } else { "↪ " },
+            theme.ui.symlink,
+            "@",
+        )
     } else {
-        (" ", theme.ui.file, "")
+        ("  ", theme.ui.file, "")
     };
 
-    let name_color = entry_name_color(entry, show_file_colors, theme);
+    let name_color = entry_name_color(entry, show_file_colors, theme, console_mode);
 
     let mut spans = vec![Span::styled(
         prefix.to_string(),
@@ -3592,7 +3779,7 @@ fn render_tree_expand_all_dialog(
                     Span::styled(
                         format!("{} rows", projected_rows),
                         Style::default()
-                            .fg(COLOR_TREE_POLICY)
+                            .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(".", Style::default().fg(app.theme.ui.file)),
@@ -3735,7 +3922,7 @@ fn render_tree_expand_all_dialog(
                     Span::styled(
                         format!("{} rows", projected_rows),
                         Style::default()
-                            .fg(COLOR_TREE_POLICY)
+                            .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(".", Style::default().fg(app.theme.ui.file)),
@@ -3855,7 +4042,7 @@ fn render_tree_expand_all_dialog(
                     Span::styled(
                         format!("{} rows", projected_rows),
                         Style::default()
-                            .fg(COLOR_TREE_POLICY)
+                            .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
@@ -3865,7 +4052,7 @@ fn render_tree_expand_all_dialog(
                     Span::styled(
                         format!("{} rows", configured_max_rows),
                         Style::default()
-                            .fg(COLOR_TREE_POLICY)
+                            .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(".", Style::default().fg(app.theme.ui.file)),
@@ -3967,7 +4154,7 @@ fn render_tree_expand_all_dialog(
                     Span::styled(
                         format!("{} entries", projected_rows),
                         Style::default()
-                            .fg(COLOR_TREE_POLICY)
+                            .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(".", Style::default().fg(app.theme.ui.file)),
@@ -3984,7 +4171,7 @@ fn render_tree_expand_all_dialog(
                     Span::styled(
                         format!("{} entries", configured_max_rows),
                         Style::default()
-                            .fg(COLOR_TREE_POLICY)
+                            .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(".", Style::default().fg(app.theme.ui.file)),
@@ -4063,14 +4250,17 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
     let profile_focused = app.connection_dialog.focus == ConnectionField::Profiles;
 
     let profile_summary = if profiles.is_empty() {
-        Line::styled("  No saved profiles", Style::default().fg(COLOR_MUTED))
+        Line::styled(
+            "  No saved profiles",
+            Style::default().fg(app.theme.ui.muted),
+        )
     } else {
         let profile_name = profiles
             .get(selected_profile)
             .map(|profile| profile.name.as_str())
             .unwrap_or("—");
 
-        let normal_style = Style::default().fg(COLOR_MUTED);
+        let normal_style = Style::default().fg(app.theme.ui.muted);
 
         let focused_style = Style::default()
             .fg(app.theme.selection.text)
@@ -4087,7 +4277,7 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
             focused_style
         } else {
             Style::default()
-                .fg(COLOR_QUERY)
+                .fg(app.theme.ui.query)
                 .add_modifier(Modifier::BOLD)
         };
 
@@ -4221,24 +4411,36 @@ fn render_connection_overlay(frame: &mut Frame, app: &App, area: Rect) -> Connec
         Line::styled(
             "Keyboard",
             Style::default()
-                .fg(COLOR_FRAME)
+                .fg(Color::LightMagenta)
                 .add_modifier(Modifier::BOLD),
         )
         .alignment(Alignment::Center),
         Line::raw(""),
-        connection_help_line("Tab / Shift+Tab", "Move between controls"),
-        connection_help_line("Enter", "Advance or activate the selected button"),
-        connection_help_line("Backspace", "Delete from the focused field"),
-        connection_help_line("Ctrl+U", "Clear the focused field"),
-        connection_help_line("F4 / Esc", "Close the connection window"),
-        connection_help_line("Left / Right", "Move the caret in an editable field"),
-        connection_help_line("Home / End", "Move to the start or end of the field"),
+        connection_help_line("Tab / Shift+Tab", "Move between controls", &app.theme),
+        connection_help_line(
+            "Enter",
+            "Advance or activate the selected button",
+            &app.theme,
+        ),
+        connection_help_line("Backspace", "Delete from the focused field", &app.theme),
+        connection_help_line("Ctrl+U", "Clear the focused field", &app.theme),
+        connection_help_line("F4 / Esc", "Close the connection window", &app.theme),
+        connection_help_line(
+            "Left / Right",
+            "Move the caret in an editable field",
+            &app.theme,
+        ),
+        connection_help_line(
+            "Home / End",
+            "Move to the start or end of the field",
+            &app.theme,
+        ),
         if let Some(message) = &app.connection_dialog.error_message {
             Line::styled(
                 message.clone(),
                 Style::default().fg(
                     if message == "Profile saved" || app.connection_in_progress {
-                        COLOR_QUERY
+                        app.theme.ui.query
                     } else {
                         COLOR_ERROR
                     },
@@ -4497,24 +4699,30 @@ fn connection_field_line(
         source_text.chars().take(FIELD_WIDTH).collect()
     };
 
-    let border_color = if focused { COLOR_FRAME } else { COLOR_MUTED };
+    let border_color = if focused {
+        theme.ui.frame
+    } else {
+        theme.ui.muted
+    };
 
     let value_style = if showing_placeholder {
         Style::default()
-            .fg(COLOR_MUTED)
+            .fg(theme.ui.muted)
             .add_modifier(Modifier::ITALIC)
     } else if focused {
         Style::default()
             .fg(theme.selection.text)
             .bg(theme.selection.background)
     } else {
-        Style::default().fg(COLOR_FILE)
+        Style::default().fg(theme.ui.file)
     };
 
     Line::from(vec![
         Span::styled(
             format!("  {:<16}", format!("{}:", label)),
-            Style::default().fg(if focused { COLOR_QUERY } else { COLOR_MUTED }),
+            Style::default()
+                .fg(theme.ui.frame)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("│", Style::default().fg(border_color)),
         Span::styled(
@@ -4535,42 +4743,37 @@ fn connection_button_span(
     let focused = field == focused_field;
 
     let style = if !enabled {
-        Style::default().fg(COLOR_MUTED)
+        Style::default().fg(theme.ui.muted)
     } else if focused {
         Style::default()
             .fg(theme.selection.text)
             .bg(theme.selection.background)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(COLOR_FILE)
+        Style::default()
+            .fg(theme.ui.query)
+            .add_modifier(Modifier::BOLD)
     };
 
-    Span::styled(format!("[ {} ]", label,), style)
+    Span::styled(format!("[ {} ]", label), style)
 }
 
-fn connection_help_line(shortcut: &str, description: &str) -> Line<'static> {
-    /*
-     * These widths describe the complete visible help table:
-     *
-     * shortcut column + gap + description column
-     */
+fn connection_help_line(shortcut: &str, description: &str, theme: &Theme) -> Line<'static> {
     const SHORTCUT_WIDTH: usize = 18;
+    const DESCRIPTION_WIDTH: usize = 39;
 
-    const DESCRIPTION_WIDTH: usize = 43;
-
-    let shortcut = format!("{:<width$}", shortcut, width = SHORTCUT_WIDTH,);
-
-    let description = format!("{:<width$}", description, width = DESCRIPTION_WIDTH,);
+    let shortcut = format!("{:<width$}", shortcut, width = SHORTCUT_WIDTH);
+    let description = format!("{:<width$}", description, width = DESCRIPTION_WIDTH);
 
     Line::from(vec![
         Span::styled(
             shortcut,
             Style::default()
-                .fg(COLOR_QUERY)
+                .fg(theme.frames.popup)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(description, Style::default().fg(COLOR_MUTED)),
+        Span::styled(description, Style::default().fg(theme.ui.file)),
     ])
     .alignment(Alignment::Center)
 }
@@ -5329,7 +5532,8 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
     let normal_bindings = vec![
         ("Up / Down", "Move the selection"),
         ("PgUp / PgDn", "Move one visible page"),
-        ("Ctrl+PgUp / Ctrl+PgDn", "Move ten visible pages"),
+        ("Ctrl+PgUp /", ""),
+        ("Ctrl+PgDn", "Move ten visible pages"),
         ("Shift+← / →", "Scroll the listing horizontally"),
         ("Home / End", "Select first or last entry"),
         ("Left / Esc", "Enter the parent directory"),
@@ -5363,7 +5567,34 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
         ("Ctrl+C", "Exit Scry"),
     ];
 
-    push_shortcut_section(&mut lines, "Normal Mode", &normal_bindings);
+    push_shortcut_section(&mut lines, "Normal Mode", &normal_bindings, &app.theme);
+
+    /*
+     * FreeBSD's physical system console does not preserve every modified
+     * navigation key in the same form as a rich terminal emulator.
+     *
+     * Keep the established rich-terminal shortcuts unchanged and document the
+     * console-only alternatives together here so users who work in both
+     * environments can see the differences at a glance.
+     */
+    push_shortcut_section(
+        &mut lines,
+        "Console Mode",
+        &[
+            ("Enter", "Exit at the selected file's directory"),
+            ("F3", "Exit at the selected directory"),
+            ("F11", "Go to the source home directory"),
+            ("Alt+B / Alt+F", "Move left or right in the search field"),
+            ("Alt+Z / Alt+X", "horizontal scrolling"),
+            (
+                "Ctrl+A / Ctrl+E",
+                "Move to the start or end of the search field",
+            ),
+            ("Ctrl+K / Ctrl+J", "Move up or down ten pages"),
+            ("Ctrl+L", "Redraw the complete interface"),
+        ],
+        &app.theme,
+    );
 
     /*
      * Tree Mode lists only the controls whose meaning changes when the
@@ -5380,6 +5611,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             ("Enter", "Make directory the new root"),
             ("Ctrl+T", "Return to List mode"),
         ],
+        &app.theme,
     );
 
     /*
@@ -5405,6 +5637,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             ("Enter", "Open or activate the selected result"),
             ("Left / Esc", "Return to parent or previous search state"),
         ],
+        &app.theme,
     );
 
     /*
@@ -5412,9 +5645,14 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
      *
      * The parser and this reference therefore cannot drift apart.
      */
-    push_shortcut_section(&mut lines, "Query Modifiers", QUERY_SYNTAX_REFERENCE);
+    push_shortcut_section(
+        &mut lines,
+        "Query Modifiers",
+        QUERY_SYNTAX_REFERENCE,
+        &app.theme,
+    );
 
-    push_query_type_reference(&mut lines);
+    push_query_type_reference(&mut lines, &app.theme);
 
     /*
      * SSH controls apply regardless of whether the remote listing is currently
@@ -5428,6 +5666,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             ("Alt+U", "Clear all marked files"),
             ("Alt+D", "Download all marked files"),
         ],
+        &app.theme,
     );
 
     push_shortcut_section(
@@ -5440,6 +5679,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             ("Scrollbar drag", "Move through long listings"),
             ("Popup buttons", "Activate visible actions"),
         ],
+        &app.theme,
     );
 
     lines.push(Line::raw(""));
@@ -5474,7 +5714,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
     let paragraph = Paragraph::new(lines)
         .block(block)
         .scroll((app.legend_scroll, 0))
-        .style(Style::default().bg(Color::Rgb(15, 16, 22)));
+        .style(Style::default().bg(app.theme.frames.popup_background));
 
     frame.render_widget(Clear, popup_area);
 
@@ -5529,7 +5769,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
     }
 }
 
-fn push_query_type_reference(lines: &mut Vec<Line<'static>>) {
+fn push_query_type_reference(lines: &mut Vec<Line<'static>>, theme: &Theme) {
     if lines.iter().any(|line| !line.spans.is_empty()) {
         lines.push(Line::raw(""));
     }
@@ -5537,13 +5777,13 @@ fn push_query_type_reference(lines: &mut Vec<Line<'static>>) {
     lines.push(Line::styled(
         "  Type Values",
         Style::default()
-            .fg(COLOR_FRAME)
+            .fg(theme.frames.popup)
             .add_modifier(Modifier::BOLD),
     ));
 
     lines.push(Line::styled(
         "  Use these values after type:. Aliases are shown on the right.",
-        Style::default().fg(COLOR_MUTED),
+        Style::default().fg(theme.ui.muted),
     ));
 
     lines.push(Line::raw(""));
@@ -5555,23 +5795,32 @@ fn push_query_type_reference(lines: &mut Vec<Line<'static>>) {
             format!("aliases: {}", reference.aliases.join(", "))
         };
 
-        lines.push(query_type_reference_line(reference.canonical, &aliases));
+        lines.push(query_type_reference_line(
+            reference.canonical,
+            &aliases,
+            theme,
+        ));
     }
 }
 
-fn query_type_reference_line(canonical: &str, aliases: &str) -> Line<'static> {
+fn query_type_reference_line(canonical: &str, aliases: &str, theme: &Theme) -> Line<'static> {
     const TYPE_WIDTH: usize = 16;
 
     Line::from(vec![
         Span::styled(
             format!("  {:<width$}", canonical, width = TYPE_WIDTH),
-            Style::default().fg(COLOR_QUERY),
+            Style::default().fg(theme.ui.query),
         ),
-        Span::styled(aliases.to_string(), Style::default().fg(COLOR_MUTED)),
+        Span::styled(aliases.to_string(), Style::default().fg(theme.ui.muted)),
     ])
 }
 
-fn push_shortcut_section(lines: &mut Vec<Line<'static>>, title: &str, bindings: &[(&str, &str)]) {
+fn push_shortcut_section(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    bindings: &[(&str, &str)],
+    theme: &Theme,
+) {
     if lines.iter().any(|line| !line.spans.is_empty()) {
         lines.push(Line::raw(""));
     }
@@ -5579,26 +5828,26 @@ fn push_shortcut_section(lines: &mut Vec<Line<'static>>, title: &str, bindings: 
     lines.push(Line::styled(
         format!("  {}", title),
         Style::default()
-            .fg(COLOR_FRAME)
+            .fg(theme.frames.popup)
             .add_modifier(Modifier::BOLD),
     ));
 
     lines.push(Line::raw(""));
 
     for (shortcut, description) in bindings {
-        lines.push(shortcut_help_line(shortcut, description));
+        lines.push(shortcut_help_line(shortcut, description, theme));
     }
 }
 
-fn shortcut_help_line(shortcut: &str, description: &str) -> Line<'static> {
+fn shortcut_help_line(shortcut: &str, description: &str, theme: &Theme) -> Line<'static> {
     const SHORTCUT_WIDTH: usize = 16;
 
     Line::from(vec![
         Span::styled(
             format!("  {:<width$}", shortcut, width = SHORTCUT_WIDTH),
-            Style::default().fg(COLOR_QUERY),
+            Style::default().fg(theme.ui.query),
         ),
-        Span::styled(description.to_string(), Style::default().fg(COLOR_MUTED)),
+        Span::styled(description.to_string(), Style::default().fg(theme.ui.muted)),
     ])
 }
 
@@ -5635,7 +5884,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> HelpOver
         .title(
             Line::from(Span::styled(
                 " tips ",
-                Style::default().fg(Color::Rgb(90, 150, 235)),
+                Style::default().fg(app.theme.frames.popup),
             ))
             .right_aligned(),
         )
@@ -5770,7 +6019,7 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> HelpOver
     {
         *line = Line::styled(
             help::TIPS_LINK_TEXT,
-            Style::default().fg(Color::Rgb(90, 150, 235)),
+            Style::default().fg(app.theme.ui.query),
         );
     }
 
@@ -5780,13 +6029,10 @@ fn render_help_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> HelpOver
     if let Some(index) = top_link_line
         && let Some(line) = lines.get_mut(index)
     {
-        *line = Line::styled(
-            help::TOP_LINK_TEXT,
-            Style::default().fg(Color::Rgb(90, 150, 235)),
-        );
+        *line = Line::styled(help::TOP_LINK_TEXT, Style::default().fg(app.theme.ui.query));
     }
 
-    let background = Style::default().bg(Color::Rgb(15, 16, 22));
+    let background = Style::default().bg(app.theme.frames.popup_background);
 
     let paragraph = Paragraph::new(lines)
         .scroll((app.help_scroll, 0))
@@ -5980,32 +6226,52 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ""
     };
 
+    let open_control = if app.console_mode() {
+        "  Enter file  F3 dir"
+    } else {
+        "  Enter open"
+    };
+
+    let go_home = if app.console_mode() {
+        "  F11 home"
+    } else {
+        "  ←/→/↑/↓ Move"
+    };
+
+    let show_exit = if app.console_mode() { "" } else { "  ^C exit" };
+
+    let move_cursor = if app.console_mode() {
+        "Alt+B/F left/right"
+    } else {
+        "^←/^→ move cursor"
+    };
+
     let footer = if !app.query.is_empty() {
         // Active Search Help Text
         format!(
-            " ^←/^→ move cursor  Enter open  Alt+R {}{}  ^U clear{}  ^Y copy  F2 info",
-            recursive_state, hidden_control, sort_control,
+            " {}  Alt+R {}{}  ^U clear{}  ^Y copy  F2 info",
+            move_cursor, recursive_state, hidden_control, sort_control,
         )
     } else if app.view_mode == ViewMode::Tree {
         // Tree View Help Text
         format!(
-            " F1 help  ? legend  ↑/↓/←/→ move  Enter open  F4 SSH  ^T {}{}  Alt+M meta  ^C exit",
-            tree_state, hidden_control,
+            " F1 help  ? legend{}{}  F4 SSH  ^T {}{}  Alt+M meta{}",
+            go_home, open_control, tree_state, hidden_control, show_exit
         )
     } else if app.source_is_remote() {
         // SSH Normal View Help Text
         format!(
-            " ^Space select  Alt+U clear select  Enter open  Alt+D download  ^T {}{}  ^C exit",
-            tree_state, hidden_control
+            " ^Space select  Alt+U clear select{}  Alt+D downl.  ^T {}{}{}",
+            open_control, tree_state, hidden_control, show_exit
         )
     } else {
         // Normal View Help Text
         format!(
-            " F1 help  ? legend  ↑/↓/←/→ move  Enter open  F4 SSH  ^T {}{}  Alt+M meta  ^C exit",
-            tree_state, hidden_control,
+            " F1 help  ? legend{}{}  F4 SSH  ^T {}{}  Alt+M meta{}",
+            go_home, open_control, tree_state, hidden_control, show_exit
         )
     };
-    let paragraph = Paragraph::new(footer).style(Style::default().fg(COLOR_MUTED));
+    let paragraph = Paragraph::new(footer).style(Style::default().fg(app.theme.ui.footer));
 
     frame.render_widget(paragraph, area);
 }

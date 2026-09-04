@@ -33,6 +33,7 @@ mod search_index;
 mod session;
 mod source;
 mod ssh;
+mod terminal_profile;
 mod themes;
 mod ui;
 mod ui_state;
@@ -44,12 +45,6 @@ use app::{
 use args::Cli;
 use clap::Parser;
 use connection::ConnectionField;
-use ratatui::layout::Rect;
-use session::{SessionSource, SessionState};
-use ssh::{SftpSource, SshTarget};
-use std::io::{self, IsTerminal, stdout};
-use std::time::{Duration, Instant};
-
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -57,8 +52,17 @@ use crossterm::{
         MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
-    execute, terminal,
+    execute,
+    terminal::{self, Clear, ClearType},
 };
+use ratatui::layout::Rect;
+use session::{SessionSource, SessionState};
+use ssh::{SftpSource, SshTarget};
+use std::io::{self, IsTerminal, stdout};
+use std::time::{Duration, Instant};
+use terminal_profile::TerminalProfile;
+
+use crossterm::cursor;
 
 /*
  * Copy persisted display and browser choices into the ordinary startup
@@ -197,6 +201,41 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
     /*
+     * Console configuration is a plain-text informational command. Handle it
+     * before terminal detection, shell-handoff initialization, configuration
+     * loading, or any TUI setup.
+     */
+    if cli.console_config {
+        external_help::print_console_config()?;
+
+        return Ok(());
+    }
+
+    let terminal_profile = TerminalProfile::detect();
+
+    /*
+     * A sourced shell function creates this private handoff file before launching
+     * Scry. Truncating it now prevents an interrupted or reused invocation from
+     * carrying a stale destination into the parent shell.
+     */
+    let shell_handoff_path = std::env::var_os("SCRY_CD_FILE")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .and_then(|path| match std::fs::write(&path, b"") {
+            Ok(()) => Some(path),
+
+            Err(error) => {
+                eprintln!(
+                    "scry: unable to initialize shell handoff file {}: {}",
+                    path.display(),
+                    error,
+                );
+
+                None
+            }
+        });
+
+    /*
      * Configuration generation must happen before ScryConfig::load().
      *
      * Normal loading may create the live scry.toml when it is missing, whereas
@@ -317,6 +356,36 @@ fn main() -> io::Result<()> {
 
     if cli.help {
         external_help::print_help()?;
+
+        return Ok(());
+    }
+
+    /*
+     * An actual console-browser launch requires shell integration.
+     *
+     * Informational commands have already returned above, so --help, --manual,
+     * --console-config, and configuration generation remain available without
+     * the helper.
+     */
+    if terminal_profile.is_console() && shell_handoff_path.is_none() {
+        execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0),)?;
+
+        let setup_result = ratatui::run(run_console_setup_screen);
+
+        /*
+         * FreeBSD's system console does not reliably restore alternate-screen
+         * contents. Return a clean console to the shell after the setup screen.
+         */
+        let cleanup_result = execute!(
+            stdout(),
+            cursor::Show,
+            Clear(ClearType::All),
+            cursor::MoveTo(0, 0),
+        );
+
+        setup_result?;
+
+        cleanup_result?;
 
         return Ok(());
     }
@@ -454,6 +523,10 @@ fn main() -> io::Result<()> {
 
     app.apply_startup_config(&startup_config);
 
+    app.set_terminal_profile(terminal_profile);
+
+    app.set_shell_handoff_enabled(shell_handoff_path.is_some());
+
     /*
      * Adopt recoverable local deletions before restoring selection and query state.
      *
@@ -560,6 +633,17 @@ fn main() -> io::Result<()> {
         app.enable_exit_on_open();
     }
 
+    /*
+     * The detected terminal profile has final authority over features that the
+     * active terminal cannot support safely.
+     *
+     * Rich terminals retain the configured and command-line behavior unchanged.
+     * System-console mode suppresses Nerd Font icons and external file opening.
+     */
+    app.apply_terminal_capabilities();
+
+    execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0),)?;
+
     execute!(
         stdout(),
         EnableMouseCapture,
@@ -579,6 +663,22 @@ fn main() -> io::Result<()> {
     run_result?;
 
     disable_result?;
+
+    /*
+     * FreeBSD's system console does not reliably restore the screen contents
+     * when Ratatui leaves the alternate screen. Clear the final frame and put
+     * the shell prompt at the top-left after every orderly console exit.
+     *
+     * Rich terminals retain their normal alternate-screen restoration.
+     */
+    if terminal_profile.is_console() {
+        execute!(
+            stdout(),
+            cursor::Show,
+            Clear(ClearType::All),
+            cursor::MoveTo(0, 0),
+        )?;
+    }
 
     /*
      * Staged deletions become permanent only after Scry has left raw terminal mode.
@@ -619,6 +719,17 @@ fn main() -> io::Result<()> {
     {
         eprintln!(
             "scry: unable to preserve clipboard contents after exit: {}",
+            error,
+        );
+    }
+
+    if let (Some(handoff_path), Some(directory)) =
+        (shell_handoff_path.as_deref(), app.shell_exit_directory())
+        && let Err(error) = std::fs::write(handoff_path, directory.as_os_str().as_encoded_bytes())
+    {
+        eprintln!(
+            "scry: unable to write shell destination {}: {}",
+            handoff_path.display(),
             error,
         );
     }
@@ -677,6 +788,24 @@ struct HorizontalScrollbarDragState {
     start_mouse_column: u16,
 
     start_thumb_left: usize,
+}
+
+fn run_console_setup_screen(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+    terminal.draw(ui::render_console_setup)?;
+
+    loop {
+        match event::read()? {
+            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                return Ok(());
+            }
+
+            Event::Resize(_, _) => {
+                terminal.draw(ui::render_console_setup)?;
+            }
+
+            _ => {}
+        }
+    }
 }
 
 fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
@@ -760,6 +889,47 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
             match event::read()? {
                 Event::Key(key_event) => {
                     if key_event.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    /*
+                     * Background jobs, system services, and the FreeBSD console
+                     * logger may write directly to the active terminal while Scry
+                     * owns the screen.
+                     *
+                     * Ratatui cannot detect those foreign writes because its
+                     * internal buffer still describes the last frame Scry drew.
+                     * Ctrl+L therefore clears the physical terminal and invalidates
+                     * Ratatui's remembered frame before rendering the complete
+                     * interface again.
+                     *
+                     * Accept the literal form as well because some physical
+                     * consoles report Ctrl+L as form feed without modifiers.
+                     */
+                    let redraw_requested =
+                        (matches!(key_event.code, KeyCode::Char('l') | KeyCode::Char('L'))
+                            && key_event.modifiers.contains(KeyModifiers::CONTROL))
+                            || key_event.code == KeyCode::Char('\x0c');
+
+                    if redraw_requested {
+                        /*
+                         * Clear the physical display directly. Do not use
+                         * Terminal::clear() here: cursor-position queries are
+                         * unreliable on the FreeBSD system console.
+                         */
+                        execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0),)?;
+
+                        /*
+                         * Discard Ratatui's saved representation of the
+                         * previous frame so that the next draw writes every
+                         * cell instead of only detected changes.
+                         */
+                        terminal.swap_buffers();
+
+                        terminal.draw(|frame| {
+                            ui_regions = ui::render(frame, app);
+                        })?;
+
                         continue;
                     }
 
@@ -945,6 +1115,23 @@ fn handle_paste_event(app: &mut App, text: &str) {
 
 fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
     /*
+     * FreeBSD's physical system console may translate Alt+E through the
+     * active keyboard map into the Euro character before Crossterm receives it.
+     *
+     * Preserve Scry's documented Alt+E Tree shortcut by normalizing that
+     * console-only representation back to its logical shortcut key.
+     *
+     * Rich terminals remain untouched, and an ordinary typed Euro character
+     * without Alt continues to enter the search field normally.
+     */
+    if app.console_mode()
+        && key_event.code == KeyCode::Char('€')
+        && key_event.modifiers.contains(KeyModifiers::ALT)
+    {
+        key_event.code = KeyCode::Char('e');
+    }
+
+    /*
      * Alphabetic Ctrl/Alt shortcuts are case-insensitive.
      *
      * Caps Lock and enhanced keyboard protocols may report Alt+R as either:
@@ -978,6 +1165,14 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
 
             (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 app.close_file_info();
+            }
+
+            /*
+             * Console Alt+Enter asks the shell helper to leave at the selected local
+             * directory. Files, SSH entries, and rich-terminal sessions are ignored.
+             */
+            (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+                app.exit_at_selected_directory();
             }
 
             (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
@@ -1411,6 +1606,16 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
             app.open_file_info();
         }
 
+        /*
+         * Icons are unavailable on the physical console.
+         *
+         * Reuse F3 there as the directory counterpart to Enter-on-file:
+         * leave Scry with the parent shell positioned at the selected directory.
+         */
+        (KeyCode::F(3), _) if app.console_mode() => {
+            app.exit_at_selected_directory();
+        }
+
         (KeyCode::F(3), _) => {
             app.toggle_icons();
         }
@@ -1441,6 +1646,16 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
 
         (KeyCode::F(10), _) => {
             app.toggle_user_column();
+        }
+
+        /*
+         * Console mode has no clickable Home control.
+         *
+         * F11 is otherwise unused, so it provides a dedicated keyboard route back to
+         * the source home directory without changing the rich-terminal key map.
+         */
+        (KeyCode::F(11), _) if app.console_mode() => {
+            app.enter_home_directory();
         }
 
         /*
@@ -1555,6 +1770,33 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
         }
 
         /*
+         * FreeBSD's physical console does not preserve Shift on Left/Right.
+         * Retain Shift+Left/Right in Rich Mode and provide console-only
+         * alphabetic alternatives for horizontal scrolling.
+         */
+        (KeyCode::Char('z'), KeyModifiers::ALT) if app.console_mode() => {
+            app.scroll_horizontal_left();
+        }
+
+        (KeyCode::Char('x'), KeyModifiers::ALT) if app.console_mode() => {
+            app.scroll_horizontal_right();
+        }
+
+        /*
+         * FreeBSD's physical console does not preserve Ctrl on Left/Right.
+         *
+         * Provide console-only character-key alternatives for moving the search caret.
+         * Rich terminals retain the established Ctrl+Left / Ctrl+Right bindings.
+         */
+        (KeyCode::Char('b'), KeyModifiers::ALT) if app.console_mode() => {
+            app.move_query_cursor_left();
+        }
+
+        (KeyCode::Char('f'), KeyModifiers::ALT) if app.console_mode() => {
+            app.move_query_cursor_right();
+        }
+
+        /*
          * Browser navigation follows conventional file-browser bindings.
          *
          * Plain Left/Right operate on the current directory or Tree structure.
@@ -1615,6 +1857,31 @@ fn handle_key_event(app: &mut App, mut key_event: KeyEvent) {
             app.begin_rapid_navigation();
 
             app.move_down();
+        }
+
+        /*
+         * FreeBSD's physical console may not provide usable PageUp/PageDown
+         * key events on laptop keyboards.
+         *
+         * Character-key aliases preserve paging there without changing the
+         * established rich-terminal bindings.
+         */
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) if app.console_mode() => {
+            app.move_query_cursor_to_start();
+        }
+
+        (KeyCode::Char('e'), KeyModifiers::CONTROL) if app.console_mode() => {
+            app.move_query_cursor_to_end();
+        }
+
+        (KeyCode::Char('k'), KeyModifiers::CONTROL) if app.console_mode() => {
+            app.begin_rapid_navigation();
+            app.fast_page_up();
+        }
+
+        (KeyCode::Char('j'), KeyModifiers::CONTROL) if app.console_mode() => {
+            app.begin_rapid_navigation();
+            app.fast_page_down();
         }
 
         (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {

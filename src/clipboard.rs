@@ -147,7 +147,7 @@ fn own_linux_clipboard(text: String) -> io::Result<()> {
  * The terminal emulator stores the resulting clipboard contents independently
  * from Scry, so they remain available after Scry exits.
  */
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
 pub fn copy_with_osc52(text: &str) -> io::Result<()> {
     use std::io::Write;
 
@@ -168,7 +168,7 @@ pub fn copy_with_osc52(text: &str) -> io::Result<()> {
  * Keeping this here avoids adding another dependency solely for encoding a
  * copied filesystem path.
  */
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
 fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -201,7 +201,10 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
-#[cfg(all(test, target_os = "freebsd"))]
+#[cfg(all(
+    test,
+    any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")
+))]
 mod tests {
     use super::encode_base64;
 

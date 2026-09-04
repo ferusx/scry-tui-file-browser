@@ -71,6 +71,18 @@ pub struct Cli {
     pub manual: bool,
 
     /*
+     * Print the complete shell-integration guide used by console installations.
+     *
+     * This is deliberately plain text: it must remain readable on FreeBSD's
+     * system console and when redirected to a file or pager.
+     */
+    #[arg(
+        long = "console-config",
+        help = "Print console shell-integration instructions"
+    )]
+    pub console_config: bool,
+
+    /*
      * Generate a documented configuration template and exit.
      *
      * The template is deliberately written as:

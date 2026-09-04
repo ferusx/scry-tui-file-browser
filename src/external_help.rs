@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use std::env;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 
 use crossterm::terminal;
 
@@ -36,6 +36,11 @@ pub const OPTIONS: &[HelpOption] = &[
         short: "",
         long: "--manual",
         description: "Print the complete explanatory manual",
+    },
+    HelpOption {
+        short: "",
+        long: "--console-config",
+        description: "Print console shell-integration instructions",
     },
     HelpOption {
         short: "-V",
@@ -171,6 +176,20 @@ pub const EXAMPLES: &[HelpExample] = &[
         description: "Restore the most recently saved browsing session",
     },
 ];
+
+const CONSOLE_CONFIG: &str = include_str!("../docs/SHELL_INTEGRATION.txt");
+
+pub fn print_console_config() -> io::Result<()> {
+    let mut output = io::stdout().lock();
+
+    output.write_all(CONSOLE_CONFIG.as_bytes())?;
+
+    if !CONSOLE_CONFIG.ends_with('\n') {
+        output.write_all(b"\n")?;
+    }
+
+    output.flush()
+}
 
 /*
  * RGB values follow Scry's main palette.

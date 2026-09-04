@@ -2177,8 +2177,7 @@ fn boolean_expression_contains_text(expression: &BooleanExpression) -> bool {
         BooleanExpression::Not(inner) => boolean_expression_contains_text(inner),
 
         BooleanExpression::And(left, right) | BooleanExpression::Or(left, right) => {
-            boolean_expression_contains_text(left)
-                || boolean_expression_contains_text(right)
+            boolean_expression_contains_text(left) || boolean_expression_contains_text(right)
         }
     }
 }

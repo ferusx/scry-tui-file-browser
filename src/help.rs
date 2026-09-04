@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use ratatui::{
     layout::Alignment,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Line,
 };
 
@@ -14,7 +14,7 @@ use crate::themes::Theme;
  * Tips deliberately use a bright terminal green so the final section
  * remains visually discoverable while scrolling rapidly through Help.
  */
-const COLOR_TIP_TEXT: Color = Color::Rgb(90, 230, 120);
+// const COLOR_TIP_TEXT: Color = Color::Rgb(90, 230, 120);
 
 pub const TIPS_LINK_TEXT: &str = "[Jump to Tips]";
 
@@ -43,7 +43,7 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
      */
     lines.push(Line::styled(
         TIPS_LINK_TEXT,
-        Style::default().fg(Color::Rgb(90, 150, 235)),
+        Style::default().fg(theme.ui.query),
     ));
 
     push_title(&mut lines, "The Interface", theme);
@@ -206,8 +206,49 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         ten visible pages at once, providing faster travel through exceptionally \
         long listings and expanded Trees; releasing Ctrl immediately returns \
         paging to its normal one-page movement. Home and End select the first or \
-        last visible entry, while the mouse wheel may also be used for ordinary \
-        scrolling.",
+        last visible entry. On a system console, F11 returns directly to the source \
+        home directory, while the mouse wheel may also be used for ordinary scrolling \
+        in supported terminals.",
+        text_width,
+        theme,
+    );
+
+    push_section(&mut lines, "Console Mode on FreeBSD", theme);
+
+    push_paragraph(
+        &mut lines,
+        "When Scry runs on the FreeBSD system console, it automatically switches to \
+        a console-safe interface and adapts features that depend on rich terminal \
+        capabilities. Nerd Font icons and external file opening are unavailable, \
+        while selected local files and directories may instead be handed back to \
+        the parent shell. Pressing Enter on a file exits Scry with the shell positioned in \
+        that file's containing directory, while F3 performs the same handoff for the \
+        selected directory, and F11 returns directly to the source home directory. \
+        Run `scry --console-config` for the required shell-integration setup.",
+        text_width,
+        theme,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_paragraph(
+        &mut lines,
+        "Some modified navigation keys are not preserved reliably by the FreeBSD \
+        system console. Console Mode therefore uses Alt+B and Alt+F to move left \
+        and right in the search field, Ctrl+A and Ctrl+E to move to its beginning \
+        and end, and Ctrl+K and Ctrl+J to move ten pages at a time. Rich terminal \
+        shortcuts remain unchanged.",
+        text_width,
+        theme,
+    );
+
+    lines.push(Line::raw(""));
+
+    push_paragraph(
+        &mut lines,
+        "Ctrl+L redraws the complete interface. Use it when output from a background
+        process, system service, or console message has overwritten part of Scry's
+        display.",
         text_width,
         theme,
     );
@@ -277,11 +318,13 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
 
     push_paragraph(
         &mut lines,
-        "Optional file and directory icons may be shown or hidden (F3). Classified \
-        filename colors may be toggled independently (F12), assigning a bright \
-        visual family to ordinary files according to Scry's established file \
-        classification. Directories and symbolic links retain their structural \
-        colors. Both optional visual features are disabled by default.",
+        "Optional file and directory icons may be shown or hidden (F3) in rich \
+        terminal environments. Classified filename colors may be toggled independently \
+        (F12), assigning a bright visual family to ordinary files according to Scry's \
+        established file classification. Directories and symbolic links retain their \
+        structural colors. Both optional visual features are disabled by default. \
+        On the FreeBSD system console, Nerd Font icons are unavailable and F3 instead \
+        exits Scry with the parent shell positioned at the selected directory.",
         text_width,
         theme,
     );
@@ -514,7 +557,8 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
         directories may be entered, listings may be sorted and searched, and the \
         same List and Tree views remain available. A remote file must first be \
         transferred into Scry's local cache before it can be opened with a desktop \
-        application or terminal program.",
+        application or terminal program. External file opening is unavailable while \
+        using Scry on the FreeBSD system console.",
         text_width,
         theme,
     );
@@ -637,10 +681,10 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "Directories are entered directly, while executable files are launched in a \
-    terminal. Ordinary files are opened with the desktop's default application, \
-    and text files may fall back to a terminal editor when no suitable desktop \
-    opener is available. Remote files are first transferred into Scry's local \
-    cache and are then opened in the same way as local files.",
+        terminal. Ordinary files are opened with the desktop's default application, \
+        and text files may fall back to a terminal editor when no suitable desktop \
+        opener is available. Remote files are first transferred into Scry's local \
+        cache and are then opened in the same way as local files.",
         text_width,
         theme,
     );
@@ -650,10 +694,10 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "Scry remains open after successfully launching a file by default, allowing \
-    browsing to continue while the external application runs. Set exit_on_open \
-    to true in scry.toml or launch with --exit-on-open when Scry should close \
-    after a file has been opened successfully. Directory navigation and failed \
-    open attempts never trigger this automatic exit.",
+        browsing to continue while the external application runs. Set exit_on_open \
+        to true in scry.toml or launch with --exit-on-open when Scry should close \
+        after a file has been opened successfully. Directory navigation and failed \
+        open attempts never trigger this automatic exit.",
         text_width,
         theme,
     );
@@ -663,10 +707,11 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "External file opening may be disabled with allow_file_opening = false in \
-    scry.toml or for one launch with --no-open. This affects ordinary file \
-    activation only; directories may still be entered and browsed normally. \
-    --no-open and --exit-on-open are mutually exclusive because one disables \
-    the action that the other waits to complete.",
+        scry.toml or for one launch with --no-open. This affects ordinary file \
+        activation only; directories may still be entered and browsed normally. \
+        --no-open and --exit-on-open are mutually exclusive because one disables \
+        the action that the other waits to complete. External file opening is always \
+        disabled in FreeBSD Console Mode regardless of these settings.",
         text_width,
         theme,
     );
@@ -676,17 +721,17 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "Deletion is disabled by default and must be enabled in Scry's configuration \
-    before the Delete key becomes active. Deletion is currently available only \
-    for local entries; remote files and directories cannot be removed through \
-    SSH. Every request opens a confirmation window with Cancel selected by \
-    default. Files, directories, and symbolic links are first moved to hidden \
-    staged paths beside their original locations. A symbolic link is handled as \
-    a link and is never followed into its target. Scry also refuses dangerous \
-    targets such as the filesystem root, the current browsing root, or paths \
-    outside the active root. Press Ctrl+Z to restore the most recently staged \
-    deletion during the current session. Remaining staged entries are removed \
-    permanently when Scry exits cleanly, while interrupted deletion sessions can \
-    be recovered from the deletion journal when Scry starts again.",
+        before the Delete key becomes active. Deletion is currently available only \
+        for local entries; remote files and directories cannot be removed through \
+        SSH. Every request opens a confirmation window with Cancel selected by \
+        default. Files, directories, and symbolic links are first moved to hidden \
+        staged paths beside their original locations. A symbolic link is handled as \
+        a link and is never followed into its target. Scry also refuses dangerous \
+        targets such as the filesystem root, the current browsing root, or paths \
+        outside the active root. Press Ctrl+Z to restore the most recently staged \
+        deletion during the current session. Remaining staged entries are removed \
+        permanently when Scry exits cleanly, while interrupted deletion sessions can \
+        be recovered from the deletion journal when Scry starts again.",
         text_width,
         theme,
     );
@@ -698,10 +743,10 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     push_paragraph(
         &mut lines,
         "Session restoration is disabled by default. It may be enabled permanently \
-with restore_session = true in the [session] section of scry.toml, or for one \
-launch with --restore-session. When enabled, Scry saves its stable browser \
-state during a normal shutdown and attempts to restore it the next time Scry \
-is launched without an explicit replacement source.",
+        with restore_session = true in the [session] section of scry.toml, or for one \
+        launch with --restore-session. When enabled, Scry saves its stable browser \
+        state during a normal shutdown and attempts to restore it the next time Scry \
+        is launched without an explicit replacement source.",
         text_width,
         theme,
     );
@@ -709,7 +754,7 @@ is launched without an explicit replacement source.",
     push_paragraph(
         &mut lines,
         "Restored session settings override matching browser and display defaults \
-from scry.toml. Explicit command-line options override both.",
+        from scry.toml. Explicit command-line options override both.",
         text_width,
         theme,
     );
@@ -828,6 +873,7 @@ from scry.toml. Explicit command-line options override both.",
         "# For a compact reminder of keyboard controls and query syntax, open the Shortcut \
     Legend with ? instead of searching through this complete Help document.",
         text_width,
+        theme,
     );
 
     lines.push(Line::raw(""));
@@ -838,6 +884,7 @@ from scry.toml. Explicit command-line options override both.",
     or below the thumb to move through the entries rapidly one page at a time. You may \
     also click on either side of the thumb to move a single page in that direction.",
         text_width,
+        theme,
     );
 
     lines.push(Line::raw(""));
@@ -848,6 +895,7 @@ from scry.toml. Explicit command-line options override both.",
     edit ~/.config/scry/scry.toml and set show_icons = true and/or \
     show_file_colors = true.",
         text_width,
+        theme,
     );
 
     lines.push(Line::raw(""));
@@ -856,6 +904,7 @@ from scry.toml. Explicit command-line options override both.",
         &mut lines,
         "# Did you know that you can enable icons in-app by pressing F3, and file colors with F12?",
         text_width,
+        theme,
     );
 
     lines.push(Line::raw(""));
@@ -867,6 +916,7 @@ from scry.toml. Explicit command-line options override both.",
         might make you feel trapped. Just disable HiddenOnly by pressing F6 to see the selectable \
         entries again.",
         text_width,
+        theme,
     );
 
     lines.push(Line::raw(""));
@@ -877,6 +927,7 @@ from scry.toml. Explicit command-line options override both.",
         you find that it is difficult to see the highlighting in your search results, try toggling \
         file colors off (F12) temporarily for clarity.",
         text_width,
+        theme,
     );
 
     lines.push(Line::raw(""));
@@ -888,6 +939,7 @@ from scry.toml. Explicit command-line options override both.",
         have had the intention to search all subdirectories, but there will only be results from \
         the current root unless you are in Recursive mode.",
         text_width,
+        theme,
     );
 
     lines.push(Line::raw(""));
@@ -899,6 +951,7 @@ from scry.toml. Explicit command-line options override both.",
         entries inside. However, if you, while browsing, enter a → dir, and you find it empty, it is \
         certain to have hidden entries inside. Enable Hidden entries to gain access to them.",
         text_width,
+        theme,
     );
 
     lines.push(Line::raw(""));
@@ -911,7 +964,7 @@ from scry.toml. Explicit command-line options override both.",
 
     lines.push(Line::styled(
         TOP_LINK_TEXT,
-        Style::default().fg(Color::Rgb(90, 150, 235)),
+        Style::default().fg(theme.ui.query),
     ));
 
     lines.push(Line::raw(""));
@@ -919,7 +972,7 @@ from scry.toml. Explicit command-line options override both.",
     lines.push(
         Line::styled(
             "↑/↓ scroll  PgUp/PgDn page  Esc/F1 closes",
-            Style::default().fg(Color::Rgb(75, 80, 92)),
+            Style::default().fg(theme.ui.muted),
         )
         .alignment(Alignment::Center),
     );
@@ -1016,11 +1069,16 @@ fn push_paragraph(lines: &mut Vec<Line<'static>>, text: &str, text_width: usize,
     }
 }
 
-fn push_tip_paragraph(lines: &mut Vec<Line<'static>>, text: &str, text_width: usize) {
+fn push_tip_paragraph(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    text_width: usize,
+    theme: &Theme,
+) {
     for wrapped_line in wrap_text(text, text_width) {
         lines.push(Line::styled(
             wrapped_line,
-            Style::default().fg(COLOR_TIP_TEXT),
+            Style::default().fg(theme.ui.status),
         ));
     }
 }

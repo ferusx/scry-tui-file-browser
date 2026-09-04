@@ -1,5 +1,5 @@
 .\" SPDX-License-Identifier: BSD-3-Clause
-.TH SCRY 1 "July 2026" "Scry" "User Commands"
+.TH SCRY 1 "September 2026" "Scry" "User Commands"
 
 .SH NAME
 scry \- fast terminal file browser, recursive finder, and SSH filesystem explorer
@@ -11,6 +11,7 @@ scry [OPTIONS] [PATH]
       --manual
   -V, --version
       --generate-config
+      --console-config
       --restore-session
       --ssh TARGET
       --preserve-hierarchy
@@ -59,10 +60,17 @@ Print the current version of \fBScry\fP and exit.
 Generate \fBscry.toml.generated\fP and exit.
 
 The generated file must be reviewed and manually renamed to \fBscry.toml\fP before it becomes the active configuration. It is written to:
-.nf
 
-~/.config/scry/scry.toml.generated
-.fi
+.RS
+\fB~/.config/scry/scry.toml.generated\fP
+.RE
+
+.TP
+.BR \-\-console\-config
+Print the complete setup instructions for FreeBSD Console Mode and exit.
+
+This command explains how to install and activate the appropriate shell helper. It does not install files, modify shell startup configuration, or enable Console Mode by itself. See the \fBCONSOLE MODE\fP section for its behavior, controls, and shell-integration requirements.
+
 
 .TP
 .BR \-\-restore\-session
@@ -163,7 +171,6 @@ Show user column at startup.
 .TP
 \fBScry\fP is designed for keyboard-first operation while retaining extensive mouse support. Most controls act immediately, and the footer displays contextual shortcuts for the current mode or open window.
 
-.RE
 .SS NAVIGATION
 .TP
 .BR Enter
@@ -257,7 +264,7 @@ Reverse the current sort direction.
 Search queries are evaluated as they are typed. Complete details of the compact and Boolean query languages are provided in the \fBSEARCHING\fP and \fBQUERY LANGUAGE\fP sections.
 .RE
 
-.RE
+
 .SS "INTERFACE AND DISPLAY"
 .TP
 
@@ -279,6 +286,11 @@ Show or hide the Details panel.
 .BR Ctrl+S
 .RS
 Show or hide the Selection Panel.
+.RE
+
+.BR Ctrl+L
+.RS
+Clear and redraw the complete interface. Use this after output from a background process, system service, or console message has overwritten part of \fBScry's\fP display.
 .RE
 
 .BR Alt+M
@@ -381,7 +393,7 @@ Download multiple selected remote files.
 File marking and batch downloading are available only during an SSH session. Directories cannot currently be marked for download.
 .RE
 
-.RE
+
 .SS "LOCAL FILE OPERATIONS"
 .TP
 .BR Delete
@@ -398,7 +410,6 @@ Restore the most recently staged local deletion during the current session.
 Local deletion is disabled by default. Deletion controls are unavailable while browsing through SSH.
 .RE
 
-.RE
 .SS "MOUSE CONTROLS"
 .TP
 .BR "Mouse wheel"
@@ -430,6 +441,220 @@ Move vertically or horizontally through long listings and scrollable windows.
 Clickable controls are available in the main interface and in applicable dialogs, including the parent and home controls, connection actions, transfer controls, and confirmation buttons.
 .RE
 
+.\" Main Section: 'Console Mode'
+.SH "CONSOLE MODE"
+
+.TP
+On FreeBSD, \fBScry\fP automatically enters Console Mode when its output terminal is \fB/dev/console\fP or a \fB/dev/ttyv*\fP virtual terminal. Terminal emulators continue to use Rich Mode. No command-line option or configuration setting is required to select either mode.
+
+.TP
+Console Mode adapts \fBScry\fP to the capabilities and workflow of the FreeBSD system console. It uses a dedicated ANSI 16-color palette, disables file and directory icons, and replaces external file opening with shell-directory handoff actions. These changes apply only in Console Mode and do not alter Rich Mode behavior.
+
+.TP
+.TP
+In Console Mode, \fBScry\fP cannot open files externally, which is the default behavior in Rich Mode. Instead, \fBScry\fP exits to the selected file's directory, or to the selected directory itself, using the appropriate shortcuts. This directory-changing behavior cannot be achieved by \fBScry\fP alone because a child process cannot change the working directory of its parent shell, and this is why the shell helpers are needed.
+
+.SS "SHELL INTEGRATION"
+
+.TP
+A program launched by a shell cannot directly change the working directory of its parent shell. Console Mode therefore requires a small shell helper. The helper launches \fBScry\fP with a private handoff path and, after \fBScry\fP exits with a selected destination, changes the current shell directory to that destination.
+
+.TP
+If Console Mode is detected without an active shell helper, \fBScry\fP displays a setup notice instead of opening the browser. Press any key to exit the notice, then print the complete shell-specific setup instructions with:
+
+.RS
+\fBscry \-\-console\-config\fP
+.RE
+
+.TP
+The command is informational only. It does not copy files, modify shell startup configuration, or activate the integration automatically.
+
+.SS "INTEGRATION FILES"
+
+.TP
+The \fBScry\fP source distribution contains the following shell helpers:
+
+.nf
+.PP
+\fBshell/scry.sh\fP
+\fBshell/scry.csh\fP
+.fi
+
+.TP
+The first helper supports sh, bash, zsh, and compatible shells. The second supports csh and tcsh. Only the helper matching the active shell should be sourced.
+
+.TP
+Packaged installations may place the helpers beneath their installation prefix at:
+
+.nf
+.PP
+\fIPREFIX\fP/share/scry/shell/scry.sh
+\fIPREFIX\fP/share/scry/shell/scry.csh
+.fi
+
+.TP
+The exact prefix is determined by the package or installation method. On FreeBSD, the conventional local prefix is \fB/usr/local\fP.
+
+.SS "MANUAL INSTALLATION"
+
+.TP
+When \fBScry\fP is built directly from its source repository, the integration files may be installed manually. For a conventional installation beneath \fB/usr/local\fP, run the following commands from the root of the \fBScry\fP source tree with sufficient permissions:
+
+.nf
+.PP
+install \-d /usr/local/share/scry/shell
+install \-d /usr/local/share/doc/scry
+install \-m 0644 shell/scry.sh \e
+    /usr/local/share/scry/shell/scry.sh
+install \-m 0644 shell/scry.csh \e
+    /usr/local/share/scry/shell/scry.csh
+install \-m 0644 docs/SHELL_INTEGRATION.txt \e
+    /usr/local/share/doc/scry/SHELL_INTEGRATION.txt
+install \-m 0644 docs/SHELL_INTEGRATION.md \e
+    /usr/local/share/doc/scry/SHELL_INTEGRATION.md
+.fi
+
+.TP
+A different installation prefix may be substituted for \fB/usr/local\fP. The shell startup command must then use the corresponding installed helper path.
+
+.TP
+The helper may alternatively be sourced directly from a persistent source checkout. The checkout must remain at the referenced location for subsequent shell sessions.
+
+.SS "ACTIVATING THE HELPER"
+
+.TP
+For sh, bash, zsh, and compatible shells, add the following line to the appropriate shell startup file when the helper is installed beneath \fB/usr/local\fP:
+
+.RS
+\fB. /usr/local/share/scry/shell/scry.sh\fP
+.RE
+
+.TP
+For csh and tcsh, add:
+
+.RS
+\fBsource /usr/local/share/scry/shell/scry.csh\fP
+.RE
+
+.TP
+Replace \fB/usr/local\fP with the actual installation prefix when another prefix is used. Open a new shell or source the modified startup file after adding the appropriate line.
+
+.TP
+The helpers are intended to be sourced rather than executed directly. \fBScry\fP never modifies shell startup files automatically; enabling shell integration remains an explicit user action.
+
+.SS "CONSOLE MODE CONTROLS"
+
+.TP
+.BR Enter " on a file"
+.RS
+Exit \fBScry\fP and return the containing directory of the selected local file to the shell helper. After \fBScry\fP exits, the helper changes the current shell directory to that containing directory. The file is not opened in an external application.
+.RE
+
+.TP
+.BR Enter " on a directory"
+.RS
+Enter the selected directory inside \fBScry\fP. This retains the ordinary directory-navigation behavior and does not exit the application or request a shell-directory handoff.
+.RE
+
+.TP
+.BR F3 " on a directory"
+.RS
+Exit \fBScry\fP and return the selected local directory to the shell helper. After \fBScry\fP exits, the helper changes the current shell directory directly to that directory.
+.RE
+
+.TP
+.BR F3 " on a non-directory"
+.RS
+Do not request a directory handoff. In Console Mode, F3 is reserved for selecting a directory as the shell destination and does not toggle file or directory icons.
+.RE
+
+.TP
+.B F11
+Return to the home directory of the active source.
+
+.RS
+For a local source, this is the local user's home directory.
+During an SSH session, it is the remote user's home directory.
+.RE
+
+.TP
+.BR Alt+B " / " Alt+F
+Move the search-field caret one character left or right.
+
+These Console Mode shortcuts replace \fBCtrl+Left\fP and \fBCtrl+Right\fP, whose Control modifier is not preserved by the FreeBSD system console.
+
+
+.TP
+.BR Alt+Z " / " Alt+X
+Scroll horizontally left or right.
+
+These Console Mode shortcuts replace \fBShift+Left\fP and \fBShift+Right\fP, whose Shift modifier is not preserved by the FreeBSD system console.
+
+.TP
+.BR Ctrl+A " / " Ctrl+E
+Move the search-field caret to the beginning or end of the query.
+
+These Console Mode shortcuts replace \fBCtrl+Home\fP and \fBCtrl+End\fP, whose Control modifier is not preserved by the FreeBSD system console.
+
+.TP
+.BR Ctrl+K " / " Ctrl+J
+Move ten visible pages upward or downward through the result listing.
+
+These Console Mode shortcuts replace \fBCtrl+PageUp\fP and \fBCtrl+PageDown\fP, whose Control modifier is not preserved by the FreeBSD system console.
+
+.TP
+.BR Ctrl+L
+.RS
+Clear the physical terminal and redraw the complete \fBScry\fP interface.
+
+This removes output written over the interface by background processes, system services, or the FreeBSD console logger.
+.RE
+
+.TP
+.BR Ctrl+C
+.RS
+Exit \fBScry\fP normally without selecting a new shell directory.
+.RE
+
+.TP
+The directory-handoff actions apply to local filesystem entries. A remote SSH path cannot become the working directory of the local parent shell.
+
+.TP
+All shortcuts not overridden above retain the meanings described in the \fBINTERACTIVE CONTROLS\fP section. This includes ordinary navigation, searching, filtering, sorting, inspection, SSH, session, and exit controls.
+
+.SS "CONSOLE DISPLAY"
+
+.TP
+Console Mode uses a fixed ANSI 16-color palette designed for the FreeBSD system console. The configured Rich Mode theme does not replace this console palette.
+
+.TP
+File and directory icons are disabled because the physical console cannot be assumed to provide the required icon font. F3 is therefore available for the directory-handoff action described above.
+
+.TP
+External file opening is disabled in Console Mode. Selecting a regular file with Enter performs the containing-directory handoff instead.
+
+.SS "ADDITIONAL DOCUMENTATION"
+
+.TP
+Complete plain-text and Markdown integration guides are included in the \fBScry\fP source distribution as:
+
+.nf
+.PP
+\fBdocs/SHELL_INTEGRATION.txt\fP
+\fBdocs/SHELL_INTEGRATION.md\fP
+.fi
+
+.TP
+Packaged installations may place these documents beneath:
+
+.nf
+.PP
+\fIPREFIX\fP/share/doc/scry/SHELL_INTEGRATION.txt
+\fIPREFIX\fP/share/doc/scry/SHELL_INTEGRATION.md
+.fi
+
+.TP
+The plain-text guide is suitable for reading directly in a terminal. The Markdown guide provides the corresponding repository documentation.
 
 .SH SEARCHING
 .TP
@@ -1107,7 +1332,7 @@ Overlapping positive matches are merged into a single clean highlighted range.
 .TP
 The canonical type name appears first. Accepted aliases follow in parentheses.
 
-.RE
+
 .BR "Filesystem and general classifications"
 
 .nf
@@ -1122,7 +1347,7 @@ The canonical type name appears first. Accepted aliases follow in parentheses.
 \(bu unknown
 .fi
 
-.RE
+
 .BR "Programming languages"
 
 .nf
@@ -1162,7 +1387,7 @@ The canonical type name appears first. Accepted aliases follow in parentheses.
 \(bu vala
 .fi
 
-.RE
+
 .BR "Development and structured files"
 
 .nf
@@ -1173,7 +1398,7 @@ The canonical type name appears first. Accepted aliases follow in parentheses.
 \(bu log (logs)
 .fi
 
-.RE
+
 .BR "Archives, packages, and documents"
 
 .nf
@@ -1184,7 +1409,7 @@ The canonical type name appears first. Accepted aliases follow in parentheses.
 \(bu presentation (slides)
 .fi
 
-.RE
+
 .BR "Media and resources"
 
 .nf
@@ -1195,7 +1420,7 @@ The canonical type name appears first. Accepted aliases follow in parentheses.
 \(bu font (fonts)
 .fi
 
-.RE
+
 .BR "System and specialized files"
 
 .nf
@@ -1208,7 +1433,7 @@ The canonical type name appears first. Accepted aliases follow in parentheses.
 \(bu plugin
 .fi
 
-.RE
+
 .TP
 The canonical names are preferred in documentation, but aliases have identical matching behavior. The same parser-backed list is displayed inside \fBScry’s\fP Shortcut Legend, so the in-app reference and accepted query syntax remain synchronized.
 
@@ -1471,7 +1696,7 @@ Selected virtual and transient system trees are skipped:
 \fB/run\fP
 .fi
 
-.RE
+
 .TP
 Index construction runs in the background, and \fBScry\fP reports the number of entries written while work continues. The remote filesystem may still be browsed during construction.
 
@@ -2375,6 +2600,26 @@ Cached remote files are arranged by remote host, account, port, and source path 
 
 .nf
 .PP
+\fB/usr/local/share/scry/shell/scry.sh\fP
+\fB/usr/local/share/scry/shell/scry.csh\fP
+.fi
+
+.RS
+Optional shell helpers for Console Mode. The first supports sh, bash, zsh, and compatible shells; the second supports csh and tcsh.
+.RE
+
+.nf
+.PP
+\fB/usr/local/share/doc/scry/SHELL_INTEGRATION.txt\fP
+\fB/usr/local/share/doc/scry/SHELL_INTEGRATION.md\fP
+.fi
+
+.RS
+Installed Console Mode integration guides in plain-text and Markdown formats.
+.RE
+
+.nf
+.PP
 \fB*.scry-meta\fP
 .fi
 
@@ -2769,7 +3014,7 @@ Remote indexes and cached files reflect the state observed when they were create
 .SH "LICENSE"
 
 .TP
-\fBScry\fP is distributed underq the \đBBSD 3-Clause License\fP.
+\fBScry\fP is distributed underq the \fBBSD 3-Clause License\fP.
 
 .TP
 Copyright and complete license terms are provided in the LICENSE file included with the source distribution.

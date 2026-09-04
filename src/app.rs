@@ -31,6 +31,7 @@ use crate::search_index::SearchIndex;
 use crate::session::{SESSION_FORMAT_VERSION, SessionMarkedFile, SessionSource, SessionState};
 use crate::source::{FileSource, LocalSource, TransferControl, TransferProgress};
 use crate::ssh::{SftpSource, SshTarget};
+use crate::terminal_profile::TerminalProfile;
 use crate::themes::Theme;
 
 const INFO_NOTIFICATION_DURATION: Duration = Duration::from_secs(5);
@@ -1058,6 +1059,18 @@ pub struct App {
      */
     pub exit_on_open: bool,
 
+    pub terminal_profile: TerminalProfile,
+
+    /*
+     * A sourced shell helper owns the handoff file that allows the parent shell
+     * to change directory after Scry exits.
+     *
+     * The destination remains unset for every ordinary exit route.
+     */
+    shell_handoff_enabled: bool,
+
+    shell_exit_directory: Option<PathBuf>,
+
     pub theme: Theme,
 
     /*
@@ -1712,6 +1725,43 @@ fn rebase_recursive_entry(entry: &mut FileEntry, root: &Path) {
 }
 
 impl App {
+    pub fn set_terminal_profile(&mut self, profile: TerminalProfile) {
+        self.terminal_profile = profile;
+    }
+
+    pub fn set_shell_handoff_enabled(&mut self, enabled: bool) {
+        self.shell_handoff_enabled = enabled;
+    }
+
+    pub fn shell_exit_directory(&self) -> Option<&Path> {
+        self.shell_exit_directory.as_deref()
+    }
+
+    pub fn console_mode(&self) -> bool {
+        self.terminal_profile.is_console()
+    }
+
+    pub fn apply_terminal_capabilities(&mut self) {
+        if self.console_mode() {
+            /*
+             * The physical system console gets its own ANSI16 presentation.
+             *
+             * This happens after normal theme/config/session resolution so rich
+             * terminals continue to use their selected theme unchanged.
+             */
+            self.theme = Theme::console();
+        }
+
+        if !self.terminal_profile.supports_icons() {
+            self.show_icons = false;
+        }
+
+        if !self.terminal_profile.supports_file_opening() {
+            self.allow_file_opening = false;
+            self.exit_on_open = false;
+        }
+    }
+
     pub fn new(start_path: PathBuf) -> io::Result<Self> {
         let current_directory = normalize_start_path(start_path)?;
 
@@ -1795,6 +1845,12 @@ impl App {
             allow_file_opening: true,
 
             exit_on_open: false,
+
+            terminal_profile: TerminalProfile::Rich,
+
+            shell_handoff_enabled: false,
+
+            shell_exit_directory: None,
 
             theme: Theme::default(),
 
@@ -4498,6 +4554,14 @@ impl App {
     }
 
     pub fn toggle_icons(&mut self) {
+        if !self.terminal_profile.supports_icons() {
+            self.show_icons = false;
+
+            self.show_info_message("Icons are unavailable in console mode");
+
+            return;
+        }
+
         self.show_icons = !self.show_icons;
     }
 
@@ -5353,7 +5417,6 @@ impl App {
              * recovery keeps startup flags and future source transitions safe.
              */
             if self.recursive_mode {
-
                 self.recursive_mode = false;
 
                 self.invalidate_recursive_cache();
@@ -5638,15 +5701,15 @@ impl App {
                 self.list_offset = 0;
 
                 /*
-                  * A queried List may be rebuilt asynchronously.
-                  *
-                  * Its filtered_indices still belong to the previous List result until the
-                  * destination worker publishes, so do not map the Tree selection through those
-                  * indices here. Carry the actual Tree path into the destination instead.
-                  *
-                  * Queryless List mode is synchronous and may perform its ordinary ancestor
-                  * mapping immediately.
-                  */
+                 * A queried List may be rebuilt asynchronously.
+                 *
+                 * Its filtered_indices still belong to the previous List result until the
+                 * destination worker publishes, so do not map the Tree selection through those
+                 * indices here. Carry the actual Tree path into the destination instead.
+                 *
+                 * Queryless List mode is synchronous and may perform its ordinary ancestor
+                 * mapping immediately.
+                 */
                 let desired_list_path = if self.effective_query_is_active() {
                     tree_selected_path.clone()
                 } else {
@@ -5893,25 +5956,6 @@ impl App {
         }
 
         let selected_path = self.selected_entry().map(|entry| entry.path.clone());
-
-
-
-        eprintln!(
-            "ALT+E STATE: remote={} recursive_active={} query_active={} hidden={} ordinary_bulk={} expanded={} recursive_expanded={} refused_state={} rows={} max={}",
-            self.source.is_remote(),
-            self.recursive_search_active(),
-            self.effective_query_is_active(),
-            self.show_hidden,
-            self.ordinary_expand_all_active,
-            self.expanded_directories.len(),
-            self.recursive_expanded_directories.len(),
-            self.refused_tree_expand_state.is_some(),
-            self.filtered_tree_indices.len(),
-            self.advanced_tree_config.max_visible_tree_rows,
-        );
-
-
-
 
         if self.recursive_search_active() {
             if self.effective_query_is_active() {
@@ -10019,6 +10063,39 @@ impl App {
         self.show_info_message(format!("Deleted {}", path.display(),));
     }
 
+    pub fn exit_at_selected_directory(&mut self) {
+        if !self.console_mode() || self.source.is_remote() {
+            return;
+        }
+
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+
+        let path = entry.path.clone();
+
+        let entry_is_directory = entry.is_directory;
+
+        if !self.path_is_directory(&path, entry_is_directory) {
+            return;
+        }
+
+        /*
+         * Alt+Enter on a file and every rich-terminal invocation deliberately do
+         * nothing. A direct console launch stays open and explains the missing
+         * integration instead of exiting without being able to move its parent shell.
+         */
+        if !self.shell_handoff_enabled {
+            self.show_info_message("Launch Scry through its shell helper to leave at a directory");
+
+            return;
+        }
+
+        self.shell_exit_directory = Some(path);
+
+        self.should_quit = true;
+    }
+
     pub fn activate_selected(&mut self) {
         let Some(entry) = self.selected_entry() else {
             return;
@@ -10057,12 +10134,52 @@ impl App {
         }
 
         /*
+         * Console file activation completes the search by returning the selected
+         * file's containing directory to the sourced shell helper.
+         *
+         * SSH paths cannot be used as a local shell directory. Direct console
+         * launches also remain inside Scry because no parent-shell handoff exists.
+         */
+        if self.console_mode() {
+            if self.source.is_remote() {
+                self.show_info_message("Shell handoff is unavailable while browsing through SSH");
+
+                return;
+            }
+
+            if !self.shell_handoff_enabled {
+                self.show_info_message("Launch Scry through its shell helper to leave at a file");
+
+                return;
+            }
+
+            let Some(parent) = path.parent() else {
+                self.show_error_message(format!(
+                    "Unable to determine the parent directory of {}",
+                    path.display(),
+                ));
+
+                return;
+            };
+
+            self.shell_exit_directory = Some(parent.to_path_buf());
+
+            self.should_quit = true;
+
+            return;
+        }
+
+        /*
          * --no-open blocks only external file activation.
          *
          * Directory navigation remains fully functional.
          */
         if !self.allow_file_opening {
-            self.show_info_message(format!("File opening is disabled — {}", path.display(),));
+            if self.console_mode() {
+                self.show_info_message("File opening is unavailable in console mode");
+            } else {
+                self.show_info_message(format!("File opening is disabled — {}", path.display()));
+            }
 
             return;
         }
@@ -13897,7 +14014,7 @@ fn copy_path_to_clipboard(path_text: &str, app: &mut App) -> io::Result<()> {
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
 fn copy_path_to_clipboard(path_text: &str, _app: &mut App) -> io::Result<()> {
     crate::clipboard::copy_with_osc52(path_text)
 }

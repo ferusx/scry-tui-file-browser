@@ -41,6 +41,10 @@ pub struct UiTheme {
 
     pub muted: Color,
 
+    pub footer: Color,
+
+    pub placeholder: Color,
+
     pub error: Color,
 
     /*
@@ -209,6 +213,10 @@ impl Default for Theme {
 
                 muted,
 
+                footer: muted,
+
+                placeholder: muted,
+
                 error: Color::Rgb(220, 55, 70),
 
                 status: Color::Rgb(225, 170, 70),
@@ -338,6 +346,71 @@ impl Default for Theme {
 }
 
 impl Theme {
+    pub fn console() -> Self {
+        /*
+         * ANSI16-only system-console palette.
+         *
+         * Rich terminal themes remain completely independent from this palette.
+         * The system console deliberately uses a restrained set of structural
+         * colors rather than approximating Scry's RGB theme.
+         */
+        let frame = Color::Magenta;
+        let directory = Color::Blue;
+        let file = Color::Gray;
+        let symlink = Color::Cyan;
+        let muted = Color::DarkGray;
+        let query = Color::Cyan;
+
+        let mut theme = Self::default();
+
+        theme.ui.frame = frame;
+        theme.ui.directory = directory;
+        theme.ui.file = file;
+        theme.ui.symlink = symlink;
+        theme.ui.muted = muted;
+        theme.ui.placeholder = Color::LightCyan;
+        theme.ui.footer = Color::LightMagenta;
+        theme.ui.error = Color::Red;
+        theme.ui.status = Color::Yellow;
+        theme.ui.query = query;
+        theme.ui.search_match = Color::Cyan;
+        theme.ui.classification = Color::Gray;
+        theme.ui.date = Color::Blue;
+        theme.ui.user = Color::Green;
+        theme.ui.size = Color::Cyan;
+
+        theme.frames.search = frame;
+        theme.frames.details = frame;
+        theme.frames.metadata = frame;
+        theme.frames.entries = frame;
+        theme.frames.selection = frame;
+        theme.frames.popup = frame;
+        theme.frames.popup_background = Color::Black;
+        theme.frames.parent_brackets = frame;
+        theme.frames.parent_text = query;
+
+        theme.selection.text = Color::Black;
+        theme.selection.background = Color::Cyan;
+
+        theme.scrollbar.thumb = Color::Cyan;
+        theme.scrollbar.track = Color::DarkGray;
+
+        /*
+         * Keep permissions readable without turning them into a rainbow.
+         *
+         * Missing permission bits recede into dark gray while special bits remain
+         * visible as exceptional state.
+         */
+        theme.permissions.file_type = Color::Gray;
+        theme.permissions.read = Color::Blue;
+        theme.permissions.write = Color::Cyan;
+        theme.permissions.execute = Color::Magenta;
+        theme.permissions.missing = Color::DarkGray;
+        theme.permissions.special = Color::Yellow;
+
+        theme
+    }
+
     /*
      * Bright, harmonious filename palette based on Scry's established FileClass.
      *

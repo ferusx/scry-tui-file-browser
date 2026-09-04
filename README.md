@@ -26,6 +26,7 @@ interface.
 - Configurable themes with safe built-in fallbacks
 - Compact contextual footer hints
 - Timed information and error notifications
+- Printable console shell-integration guide through `--console-config`
 - Built-in Help, Shortcut Legend, About, and File Information windows
 
 ### Search and classification
@@ -223,6 +224,33 @@ appearance, configure the terminal emulator to use a
 Icons may be enabled or disabled at runtime with `F3` and through
 `show_icons` in `scry.toml`. Scry remains fully usable without icon support.
 
+## FreeBSD system-console integration
+
+On the FreeBSD system console, Scry uses a console-safe interface **without** Nerd Font icons and replaces external file opening with an optional shell handoff. Pressing `Enter` on a local file will exit Scry in that file’s containing directory, while `F3` on a local directory will exit Scry in the selected directory. `F11` returns directly to the source home directory. Rich-terminal behavior remains unchanged.
+
+The shell helpers are distributed in the repository’s `shell/` directory. Scry never modifies personal shell startup files. Cargo installs only the executable, so users who install with `cargo install --path .` should first copy the helpers to a stable location:
+
+
+```sh
+mkdir -p "$HOME/.local/share/scry/shell"
+install -m 0644 shell/scry.sh shell/scry.csh \
+    "$HOME/.local/share/scry/shell/"
+```
+
+For example, `sh` users can then add this line to `~/.profile`:
+
+```sh
+. "$HOME/.local/share/scry/shell/scry.sh"
+```
+
+Complete setup instructions for `sh`, `bash`, `ksh`, `zsh`, `csh`, and `tcsh`
+are available in [Scry Console Shell Integration](docs/SHELL_INTEGRATION.md).
+The same instructions are available as plain console text with:
+
+```sh
+scry --console-config
+```
+
 ## Usage
 
 ```text
@@ -280,15 +308,20 @@ scry --manual
 
 # Generate a documented configuration template
 scry --generate-config
+
+# Print console shell-integration instructions
+scry --console-config
 ```
 
 ## Help and manual
 
-Scry provides four complementary documentation routes:
+Scry provides five complementary documentation routes:
 
 - `scry --help` prints a concise command-line reference and startup examples.
 - `scry --manual` prints the complete explanatory manual used by the F1 Help
   window. Its output is suitable for pagers, redirection, and text editors.
+- `scry --console-config` prints the plain-text shell-integration guide for
+  FreeBSD system-console users.
 - `?` opens the in-app Shortcut Legend, including the complete query
   modifier and `type:` alias reference.
 - Scry also includes a complete `scry(1)` manual page for traditional Unix
@@ -502,6 +535,7 @@ They begin filtering only after they form a valid expression.
 |---|---|
 | `-h`, `--help` | Print concise command-line help |
 | `--manual` | Print the complete Scry manual |
+| `--console-config` | Print console shell-integration instructions |
 | `-V`, `--version` | Print the Scry version |
 | `--generate-config` | Generate `scry.toml.generated` and exit |
 | `--restore-session` | Restore the most recently saved browser session |
@@ -534,7 +568,7 @@ session state for the current launch.
 Press `?` inside Scry to open the complete Shortcut Legend. Press `F1` to
 open the full internal Help.
 
-Scry controls:
+Scry controls - **Normal mode**:
 
 | Shortcut | Action |
 |---|---|
@@ -576,9 +610,25 @@ Scry controls:
 | `?` | Open the Shortcut Legend |
 | `Ctrl+C` | Exit |
 
+
 Mouse support includes wheel scrolling, left-click selection, double-click
 activation, clickable controls where
 available, and draggable scrollbars.
+
+Scry controls - **Console mode**:
+
+On the FreeBSD system console, a small set of alternate shortcuts replaces key combinations that are not reported reliably by the console keyboard layer.
+
+| Shortcut | Action |
+|---|---|
+| `Enter` | Exit at the selected file's directory |
+| `F3` | Exit at the selected directory |
+| `F11` | Go to the source home directory |
+| `Alt+B` / `Alt+F` | Move left or right in the search field |
+| `Ctrl+A` / `Ctrl+E` | Move to the start or end of the search field |
+| `Alt+K` / `Alt+J` | Page up or down |
+| `Ctrl+K` / `Ctrl+J` | Move up or down ten pages |
+
 
 ## SSH and remote files
 
