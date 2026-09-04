@@ -1,6 +1,6 @@
 # Scry Terminal File Browser
 
-## Version 1.0.0
+## Version 1.0.2
 
 **Scry** is a fast, richly featured terminal file browser, recursive finder, and
 SSH/SFTP filesystem explorer written in Rust. It combines responsive List and
@@ -180,13 +180,13 @@ When the terminal falls below Scry’s minimum usable size, the interface is rep
 
 ## Building
 
-Scry 1.0.0 may be built directly from the source repository with a recent stable
+Scry may be built directly from the source repository with a recent stable
 Rust toolchain:
 
 ```sh
 git clone https://github.com/ferusx/scry-tui-file-browser.git
 cd scry-tui-file-browser
-git checkout v1.0.0
+git checkout v1.0.2
 cargo build --release
 ```
 
