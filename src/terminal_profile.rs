@@ -28,7 +28,7 @@ impl TerminalProfile {
     }
 }
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 fn system_console_is_active() -> bool {
     use std::ffi::CStr;
 
@@ -42,10 +42,20 @@ fn system_console_is_active() -> bool {
 
     let terminal_name = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy();
 
-    terminal_name == "/dev/console" || terminal_name.starts_with("/dev/ttyv")
+    match std::env::consts::OS {
+        "freebsd" => terminal_name == "/dev/console" || terminal_name.starts_with("/dev/ttyv"),
+
+        "netbsd" => {
+            terminal_name == "/dev/console"
+                || terminal_name == "/dev/constty"
+                || terminal_name.starts_with("/dev/ttyE")
+        }
+
+        _ => false,
+    }
 }
 
-#[cfg(not(target_os = "freebsd"))]
+#[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
 fn system_console_is_active() -> bool {
     false
 }

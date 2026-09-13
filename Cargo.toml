@@ -1,8 +1,10 @@
 [package]
 name = "scry"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 license = "BSD-3-Clause"
+description = "A fast terminal filesystem browser and recursive finder with SSH to browse remote filesystems"
+repository = "https://github.com/ferusx/scry-tui-file-browser"
 
 [dependencies]
 bincode = { version = "2", features = ["serde"] }

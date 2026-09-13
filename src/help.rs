@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::io::{self, Write};
-
 use ratatui::{
     layout::Alignment,
     style::{Modifier, Style},
@@ -980,29 +978,7 @@ pub fn content(theme: &Theme, text_width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/*
- * Print the same document used by the F1 Help window as plain text.
- *
- * Styling is deliberately discarded. The resulting output is safe to redirect
- * into files, pipe through pagers, or open in an external text editor.
- */
-pub fn print_manual(theme: &Theme, text_width: usize) -> io::Result<()> {
-    let lines = content(theme, text_width);
 
-    let stdout = io::stdout();
-
-    let mut output = stdout.lock();
-
-    for line in lines {
-        for span in line.spans {
-            write!(output, "{}", span.content)?;
-        }
-
-        writeln!(output)?;
-    }
-
-    Ok(())
-}
 
 fn push_title(lines: &mut Vec<Line<'static>>, title: &str, theme: &Theme) {
     /*

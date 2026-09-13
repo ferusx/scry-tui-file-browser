@@ -37,6 +37,7 @@ mod terminal_profile;
 mod themes;
 mod ui;
 mod ui_state;
+mod manual;
 
 use app::{
     App, DeletionChoice, EntryFilter, RemoteIndexDialogFocus, TreeExpandAllDialogFocus,
@@ -58,7 +59,7 @@ use crossterm::{
 use ratatui::layout::Rect;
 use session::{SessionSource, SessionState};
 use ssh::{SftpSource, SshTarget};
-use std::io::{self, IsTerminal, stdout};
+use std::io::{self, stdout};
 use std::time::{Duration, Instant};
 use terminal_profile::TerminalProfile;
 
@@ -339,23 +340,39 @@ fn main() -> io::Result<()> {
          * uses a stable readable width so the resulting file does not depend on an
          * unavailable or unusually narrow terminal.
          */
-        let text_width = if io::stdout().is_terminal() {
-            crossterm::terminal::size()
-                .map(|(width, _)| width.saturating_sub(4).clamp(40, 100) as usize)
-                .unwrap_or(78)
-        } else {
-            78
-        };
 
         let theme = crate::themes::Theme::load(&config.theme);
 
-        help::print_manual(&theme, text_width)?;
+        manual::print_manual(&theme)?;
 
         return Ok(());
     }
 
     if cli.help {
-        external_help::print_help()?;
+        manual::print_help()?;
+
+        return Ok(());
+    }
+
+    #[cfg(target_os = "netbsd")]
+    if terminal_profile.is_console() {
+        execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0),)?;
+
+        let unsupported_result = ratatui::run(run_netbsd_console_unsupported_screen);
+
+        /*
+         * Return a clean system console to the shell after the startup gate.
+         */
+        let cleanup_result = execute!(
+            stdout(),
+            cursor::Show,
+            Clear(ClearType::All),
+            cursor::MoveTo(0, 0),
+        );
+
+        unsupported_result?;
+
+        cleanup_result?;
 
         return Ok(());
     }
@@ -801,6 +818,27 @@ fn run_console_setup_screen(terminal: &mut ratatui::DefaultTerminal) -> io::Resu
 
             Event::Resize(_, _) => {
                 terminal.draw(ui::render_console_setup)?;
+            }
+
+            _ => {}
+        }
+    }
+}
+
+#[cfg(target_os = "netbsd")]
+fn run_netbsd_console_unsupported_screen(
+    terminal: &mut ratatui::DefaultTerminal,
+) -> io::Result<()> {
+    terminal.draw(ui::render_netbsd_console_unsupported)?;
+
+    loop {
+        match event::read()? {
+            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                return Ok(());
+            }
+
+            Event::Resize(_, _) => {
+                terminal.draw(ui::render_netbsd_console_unsupported)?;
             }
 
             _ => {}

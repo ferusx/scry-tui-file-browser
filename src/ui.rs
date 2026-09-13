@@ -300,6 +300,133 @@ fn console_setup_logo_lines() -> Vec<Line<'static>> {
         .collect()
 }
 
+#[cfg(target_os = "netbsd")]
+fn netbsd_console_logo_lines() -> Vec<Line<'static>> {
+    const LOGO: &[&str] = &[
+        " SSS   CCC   RRR   Y   Y",
+        "S     C      R  R   Y Y ",
+        " SS   C      RRR     Y  ",
+        "   S  C      R R     Y  ",
+        "SSS    CCC   R  R    Y  ",
+    ];
+
+    LOGO.iter()
+        .map(|text| {
+            Line::styled(
+                (*text).to_string(),
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "netbsd")]
+pub fn render_netbsd_console_unsupported(frame: &mut Frame) {
+    let area = frame.area();
+
+    frame.render_widget(Clear, area);
+
+    frame.render_widget(
+        Block::default().style(Style::default().fg(Color::Gray).bg(Color::Black)),
+        area,
+    );
+
+    let mut lines = netbsd_console_logo_lines();
+
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "NetBSD system console is not supported",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "The NetBSD system console does not provide the terminal",
+            Style::default().fg(Color::Gray),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(
+        Line::styled(
+            "environment required by Scry's interactive interface.",
+            Style::default().fg(Color::Gray),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Scry can run on NetBSD in a terminal emulator under X",
+            Style::default().fg(Color::Gray),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(
+        Line::styled(
+            "or through an SSH session.",
+            Style::default().fg(Color::Gray),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Run Scry under X or via SSH instead.",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    lines.push(Line::raw(""));
+
+    lines.push(
+        Line::styled(
+            "Press any key to exit.",
+            Style::default().fg(Color::LightMagenta),
+        )
+        .alignment(Alignment::Center),
+    );
+
+    let content_height = lines.len().min(u16::MAX as usize) as u16;
+
+    let message_area = Rect {
+        x: area.x,
+
+        y: area
+            .y
+            .saturating_add(area.height.saturating_sub(content_height) / 2),
+
+        width: area.width,
+
+        height: content_height.min(area.height),
+    };
+
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        message_area,
+    );
+}
+
 /*
  * Explain the required shell handoff before an unconfigured console launch.
  *
@@ -5585,7 +5712,7 @@ fn render_legend_overlay(frame: &mut Frame, app: &mut App, area: Rect) -> Option
             ("F3", "Exit at the selected directory"),
             ("F11", "Go to the source home directory"),
             ("Alt+B / Alt+F", "Move left or right in the search field"),
-            ("Alt+Z / Alt+X", "horizontal scrolling"),
+            ("Alt+Z / Alt+X", "Scroll horizontally"),
             (
                 "Ctrl+A / Ctrl+E",
                 "Move to the start or end of the search field",
