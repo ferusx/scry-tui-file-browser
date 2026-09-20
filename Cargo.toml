@@ -1,6 +1,6 @@
 [package]
 name = "scry"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 license = "BSD-3-Clause"
 description = "A fast terminal filesystem browser and recursive finder with SSH to browse remote filesystems"
