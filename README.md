@@ -213,14 +213,30 @@ cargo build
 target/debug/scry
 ```
 
-### Icon font
+### Terminal font and icons
 
-Scry's optional file and directory icons use Nerd Font glyphs. For the intended
-appearance, configure the terminal emulator to use a
-[Nerd Font](https://www.nerdfonts.com/)-compatible font.
+Scry does not require a Nerd Font for its normal interface, but it does require a
+Unicode-capable monospace font with proper box-drawing support.
 
-Icons may be enabled or disabled at runtime with `F3` and through
-`show_icons` in `scry.toml`. Scry remains fully usable without icon support.
+A [Nerd Font](https://www.nerdfonts.com/) is strongly recommended and is required
+when Scry's optional file and directory icons are enabled. Icons may be toggled
+at runtime with `F3` and through `show_icons` in `scry.toml`.
+
+If borders, separators, arrows, icons, or other interface characters appear as
+diamonds, replacement symbols, malformed glyphs, or otherwise display
+incorrectly, select a [Nerd Font](https://www.nerdfonts.com/) or another monospace
+font with complete Unicode box-drawing support in the terminal emulator.
+
+Scry remains fully usable without Nerd Font icon support when a suitable
+Unicode-capable monospace font is used.
+
+<p align="center">
+  <img src="screenshots/scry-unsupported-font.png" alt="Scry rendered with an unsuitable terminal font, showing malformed interface glyphs" width="95%">
+</p>
+
+<p align="center">
+  <em>Example of Scry rendered with an unsuitable terminal font.</em>
+</p>
 
 ## FreeBSD system-console integration
 

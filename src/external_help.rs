@@ -187,3 +187,4 @@ pub fn print_console_config() -> io::Result<()> {
 
     output.flush()
 }
+

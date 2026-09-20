@@ -56,7 +56,7 @@ const COLOR_TREE_POLICY: Color = Color::Rgb(90, 205, 130);
  * Below this geometry the ordinary interface is replaced by a resize notice
  * rather than allowing panels and text to overlap or truncate unpredictably.
  */
-pub const MIN_TERMINAL_WIDTH: u16 = 100; // 110
+pub const MIN_TERMINAL_WIDTH: u16 = 110;
 
 pub const MIN_TERMINAL_HEIGHT: u16 = 22;
 
