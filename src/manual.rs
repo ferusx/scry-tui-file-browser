@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use std::env;
+use std::ffi::CStr;
 use std::io::{self, IsTerminal, Write};
 use crossterm::terminal;
 use ratatui::{
@@ -186,6 +187,25 @@ pub fn print_manual(
     Ok(())
 }
 
+fn use_ascii_frame() -> bool {
+    if env::consts::OS != "netbsd" || !io::stdout().is_terminal() {
+        return false;
+    }
+
+    let tty_name = unsafe { libc::ttyname(libc::STDOUT_FILENO) };
+
+    if tty_name.is_null() {
+        return false;
+    }
+
+    let tty_path = unsafe { CStr::from_ptr(tty_name) }
+        .to_string_lossy();
+
+    tty_path.starts_with("/dev/ttyE")
+        || tty_path == "/dev/console"
+        || tty_path == "/dev/constty"
+}
+
 fn colors_enabled() -> bool {
     io::stdout().is_terminal()
         && env::var_os("NO_COLOR").is_none()
@@ -195,24 +215,42 @@ fn print_top_border(
     width: usize,
     colors_enabled: bool,
 ) {
-    println!(
-        "{}┌{}┐{}",
-        border_color(colors_enabled),
-        "─".repeat(width + 4),
-        reset(colors_enabled),
-    );
+    if use_ascii_frame() {
+        println!(
+            "{}+{}+{}",
+            border_color(colors_enabled),
+            "-".repeat(width + 4),
+            reset(colors_enabled),
+        );
+    } else {
+        println!(
+            "{}┌{}┐{}",
+            border_color(colors_enabled),
+            "─".repeat(width + 4),
+            reset(colors_enabled),
+        );
+    }
 }
 
 fn print_bottom_border(
     width: usize,
     colors_enabled: bool,
 ) {
-    println!(
-        "{}└{}┘{}",
-        border_color(colors_enabled),
-        "─".repeat(width + 4),
-        reset(colors_enabled),
-    );
+    if use_ascii_frame() {
+        println!(
+            "{}+{}+{}",
+            border_color(colors_enabled),
+            "-".repeat(width + 4),
+            reset(colors_enabled),
+        );
+    } else {
+        println!(
+            "{}└{}┘{}",
+            border_color(colors_enabled),
+            "─".repeat(width + 4),
+            reset(colors_enabled),
+        );
+    }
 }
 
 fn print_help_line(
@@ -223,12 +261,15 @@ fn print_help_line(
 ) -> io::Result<()> {
     let stdout = io::stdout();
 
+    let border = if use_ascii_frame() { "|" } else { "│" };
+
     let mut output = stdout.lock();
 
     write!(
         output,
-        "{}│{}  ",
+        "{}{}{}  ",
         border_color(colors_enabled),
+        border,
         reset(colors_enabled),
     )?;
 
@@ -288,8 +329,9 @@ fn print_help_line(
 
     write!(
         output,
-        "  {}│{}",
+        "  {}{}{}",
         border_color(colors_enabled),
+        border,
         reset(colors_enabled),
     )?;
 
@@ -570,11 +612,11 @@ fn print_options_table(
     println!(
         "{}",
         palette.frame(&table_border(
-            '┌',
-            '┬',
-            '┐',
-            &[short_width, long_width, description_width,],
-        ),),
+            if use_ascii_frame() { '+' } else { '┌' },
+            if use_ascii_frame() { '+' } else { '┬' },
+            if use_ascii_frame() { '+' } else { '┐' },
+            &[short_width, long_width, description_width],
+        ))
     );
 
     print_three_column_row(palette, "short", "long", "description", widths, true);
@@ -582,11 +624,11 @@ fn print_options_table(
     println!(
         "{}",
         palette.frame(&table_border(
-            '├',
-            '┼',
-            '┤',
-            &[short_width, long_width, description_width,],
-        ),),
+            if use_ascii_frame() { '+' } else { '├' },
+            if use_ascii_frame() { '+' } else { '┼' },
+            if use_ascii_frame() { '+' } else { '┤' },
+            &[short_width, long_width, description_width],
+        ))
     );
 
     for option in OPTIONS {
@@ -603,11 +645,11 @@ fn print_options_table(
     println!(
         "{}",
         palette.frame(&table_border(
-            '└',
-            '┴',
-            '┘',
-            &[short_width, long_width, description_width,],
-        ),),
+            if use_ascii_frame() { '+' } else { '└' },
+            if use_ascii_frame() { '+' } else { '┴' },
+            if use_ascii_frame() { '+' } else { '┘' },
+            &[short_width, long_width, description_width],
+        ))
     );
 }
 
@@ -645,15 +687,17 @@ fn print_three_column_row(
         palette.text(&third)
     };
 
+    let vertical = if use_ascii_frame() { "|" } else { "│" };
+
     println!(
         "{} {} {} {} {} {} {}",
-        palette.frame("│"),
+        palette.frame(vertical),
         first,
-        palette.frame("│"),
+        palette.frame(vertical),
         second,
-        palette.frame("│"),
+        palette.frame(vertical),
         third,
-        palette.frame("│"),
+        palette.frame(vertical),
     );
 }
 
@@ -671,16 +715,20 @@ fn print_examples_table(
     }
 }
 
-fn table_border(left: char, junction: char, right: char, widths: &[usize]) -> String {
+fn table_border(
+    left: char,
+    junction: char,
+    right: char,
+    widths: &[usize],
+) -> String {
     let mut result = String::new();
+
+    let horizontal = if use_ascii_frame() { "-" } else { "─" };
 
     result.push(left);
 
     for (index, width) in widths.iter().enumerate() {
-        /*
-         * Two extra cells account for the spaces surrounding each value.
-         */
-        result.push_str(&"─".repeat(width.saturating_add(2)));
+        result.push_str(&horizontal.repeat(width.saturating_add(2)));
 
         if index + 1 == widths.len() {
             result.push(right);
