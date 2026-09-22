@@ -78,7 +78,7 @@ pub struct Cli {
      */
     #[arg(
         long = "console-config",
-        help = "Print console shell-integration instructions"
+        help = "Print platform-specific console integration information"
     )]
     pub console_config: bool,
 

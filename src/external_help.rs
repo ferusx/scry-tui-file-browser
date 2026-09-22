@@ -174,8 +174,10 @@ pub const EXAMPLES: &[HelpExample] = &[
     },
 ];
 
+#[cfg(target_os = "freebsd")]
 const CONSOLE_CONFIG: &str = include_str!("../docs/SHELL_INTEGRATION.txt");
 
+#[cfg(target_os = "freebsd")]
 pub fn print_console_config() -> io::Result<()> {
     let mut output = io::stdout().lock();
 
@@ -184,6 +186,56 @@ pub fn print_console_config() -> io::Result<()> {
     if !CONSOLE_CONFIG.ends_with('\n') {
         output.write_all(b"\n")?;
     }
+
+    output.flush()
+}
+
+#[cfg(target_os = "netbsd")]
+pub fn print_console_config() -> io::Result<()> {
+    let mut output = io::stdout().lock();
+
+    writeln!(
+        output,
+        "Scry does not support the NetBSD physical console."
+    )?;
+
+    writeln!(output)?;
+
+    writeln!(
+        output,
+        "Run Scry under X or via SSH instead."
+    )?;
+
+    writeln!(output)?;
+
+    writeln!(
+        output,
+        "The --console-config option provides FreeBSD system-console"
+    )?;
+
+    writeln!(
+        output,
+        "shell-integration instructions on FreeBSD builds."
+    )?;
+
+    output.flush()
+}
+
+#[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+pub fn print_console_config() -> io::Result<()> {
+    let mut output = io::stdout().lock();
+
+    writeln!(
+        output,
+        "Scry console shell integration is currently intended for FreeBSD."
+    )?;
+
+    writeln!(output)?;
+
+    writeln!(
+        output,
+        "The --console-config guide applies to FreeBSD system-console use."
+    )?;
 
     output.flush()
 }
