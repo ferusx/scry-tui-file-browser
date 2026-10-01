@@ -174,10 +174,10 @@ pub const EXAMPLES: &[HelpExample] = &[
     },
 ];
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
 const CONSOLE_CONFIG: &str = include_str!("../docs/SHELL_INTEGRATION.txt");
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
 pub fn print_console_config() -> io::Result<()> {
     let mut output = io::stdout().lock();
 
@@ -190,13 +190,14 @@ pub fn print_console_config() -> io::Result<()> {
     output.flush()
 }
 
-#[cfg(target_os = "netbsd")]
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
 pub fn print_console_config() -> io::Result<()> {
     let mut output = io::stdout().lock();
 
     writeln!(
         output,
-        "Scry does not support the NetBSD physical console."
+        "Scry does not support the {} physical console.",
+        os_name
     )?;
 
     writeln!(output)?;
@@ -210,31 +211,36 @@ pub fn print_console_config() -> io::Result<()> {
 
     writeln!(
         output,
-        "The --console-config option provides FreeBSD system-console"
+        "The --console-config option provides shell-integration instructions"
     )?;
 
     writeln!(
         output,
-        "shell-integration instructions on FreeBSD builds."
+        "on FreeBSD and Linux builds, where physical-console mode is supported."
     )?;
 
     output.flush()
 }
 
-#[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
 pub fn print_console_config() -> io::Result<()> {
     let mut output = io::stdout().lock();
 
     writeln!(
         output,
-        "Scry console shell integration is currently intended for FreeBSD."
+        "Scry console shell integration is supported on FreeBSD and Linux."
     )?;
 
     writeln!(output)?;
 
     writeln!(
         output,
-        "The --console-config guide applies to FreeBSD system-console use."
+        "This build does not provide a supported physical-console integration target."
     )?;
 
     output.flush()

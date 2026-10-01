@@ -384,10 +384,7 @@ fn main() -> io::Result<()> {
      * --console-config, and configuration generation remain available without
      * the helper.
      */
-    if cfg!(target_os = "freebsd")
-        && terminal_profile.is_console()
-        && shell_handoff_path.is_none()
-    {
+    if terminal_profile.is_console() && shell_handoff_path.is_none() {
         execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0),)?;
 
         let setup_result = ratatui::run(run_console_setup_screen);

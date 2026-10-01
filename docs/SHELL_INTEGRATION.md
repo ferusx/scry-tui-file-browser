@@ -1,8 +1,12 @@
 # Scry Console Shell Integration
 
-Scry can browse and search files directly on a FreeBSD system console. Shell
+Scry can browse and search files directly on supported physical consoles:
+**FreeBSD and Linux** (Alpine, Arch, Debian, openSUSE, and Void). Shell
 integration adds the ability to leave Scry in the directory selected during
 that session.
+
+NetBSD and OpenBSD physical consoles are not supported. Run Scry under X or via
+SSH on those systems instead.
 
 ## Why shell integration is required
 
@@ -25,7 +29,7 @@ startup file.
 
 ## Console actions
 
-With shell integration enabled on the FreeBSD system console:
+With shell integration enabled on a supported FreeBSD or Linux physical console:
 
 | Action | Result |
 | --- | --- |
@@ -41,25 +45,40 @@ control icons.
 
 ## Installed helper files
 
-The FreeBSD package installs:
+FreeBSD packages install:
 
 ```text
 /usr/local/share/scry/shell/scry.sh
 /usr/local/share/scry/shell/scry.csh
 ```
 
+Linux packages install:
+
+```text
+/usr/share/scry/shell/scry.sh
+/usr/share/scry/shell/scry.csh
+```
+
 Use `scry.sh` with `sh`, `bash`, `ksh`, and `zsh`. Use `scry.csh` with `csh`
 and `tcsh`.
 
-Choose your shell below and add only the shown integration line to its startup
-file. Existing startup content should remain in place.
+Choose your shell below and add only the integration line for your platform to
+its startup file. Existing startup content should remain in place.
 
 ## sh
 
-Add this line to `~/.profile`:
+Add the appropriate line to `~/.profile`.
+
+FreeBSD:
 
 ```sh
 . /usr/local/share/scry/shell/scry.sh
+```
+
+Linux:
+
+```sh
+. /usr/share/scry/shell/scry.sh
 ```
 
 Load it into the current shell:
@@ -70,10 +89,18 @@ Load it into the current shell:
 
 ## bash
 
-Add this line to `~/.bashrc`:
+Add the appropriate line to `~/.bashrc`.
+
+FreeBSD:
 
 ```bash
 . /usr/local/share/scry/shell/scry.sh
+```
+
+Linux:
+
+```bash
+. /usr/share/scry/shell/scry.sh
 ```
 
 Load it into the current shell:
@@ -100,28 +127,40 @@ add this to `~/.profile`:
 export ENV="$HOME/.kshrc"
 ```
 
-Then add this line to `~/.kshrc`:
+Then add the appropriate helper line to `~/.kshrc`.
+
+FreeBSD:
 
 ```ksh
 . /usr/local/share/scry/shell/scry.sh
 ```
 
-Start a new Korn shell after setting `ENV`, or load the helper directly for the
-current shell:
+Linux:
 
 ```ksh
-. /usr/local/share/scry/shell/scry.sh
+. /usr/share/scry/shell/scry.sh
 ```
+
+Start a new Korn shell after setting `ENV`, or load the appropriate helper
+directly for the current shell.
 
 If your Korn shell already uses a different `ENV` file, add the helper line to
 that file instead of replacing the existing setting.
 
 ## zsh
 
-Add this line to `~/.zshrc`:
+Add the appropriate line to `~/.zshrc`.
+
+FreeBSD:
 
 ```zsh
 . /usr/local/share/scry/shell/scry.sh
+```
+
+Linux:
+
+```zsh
+. /usr/share/scry/shell/scry.sh
 ```
 
 Load it into the current shell:
@@ -132,10 +171,18 @@ Load it into the current shell:
 
 ## csh
 
-Add this alias to `~/.cshrc`:
+Add the appropriate alias to `~/.cshrc`.
+
+FreeBSD:
 
 ```csh
 alias scry 'source /usr/local/share/scry/shell/scry.csh \!*'
+```
+
+Linux:
+
+```csh
+alias scry 'source /usr/share/scry/shell/scry.csh \!*'
 ```
 
 Load it into the current shell:
@@ -146,10 +193,18 @@ source ~/.cshrc
 
 ## tcsh
 
-Add this alias to `~/.tcshrc`:
+Add the appropriate alias to `~/.tcshrc`.
+
+FreeBSD:
 
 ```tcsh
 alias scry 'source /usr/local/share/scry/shell/scry.csh \!*'
+```
+
+Linux:
+
+```tcsh
+alias scry 'source /usr/share/scry/shell/scry.csh \!*'
 ```
 
 Load it into the current shell:
@@ -191,12 +246,28 @@ Now launch Scry through the helper:
 scry
 ```
 
-On the FreeBSD system console, select a local file and press Enter. Scry should
-exit and `pwd` should report the file's containing directory. Launch Scry again,
-select a local directory, and press F3. Scry should exit in that directory.
+On a supported FreeBSD or Linux physical console, select a local file and press
+Enter. Scry should exit and `pwd` should report the file's containing directory.
+Launch Scry again, select a local directory, and press F3. Scry should exit in
+that directory.
 
-Launching `/usr/local/bin/scry` directly bypasses the shell helper. Scry can
-still browse in that form, but it cannot change the parent shell directory.
+Launching the executable directly bypasses the shell helper.
+
+FreeBSD:
+
+```text
+/usr/local/bin/scry
+```
+
+Linux:
+
+```text
+/usr/bin/scry
+```
+
+A direct rich-terminal launch continues to work normally. A direct physical-
+console launch cannot change the parent shell directory and Scry will request
+that console shell integration be configured.
 
 ## Command-line arguments
 
@@ -219,19 +290,33 @@ Developers can point either helper at a locally built executable with
 For `sh`, `bash`, `ksh`, or `zsh`, set the variable before sourcing `scry.sh`:
 
 ```sh
-SCRY_BINARY="$HOME/bsd_tools/scry/target/release/scry"
-. "$HOME/bsd_tools/scry/shell/scry.sh"
+SCRY_BINARY="$HOME/src/scry/target/release/scry"
+```
+
+Then source the helper for the current platform.
+
+FreeBSD:
+
+```sh
+. /usr/local/share/scry/shell/scry.sh
+```
+
+Linux:
+
+```sh
+. /usr/share/scry/shell/scry.sh
 ```
 
 For `csh` or `tcsh`:
 
 ```csh
-setenv SCRY_BINARY "$HOME/bsd_tools/scry/target/release/scry"
-alias scry 'source "$HOME/bsd_tools/scry/shell/scry.csh" \!*'
+setenv SCRY_BINARY "$HOME/src/scry/target/release/scry"
 ```
 
-`SCRY_BINARY` is not needed for the installed FreeBSD package. Remove that
-development setting after switching to the packaged executable.
+Then use the normal csh/tcsh alias for the current platform.
+
+`SCRY_BINARY` is not needed for an installed package. Remove that development
+setting after switching to the packaged executable.
 
 ## Remote browsing
 
@@ -248,13 +333,14 @@ then share that computer's local filesystem.
 ### Scry says to launch through its shell helper
 
 The executable was launched directly or the helper was not loaded. Reload the
-appropriate startup file and run `scry`, not `/usr/local/bin/scry`.
+appropriate startup file and run `scry` through the shell function or alias,
+not the executable path directly.
 
 ### Enter on a file does not leave Scry
 
-Confirm that you are on the FreeBSD system console and that `scry` resolves to
-the function or alias described under **Verify the integration**. Rich-terminal
-file activation remains unchanged intentionally.
+Confirm that you are on a supported FreeBSD or Linux physical console and that
+`scry` resolves to the function or alias described under **Verify the
+integration**. Rich-terminal file activation remains unchanged intentionally.
 
 ### F3 does nothing
 
@@ -268,14 +354,14 @@ Unix LF line endings and reload the shell configuration.
 
 ### A development binary produces `Exec format error`
 
-Rebuild it on FreeBSD with:
+Rebuild it on the target system with:
 
 ```text
 cargo build --release
 ```
 
-Then confirm that `target/release/scry` is a native FreeBSD executable before
-using it through `SCRY_BINARY`.
+Then confirm that `target/release/scry` is a native executable for that system
+before using it through `SCRY_BINARY`.
 
 ## Remove the integration
 

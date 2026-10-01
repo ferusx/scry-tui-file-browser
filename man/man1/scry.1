@@ -67,7 +67,7 @@ The generated file must be reviewed and manually renamed to \fBscry.toml\fP befo
 
 .TP
 .BR \-\-console\-config
-Print the complete setup instructions for FreeBSD Console Mode and exit.
+Print the complete setup instructions for supported physical-console shell integration and exit.
 
 This command explains how to install and activate the appropriate shell helper. It does not install files, modify shell startup configuration, or enable Console Mode by itself. See the \fBCONSOLE MODE\fP section for its behavior, controls, and shell-integration requirements.
 
@@ -445,10 +445,9 @@ Clickable controls are available in the main interface and in applicable dialogs
 .SH "CONSOLE MODE"
 
 .TP
-On FreeBSD, \fBScry\fP automatically enters Console Mode when its output terminal is \fB/dev/console\fP or a \fB/dev/ttyv*\fP virtual terminal. Terminal emulators continue to use Rich Mode. No command-line option or configuration setting is required to select either mode.
-
+On FreeBSD and Linux, \fBScry\fP automatically enters Console Mode when it detects a supported physical system console. On FreeBSD this includes \fB/dev/console\fP and \fB/dev/ttyv*\fP virtual terminals. On Linux this includes \fB/dev/console\fP and numbered virtual terminals such as \fB/dev/tty1\fP. Terminal emulators continue to use Rich Mode. No command-line option or configuration setting is required to select either mode.
 .TP
-Console Mode adapts \fBScry\fP to the capabilities and workflow of the FreeBSD system console. It uses a dedicated ANSI 16-color palette, disables file and directory icons, and replaces external file opening with shell-directory handoff actions. These changes apply only in Console Mode and do not alter Rich Mode behavior.
+Console Mode adapts \fBScry\fP to the capabilities and workflow of supported physical system consoles. It uses a dedicated ANSI 16-color palette, disables file and directory icons, and replaces external file opening with shell-directory handoff actions. These changes apply only in Console Mode and do not alter Rich Mode behavior.
 
 .TP
 .TP
@@ -493,8 +492,7 @@ Packaged installations may place the helpers beneath their installation prefix a
 .fi
 
 .TP
-The exact prefix is determined by the package or installation method. On FreeBSD, the conventional local prefix is \fB/usr/local\fP.
-
+The exact prefix is determined by the package or installation method. Packaged FreeBSD installations conventionally use \fB/usr/local\fP, while packaged Linux installations conventionally use \fB/usr\fP.
 .SS "MANUAL INSTALLATION"
 
 .TP
@@ -581,33 +579,30 @@ During an SSH session, it is the remote user's home directory.
 .BR Alt+B " / " Alt+F
 Move the search-field caret one character left or right.
 
-These Console Mode shortcuts replace \fBCtrl+Left\fP and \fBCtrl+Right\fP, whose Control modifier is not preserved by the FreeBSD system console.
-
+These Console Mode shortcuts provide an alternative to \fBCtrl+Left\fP and \fBCtrl+Right\fP. They are required on the FreeBSD system console, where the Control modifier is not preserved for those keys.
 
 .TP
 .BR Alt+Z " / " Alt+X
 Scroll horizontally left or right.
 
-These Console Mode shortcuts replace \fBShift+Left\fP and \fBShift+Right\fP, whose Shift modifier is not preserved by the FreeBSD system console.
+These Console Mode shortcuts provide an alternative to \fBShift+Left\fP and \fBShift+Right\fP. They are required on the FreeBSD system console, where the Shift modifier is not preserved for those keys.
 
 .TP
 .BR Ctrl+A " / " Ctrl+E
 Move the search-field caret to the beginning or end of the query.
 
-These Console Mode shortcuts replace \fBCtrl+Home\fP and \fBCtrl+End\fP, whose Control modifier is not preserved by the FreeBSD system console.
-
+These Console Mode shortcuts provide an alternative to \fBCtrl+Home\fP and \fBCtrl+End\fP. They are required on the FreeBSD system console, where the Control modifier is not preserved for those keys.
 .TP
 .BR Ctrl+K " / " Ctrl+J
 Move ten visible pages upward or downward through the result listing.
 
-These Console Mode shortcuts replace \fBCtrl+PageUp\fP and \fBCtrl+PageDown\fP, whose Control modifier is not preserved by the FreeBSD system console.
-
+These Console Mode shortcuts provide an alternative to \fBCtrl+PageUp\fP and \fBCtrl+PageDown\fP. They are required on the FreeBSD system console, where the Control modifier is not preserved for those keys.
 .TP
 .BR Ctrl+L
 .RS
 Clear the physical terminal and redraw the complete \fBScry\fP interface.
 
-This removes output written over the interface by background processes, system services, or the FreeBSD console logger.
+This removes output written over the interface by background processes, system services, or console messages.
 .RE
 
 .TP
@@ -625,7 +620,7 @@ All shortcuts not overridden above retain the meanings described in the \fBINTER
 .SS "CONSOLE DISPLAY"
 
 .TP
-Console Mode uses a fixed ANSI 16-color palette designed for the FreeBSD system console. The configured Rich Mode theme does not replace this console palette.
+Console Mode uses a fixed ANSI 16-color palette intended for physical system consoles. The configured Rich Mode theme does not replace this console palette.
 
 .TP
 File and directory icons are disabled because the physical console cannot be assumed to provide the required icon font. F3 is therefore available for the directory-handoff action described above.
@@ -2602,16 +2597,20 @@ Cached remote files are arranged by remote host, account, port, and source path 
 .PP
 \fB/usr/local/share/scry/shell/scry.sh\fP
 \fB/usr/local/share/scry/shell/scry.csh\fP
+\fB/usr/share/scry/shell/scry.sh\fP
+\fB/usr/share/scry/shell/scry.csh\fP
 .fi
 
 .RS
-Optional shell helpers for Console Mode. The first supports sh, bash, zsh, and compatible shells; the second supports csh and tcsh.
+Optional shell helpers for Console Mode. FreeBSD packages conventionally install beneath \fB/usr/local/share\fP and Linux packages beneath \fB/usr/share\fP. The first helper supports sh, bash, ksh, zsh, and compatible shells; the second supports csh and tcsh.
 .RE
 
 .nf
 .PP
 \fB/usr/local/share/doc/scry/SHELL_INTEGRATION.txt\fP
 \fB/usr/local/share/doc/scry/SHELL_INTEGRATION.md\fP
+\fB/usr/share/doc/scry/SHELL_INTEGRATION.txt\fP
+\fB/usr/share/doc/scry/SHELL_INTEGRATION.md\fP
 .fi
 
 .RS
