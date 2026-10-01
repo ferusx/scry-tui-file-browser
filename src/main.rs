@@ -354,24 +354,24 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    #[cfg(target_os = "netbsd")]
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
     if terminal_profile.is_console() {
         execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0),)?;
 
-        let unsupported_result = ratatui::run(run_netbsd_console_unsupported_screen);
+        let unsupported_result =
+            ratatui::run(run_unsupported_console_screen);
 
         /*
          * Return a clean system console to the shell after the startup gate.
          */
         let cleanup_result = execute!(
-            stdout(),
-            cursor::Show,
-            Clear(ClearType::All),
-            cursor::MoveTo(0, 0),
-        );
+        stdout(),
+        cursor::Show,
+        Clear(ClearType::All),
+        cursor::MoveTo(0, 0),
+    );
 
         unsupported_result?;
-
         cleanup_result?;
 
         return Ok(());
@@ -384,7 +384,10 @@ fn main() -> io::Result<()> {
      * --console-config, and configuration generation remain available without
      * the helper.
      */
-    if terminal_profile.is_console() && shell_handoff_path.is_none() {
+    if cfg!(target_os = "freebsd")
+        && terminal_profile.is_console()
+        && shell_handoff_path.is_none()
+    {
         execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0),)?;
 
         let setup_result = ratatui::run(run_console_setup_screen);
@@ -825,11 +828,11 @@ fn run_console_setup_screen(terminal: &mut ratatui::DefaultTerminal) -> io::Resu
     }
 }
 
-#[cfg(target_os = "netbsd")]
-fn run_netbsd_console_unsupported_screen(
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+fn run_unsupported_console_screen(
     terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<()> {
-    terminal.draw(ui::render_netbsd_console_unsupported)?;
+    terminal.draw(ui::render_unsupported_console)?;
 
     loop {
         match event::read()? {
@@ -838,7 +841,7 @@ fn run_netbsd_console_unsupported_screen(
             }
 
             Event::Resize(_, _) => {
-                terminal.draw(ui::render_netbsd_console_unsupported)?;
+                terminal.draw(ui::render_unsupported_console)?;
             }
 
             _ => {}
