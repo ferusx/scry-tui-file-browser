@@ -300,8 +300,8 @@ fn console_setup_logo_lines() -> Vec<Line<'static>> {
         .collect()
 }
 
-#[cfg(target_os = "netbsd")]
-fn netbsd_console_logo_lines() -> Vec<Line<'static>> {
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+fn unsupported_console_logo_lines() -> Vec<Line<'static>> {
     const LOGO: &[&str] = &[
         " SSS   CCC   RRR   Y   Y",
         "S     C      R  R   Y Y ",
@@ -323,9 +323,15 @@ fn netbsd_console_logo_lines() -> Vec<Line<'static>> {
         .collect()
 }
 
-#[cfg(target_os = "netbsd")]
-pub fn render_netbsd_console_unsupported(frame: &mut Frame) {
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+pub fn render_unsupported_console(frame: &mut Frame) {
     let area = frame.area();
+
+    let os_name = if cfg!(target_os = "openbsd") {
+        "OpenBSD"
+    } else {
+        "NetBSD"
+    };
 
     frame.render_widget(Clear, area);
 
@@ -334,14 +340,14 @@ pub fn render_netbsd_console_unsupported(frame: &mut Frame) {
         area,
     );
 
-    let mut lines = netbsd_console_logo_lines();
+    let mut lines = unsupported_console_logo_lines();
 
     lines.push(Line::raw(""));
     lines.push(Line::raw(""));
 
     lines.push(
         Line::styled(
-            "NetBSD system console is not supported",
+            format!("{os_name} system console is not supported"),
             Style::default()
                 .fg(Color::LightMagenta)
                 .add_modifier(Modifier::BOLD),
@@ -353,7 +359,7 @@ pub fn render_netbsd_console_unsupported(frame: &mut Frame) {
 
     lines.push(
         Line::styled(
-            "The NetBSD system console does not provide the terminal",
+            format!("The {os_name} system console does not provide the terminal"),
             Style::default().fg(Color::Gray),
         )
         .alignment(Alignment::Center),
@@ -371,7 +377,7 @@ pub fn render_netbsd_console_unsupported(frame: &mut Frame) {
 
     lines.push(
         Line::styled(
-            "Scry can run on NetBSD in a terminal emulator under X",
+            format!("Scry can run on {os_name} in a terminal emulator under X"),
             Style::default().fg(Color::Gray),
         )
         .alignment(Alignment::Center),
@@ -1115,6 +1121,7 @@ fn render_details(frame: &mut Frame, app: &mut App, area: Rect) {
         first_row[0],
         &entry,
         app.show_icons,
+        app.console_mode(),
         name_color,
         &theme,
     );
@@ -1186,12 +1193,13 @@ fn render_detail_name(
     area: Rect,
     entry: &FileEntry,
     show_icons: bool,
+    console_mode: bool,
     name_color: Color,
     theme: &Theme,
 ) {
     let mut spans = vec![Span::styled(" Name: ", Style::default().fg(theme.ui.muted))];
 
-    if show_icons {
+    if show_icons && !console_mode {
         spans.push(Span::styled(
             format!("{} ", file_icon(entry)),
             Style::default().fg(file_icon_color(entry, theme)),
@@ -2812,7 +2820,7 @@ fn entry_list_item(
         Style::default().fg(structural_color),
     )];
 
-    if show_icons {
+    if show_icons && !console_mode {
         spans.push(Span::styled(
             format!("{} ", file_icon(entry)),
             Style::default().fg(file_icon_color(entry, theme)),
