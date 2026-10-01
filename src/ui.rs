@@ -2618,7 +2618,7 @@ fn tree_list_item(
         Style::default().fg(structural_color),
     ));
 
-    if show_icons {
+    if show_icons && !console_mode {
         spans.push(Span::styled(
             format!("{} ", file_icon(&row.entry)),
             file_icon_color(&row.entry, theme),
