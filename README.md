@@ -70,7 +70,7 @@ interface.
 - Documented configuration generation with `--generate-config`
 - Concise external help through `--help`
 - Complete printable manual through `--manual`
-- Linux and FreeBSD support
+- Supports multiple UNIX-like systems
 
 ## Screenshots
 
@@ -176,7 +176,169 @@ When the terminal falls below Scry’s minimum usable size, the interface is rep
   <img src="screenshots/scry-resize.png" alt="Scry displaying the minimum size screen" width="95%">
 </p>
 
-## Building
+## Installation
+
+### Prebuilt packages
+
+Prebuilt **Scry** packages are available for:
+
+- Alpine Linux (x86_64)
+- Arch Linux (x86_64)
+- Debian (amd64)
+- FreeBSD
+- NetBSD
+- OpenBSD
+- openSUSE (x86_64)
+- Void Linux (x86_64)
+
+Packages are available from the [GitHub Releases page](https://github.com/ferusx/scry-tui-file-browser/releases).
+
+**Note:** ***Some installation commands require root privileges. Run those commands as root or using the privilege-elevation method appropriate for your system.***
+
+Installation instructions for each supported package format are provided below. Replace `<version>` in the commands with the version of Scry you want to install.
+
+Signing-key instructions are included where required.
+
+#### Alpine Linux
+
+Download the package and the Scry Alpine signing key:
+
+```sh
+wget https://github.com/ferusx/scry-tui-file-browser/releases/download/v<version>/scry-<version>-r0.apk
+wget -O ferusx-6aaf881d.rsa.pub https://raw.githubusercontent.com/ferusx/package-signing-keys/master/alpine/ferusx-6aaf881d.rsa.pub
+```
+
+Install the signing key:
+
+```sh
+cp ferusx-6aaf881d.rsa.pub /etc/apk/keys/
+```
+
+Install Scry:
+
+```sh
+apk add ./scry-<version>-r0.apk
+```
+
+#### Arch Linux
+
+Download the package:
+
+```sh
+curl -fLO https://github.com/ferusx/scry-tui-file-browser/releases/download/v<version>/scry-<version>-1-x86_64.pkg.tar.zst
+```
+
+Install Scry:
+
+```sh
+pacman -U ./scry-<version>-1-x86_64.pkg.tar.zst
+```
+
+#### Debian
+
+Download the package:
+
+```sh
+wget https://github.com/ferusx/scry-tui-file-browser/releases/download/v<version>/scry_<version>-1_amd64.deb
+```
+
+Install Scry:
+
+```sh
+apt install ./scry_<version>-1_amd64.deb
+```
+
+#### FreeBSD
+
+Download the package:
+
+```sh
+fetch https://github.com/ferusx/scry-tui-file-browser/releases/download/v<version>/scry-freebsd-<version>.pkg
+```
+
+Install Scry:
+
+```sh
+pkg install ./scry-freebsd-<version>.pkg
+```
+
+#### NetBSD
+
+Download the package:
+
+```sh
+ftp https://github.com/ferusx/scry-tui-file-browser/releases/download/v<version>/scry-netbsd-<version>.tgz
+```
+
+Install Scry:
+
+```sh
+pkg_add ./scry-netbsd-<version>.tgz
+```
+
+#### OpenBSD
+
+Download the package and the Scry OpenBSD signing key:
+
+```sh
+ftp https://github.com/ferusx/scry-tui-file-browser/releases/download/v<version>/scry-openbsd-<version>.tgz
+ftp https://raw.githubusercontent.com/ferusx/package-signing-keys/master/openbsd/scry-openbsd-pkg.pub
+```
+
+Install the signing key:
+
+```
+cp scry-openbsd-pkg.pub /etc/signify/
+```
+
+Install Scry:
+
+```sh
+pkg_add ./scry-openbsd-<version>.tgz
+```
+
+#### openSUSE
+
+Download the package and the Scry RPM signing key:
+
+```sh
+curl -fLO https://github.com/ferusx/scry-tui-file-browser/releases/download/v<version>/scry-<version>-1.x86_64.rpm
+curl -fLO https://raw.githubusercontent.com/ferusx/package-signing-keys/master/rpm/ferusx-rpm-signing-public.asc
+```
+
+Import the signing key:
+
+```
+rpm --import ferusx-rpm-signing-public.asc
+```
+
+Install Scry:
+
+```sh
+zypper install ./scry-<version>-1.x86_64.rpm
+```
+
+#### Void Linux
+
+Download the package:
+
+```sh
+curl -fLO https://github.com/ferusx/scry-tui-file-browser/releases/download/v<version>/scry-<version>_1.x86_64.xbps
+```
+
+Create a local package repository containing the downloaded package:
+
+```sh
+xbps-rindex -a "$PWD"/scry-<version>_1.x86_64.xbps
+```
+
+Install Scry from the local repository:
+
+```sh
+xbps-install --repository="$PWD" scry
+```
+
+### Build from source
 
 Scry may be built directly from the source repository with a recent stable
 Rust toolchain:
@@ -184,8 +346,8 @@ Rust toolchain:
 ```sh
 git clone https://github.com/ferusx/scry-tui-file-browser.git
 cd scry-tui-file-browser
-git checkout vX.Y.Z
-cargo build --release
+git checkout v<version>
+cargo build --release --locked
 ```
 
 The optimized binary will be available at:
@@ -203,7 +365,7 @@ Run it directly:
 Or install it into Cargo's binary directory:
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
 During development, the debug binary can be built and run with:
@@ -833,36 +995,6 @@ prevent the application from starting. In such an event, the application will st
 Users can create their own Scry themes by copying one of the existing theme files, renaming the copy, and changing its color values. Starting from an existing theme is recommended because it shows the complete set of available color settings and provides a ready-made example of the expected structure.
 
 Custom themes should be placed in `~/.config/scry/themes` and can then be selected with the top-level theme setting in `scry.toml`.
-
-
-## Platform support
-
-Scry is being developed and tested on:
-
-- Linux
-- FreeBSD
-
-Other Unix-like systems may work but have not yet been tested as thoroughly.
-
-## Project status
-
-Scry is under active development. The following major systems are functional:
-
-- local List and Tree browsing;
-- exact, fuzzy, recursive, and fuzzy-recursive searching;
-- rich query modifiers and source-language classification;
-- background local scans and bounded fuzzy ranking;
-- SSH/SFTP browsing and saved connection profiles;
-- persistent indexed recursive searching over SSH;
-- remote file transfers and private local caching;
-- configurable metadata, icons, startup defaults, and themes;
-- local deletion with confirmation and path-safety checks;
-- internal Help, Shortcut Legend, and About windows;
-- keyboard and mouse operation.
-
-Current refinement work is focused on further Tree-mode performance, adaptive
-presentation, search highlighting, notification behavior, and additional
-quality-of-life controls. Every feature covered in this file is currently working or otherwise clearly stated as not-yet-implemented.
 
 ## Acknowledgements
 
