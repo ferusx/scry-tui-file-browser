@@ -1,0 +1,72 @@
+# Crimson Reactor
+# Strong-color Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#E32636"
+directory = "#FF8A4C"
+file = "#FFF0EA"
+symlink = "#00EFD0"
+muted = "#8B6668"
+error = "#FF203C"
+query = "#FF6A58"
+search_match = "#D94DFF"
+classification = "#FFFFFF"
+date = "#FF9C5A"
+user = "#A77A79"
+size = "#45EFD5"
+
+[frames]
+search = "#FF3C28"
+details = "#E32636"
+metadata = "#FF7A22"
+entries = "#B0002A"
+selection = "#A7D900"
+popup = "#E32636"
+parent_brackets = "#E32636"
+parent_text = "#FFE342"
+
+[selection]
+text = "#FFFFFF"
+background = "#64182A"
+
+[scrollbar]
+thumb = "#F12C42"
+track = "#45141E"
+
+[permissions]
+read = "#8B6668"
+write = "#FF8A4C"
+execute = "#E32636"
+file_type = "#F0DDD9"
+missing = "#583B40"
+special = "#FFE342"
+
+[icons]
+directory = "#C8FF2E"
+symlink = "#00EFD0"
+rust = "#FF5A28"
+python = "#3E92FF"
+shell = "#22E97A"
+source = "#6C7CFF"
+java = "#FF314E"
+javascript = "#FFE52E"
+web = "#FF31C5"
+config = "#00CFC0"
+archive = "#FF7926"
+document = "#EEDBD6"
+spreadsheet = "#27D961"
+presentation = "#FF702F"
+image = "#FF2AD8"
+audio = "#4376FF"
+video = "#983CFF"
+font = "#C264FF"
+database = "#00BFB4"
+log = "#AA8280"
+backup = "#BC4DFF"
+certificate = "#FFD82E"
+disk_image = "#6F75FF"
+torrent = "#25D786"
+desktop_plugin = "#7E58FF"
+binary = "#E0CCC7"
+unknown = "#AD8584"

@@ -1,0 +1,72 @@
+# Toxic Orchid
+# Strong-color Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#E000FF"
+directory = "#8A7CFF"
+file = "#FFF0FF"
+symlink = "#00FFD0"
+muted = "#7D628A"
+error = "#FF3E68"
+query = "#FF5CE1"
+search_match = "#8AFF3D"
+classification = "#FFFFFF"
+date = "#9D8EFF"
+user = "#9A7BA6"
+size = "#3BEFD7"
+
+[frames]
+search = "#FF2ED1"
+details = "#C500FF"
+metadata = "#7E4BFF"
+entries = "#8E00D8"
+selection = "#72D800"
+popup = "#E000FF"
+parent_brackets = "#E000FF"
+parent_text = "#DFFF3D"
+
+[selection]
+text = "#FFFFFF"
+background = "#58156A"
+
+[scrollbar]
+thumb = "#E73CFF"
+track = "#37143D"
+
+[permissions]
+read = "#7D628A"
+write = "#8A7CFF"
+execute = "#FF5CE1"
+file_type = "#EAD7F0"
+missing = "#4E3558"
+special = "#DFFF3D"
+
+[icons]
+directory = "#CFFF2E"
+symlink = "#00FFD0"
+rust = "#FF6338"
+python = "#3E90FF"
+shell = "#20E97A"
+source = "#6D75FF"
+java = "#FF4567"
+javascript = "#FFE72E"
+web = "#FF2ACF"
+config = "#00D0C0"
+archive = "#FF8A32"
+document = "#E7D6ED"
+spreadsheet = "#26D95E"
+presentation = "#FF7A36"
+image = "#FF24E1"
+audio = "#4475FF"
+video = "#A12FFF"
+font = "#C761FF"
+database = "#00BFB7"
+log = "#A388AE"
+backup = "#D13CFF"
+certificate = "#FFD62E"
+disk_image = "#746AFF"
+torrent = "#23D785"
+desktop_plugin = "#8B4EFF"
+binary = "#DAC8E1"
+unknown = "#AE91B7"

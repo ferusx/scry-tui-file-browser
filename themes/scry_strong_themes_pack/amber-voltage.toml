@@ -1,0 +1,72 @@
+# Amber Voltage
+# Strong-color Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#FFB000"
+directory = "#FFD35A"
+file = "#FFF4D6"
+symlink = "#00E8D2"
+muted = "#8E7650"
+error = "#FF4A55"
+query = "#FFD84D"
+search_match = "#FF5EC4"
+classification = "#FFFDF6"
+date = "#FFD36A"
+user = "#A58B5F"
+size = "#50F0DA"
+
+[frames]
+search = "#FFC400"
+details = "#FF8C00"
+metadata = "#E8A400"
+entries = "#D66A00"
+selection = "#9DDB00"
+popup = "#FFB000"
+parent_brackets = "#FFB000"
+parent_text = "#FFF05A"
+
+[selection]
+text = "#FFFDF6"
+background = "#6D3B00"
+
+[scrollbar]
+thumb = "#FFB000"
+track = "#4A2E0C"
+
+[permissions]
+read = "#8E7650"
+write = "#FFD35A"
+execute = "#FF8C00"
+file_type = "#F4E4BE"
+missing = "#5A472D"
+special = "#FFF05A"
+
+[icons]
+directory = "#7CFF3A"
+symlink = "#00E8D2"
+rust = "#FF5E2E"
+python = "#3F9DFF"
+shell = "#28E878"
+source = "#6F7FFF"
+java = "#FF4E4E"
+javascript = "#FFF03A"
+web = "#FF42C8"
+config = "#00CFC0"
+archive = "#FF7A1F"
+document = "#F2E5C8"
+spreadsheet = "#35D95E"
+presentation = "#FF7A2E"
+image = "#FF3ADB"
+audio = "#4D82FF"
+video = "#9748FF"
+font = "#C16BFF"
+database = "#00BFB4"
+log = "#B59A6B"
+backup = "#B35CFF"
+certificate = "#FFE03A"
+disk_image = "#6E7DFF"
+torrent = "#32D98A"
+desktop_plugin = "#7B64FF"
+binary = "#E8D9B8"
+unknown = "#B69B6B"

@@ -1,0 +1,72 @@
+# Lush Emerald
+# Complete Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#2E8B73"
+directory = "#64D8A8"
+file = "#D6E4DB"
+symlink = "#73CFCB"
+muted = "#6E8178"
+error = "#E06B72"
+query = "#8BE6C2"
+search_match = "#B6E38C"
+classification = "#EEF7F1"
+date = "#7CCFA8"
+user = "#8C9C94"
+size = "#85DCC1"
+
+[frames]
+search = "#2FA889"
+details = "#3D9B78"
+metadata = "#6A9E62"
+entries = "#1F7D68"
+selection = "#7FB34D"
+popup = "#3AA17B"
+parent_brackets = "#2FA889"
+parent_text = "#C9F38D"
+
+[selection]
+text = "#F4FFF8"
+background = "#214B3E"
+
+[scrollbar]
+thumb = "#48B790"
+track = "#21342E"
+
+[permissions]
+read = "#70847A"
+write = "#63CFA6"
+execute = "#8BCF65"
+file_type = "#D0DED6"
+missing = "#42564D"
+special = "#D7E878"
+
+[icons]
+directory = "#9BD45A"
+symlink = "#69D3C7"
+rust = "#D98A5F"
+python = "#6EB5E8"
+shell = "#63C987"
+source = "#7D9DE0"
+java = "#D46C67"
+javascript = "#E3C85B"
+web = "#C87DC2"
+config = "#4FC2B2"
+archive = "#D99A5B"
+document = "#C7D5CD"
+spreadsheet = "#62C98A"
+presentation = "#DF945F"
+image = "#C97FC6"
+audio = "#6A9EDC"
+video = "#9A72D1"
+font = "#AE8CCD"
+database = "#4FB8B0"
+log = "#8D9D95"
+backup = "#9B7BB2"
+certificate = "#D9C46B"
+disk_image = "#7C94C8"
+torrent = "#67BE8E"
+desktop_plugin = "#8E7AC4"
+binary = "#BAC8C0"
+unknown = "#9BA9A1"

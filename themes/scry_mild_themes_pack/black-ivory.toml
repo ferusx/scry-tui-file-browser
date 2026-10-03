@@ -1,0 +1,72 @@
+# Black Ivory
+# Complete Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#B9B2A5"
+directory = "#C9C1B2"
+file = "#E4DED3"
+symlink = "#9CB8B3"
+muted = "#77736C"
+error = "#C96767"
+query = "#D4C69E"
+search_match = "#B59AB7"
+classification = "#F5F0E8"
+date = "#C7BBA4"
+user = "#918A7E"
+size = "#A8C2BC"
+
+[frames]
+search = "#AFA696"
+details = "#C2B7A2"
+metadata = "#948E84"
+entries = "#827B70"
+selection = "#AAA28F"
+popup = "#B8AFA0"
+parent_brackets = "#B8AFA0"
+parent_text = "#E0C66E"
+
+[selection]
+text = "#FFFDF7"
+background = "#383530"
+
+[scrollbar]
+thumb = "#A9A092"
+track = "#242321"
+
+[permissions]
+read = "#77736C"
+write = "#C9BFAE"
+execute = "#A99C88"
+file_type = "#DDD6CB"
+missing = "#4A4843"
+special = "#D8C36D"
+
+[icons]
+directory = "#D4C25D"
+symlink = "#9CB8B3"
+rust = "#C77B5D"
+python = "#849FC4"
+shell = "#7CA587"
+source = "#8A94AF"
+java = "#BE6D67"
+javascript = "#D0B85D"
+web = "#A97F9F"
+config = "#7EA8A2"
+archive = "#C18B5F"
+document = "#D1CAC0"
+spreadsheet = "#7FA384"
+presentation = "#C28B64"
+image = "#AA82A2"
+audio = "#8195B7"
+video = "#947AAE"
+font = "#A691B5"
+database = "#789F9C"
+log = "#8B867D"
+backup = "#927B8F"
+certificate = "#CCB65F"
+disk_image = "#858FA7"
+torrent = "#7B9C84"
+desktop_plugin = "#877CA4"
+binary = "#C6BFB5"
+unknown = "#9A948A"

@@ -1,0 +1,72 @@
+# Violet Supernova
+# Strong-color Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#8A2CFF"
+directory = "#7A8CFF"
+file = "#F0E8FF"
+symlink = "#00F0D0"
+muted = "#756686"
+error = "#FF3F6A"
+query = "#C05CFF"
+search_match = "#FF56C8"
+classification = "#FFFFFF"
+date = "#8EA0FF"
+user = "#9586A6"
+size = "#36EAD6"
+
+[frames]
+search = "#A53DFF"
+details = "#7A2CFF"
+metadata = "#5E4BFF"
+entries = "#5B00D6"
+selection = "#CA4DFF"
+popup = "#8A2CFF"
+parent_brackets = "#8A2CFF"
+parent_text = "#FFE74A"
+
+[selection]
+text = "#FFFFFF"
+background = "#4A1E75"
+
+[scrollbar]
+thumb = "#9B3CFF"
+track = "#2D1740"
+
+[permissions]
+read = "#756686"
+write = "#7A8CFF"
+execute = "#CA4DFF"
+file_type = "#E8DDF5"
+missing = "#493A57"
+special = "#FFE74A"
+
+[icons]
+directory = "#D8FF3B"
+symlink = "#00F0D0"
+rust = "#FF6B3C"
+python = "#408FFF"
+shell = "#2BE87D"
+source = "#6E7CFF"
+java = "#FF4E67"
+javascript = "#FFE33D"
+web = "#FF36C8"
+config = "#00CEC0"
+archive = "#FF913D"
+document = "#E6D9F1"
+spreadsheet = "#32D96A"
+presentation = "#FF7E3D"
+image = "#FF37E1"
+audio = "#4B74FF"
+video = "#A73BFF"
+font = "#C56BFF"
+database = "#00BFB8"
+log = "#A699B3"
+backup = "#CF4DFF"
+certificate = "#FFD93D"
+disk_image = "#786CFF"
+torrent = "#2FD987"
+desktop_plugin = "#8C5CFF"
+binary = "#D8CBE5"
+unknown = "#AA9AB8"

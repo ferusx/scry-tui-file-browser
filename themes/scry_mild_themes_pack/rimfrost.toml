@@ -1,0 +1,72 @@
+# Rimfrost
+# Complete Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#9BC7D9"
+directory = "#8FD3F4"
+file = "#DCEAF0"
+symlink = "#9BE7E1"
+muted = "#7E96A2"
+error = "#E98592"
+query = "#B0F0EE"
+search_match = "#C9A7E8"
+classification = "#F6FBFD"
+date = "#A6D9EE"
+user = "#94A7B0"
+size = "#A4E4E2"
+
+[frames]
+search = "#83D6D3"
+details = "#88BEE4"
+metadata = "#A8BED0"
+entries = "#9EAFE8"
+selection = "#A8D6C3"
+popup = "#A1CFE3"
+parent_brackets = "#A1CFE3"
+parent_text = "#F0F7A8"
+
+[selection]
+text = "#FFFFFF"
+background = "#495971"
+
+[scrollbar]
+thumb = "#B0C5F0"
+track = "#34404C"
+
+[permissions]
+read = "#7F98A4"
+write = "#8FD3F4"
+execute = "#C1A7EC"
+file_type = "#D9E7ED"
+missing = "#566B75"
+special = "#F0E59A"
+
+[icons]
+directory = "#B7EB7A"
+symlink = "#9BE7E1"
+rust = "#E99A70"
+python = "#8BC8EF"
+shell = "#87D6A1"
+source = "#9EADEB"
+java = "#E48685"
+javascript = "#F0DB7A"
+web = "#D69BCF"
+config = "#8ED7D4"
+archive = "#E6AA79"
+document = "#D4E2E8"
+spreadsheet = "#83D39B"
+presentation = "#E9A67E"
+image = "#D69BD3"
+audio = "#8FB5E8"
+video = "#B28DDB"
+font = "#C2A6E3"
+database = "#85CFCF"
+log = "#A7B7BF"
+backup = "#B69CC6"
+certificate = "#E8D77F"
+disk_image = "#9FAFDA"
+torrent = "#8CC9A4"
+desktop_plugin = "#A69AD9"
+binary = "#C9D8DE"
+unknown = "#AABBC3"

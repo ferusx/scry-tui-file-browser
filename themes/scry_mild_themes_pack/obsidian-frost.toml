@@ -1,0 +1,72 @@
+# Obsidian Frost
+# Complete Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#6E7E95"
+directory = "#78B9D6"
+file = "#C9D4DC"
+symlink = "#72D0C8"
+muted = "#687582"
+error = "#DF6674"
+query = "#86DAD5"
+search_match = "#A78CD0"
+classification = "#E7EEF2"
+date = "#84BCD3"
+user = "#7F8B95"
+size = "#7FD0CD"
+
+[frames]
+search = "#5E8C9D"
+details = "#657BA0"
+metadata = "#75828D"
+entries = "#5C6888"
+selection = "#6A8C84"
+popup = "#70849B"
+parent_brackets = "#70849B"
+parent_text = "#BFEA8B"
+
+[selection]
+text = "#F5FAFC"
+background = "#2D3442"
+
+[scrollbar]
+thumb = "#778BA4"
+track = "#20262D"
+
+[permissions]
+read = "#6D7B87"
+write = "#78B9D6"
+execute = "#9B87C7"
+file_type = "#C3CED6"
+missing = "#414B54"
+special = "#D7CF74"
+
+[icons]
+directory = "#9CD95F"
+symlink = "#72D0C8"
+rust = "#D57D5D"
+python = "#76A9D5"
+shell = "#6DBD86"
+source = "#7F95C8"
+java = "#CE6769"
+javascript = "#D7C65E"
+web = "#B27CB6"
+config = "#68B8B2"
+archive = "#CB8B5C"
+document = "#BCC8CF"
+spreadsheet = "#67B97C"
+presentation = "#CF8A61"
+image = "#B77EC0"
+audio = "#7292C7"
+video = "#9674B8"
+font = "#A889C5"
+database = "#64B2AE"
+log = "#87939C"
+backup = "#92789D"
+certificate = "#D4BF68"
+disk_image = "#7E8FB5"
+torrent = "#6DA483"
+desktop_plugin = "#8276AD"
+binary = "#B3C0C8"
+unknown = "#8D9AA3"

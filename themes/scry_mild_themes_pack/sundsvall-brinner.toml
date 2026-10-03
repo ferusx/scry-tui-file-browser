@@ -1,0 +1,72 @@
+# Sundsvall Brinner
+# Complete Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#D24B35"
+directory = "#F29D49"
+file = "#E5D8CB"
+symlink = "#44C9B8"
+muted = "#8D746C"
+error = "#FF4B5F"
+query = "#F0B35D"
+search_match = "#E96F8E"
+classification = "#FFF0E2"
+date = "#F0A45A"
+user = "#A88C80"
+size = "#6CD6C4"
+
+[frames]
+search = "#E05B3B"
+details = "#F07A32"
+metadata = "#D99D35"
+entries = "#C9323F"
+selection = "#A8BE3F"
+popup = "#E1463E"
+parent_brackets = "#E1463E"
+parent_text = "#FFE064"
+
+[selection]
+text = "#FFF9EF"
+background = "#642537"
+
+[scrollbar]
+thumb = "#EE4F49"
+track = "#3C2825"
+
+[permissions]
+read = "#91786F"
+write = "#F0A45A"
+execute = "#E44D45"
+file_type = "#E0D2C6"
+missing = "#59433D"
+special = "#F4D34D"
+
+[icons]
+directory = "#B8D83D"
+symlink = "#44C9B8"
+rust = "#FF6B35"
+python = "#65AEE8"
+shell = "#62D47D"
+source = "#5F91E8"
+java = "#F14C58"
+javascript = "#FFD23F"
+web = "#EF59AA"
+config = "#39C7B4"
+archive = "#F08B2F"
+document = "#DDD0C4"
+spreadsheet = "#69D46F"
+presentation = "#FF8D3D"
+image = "#EA4FC5"
+audio = "#5D9FE5"
+video = "#9E5AE3"
+font = "#C180E3"
+database = "#30BEB5"
+log = "#9B8781"
+backup = "#B45D98"
+certificate = "#F4D13E"
+disk_image = "#738BD6"
+torrent = "#59C58A"
+desktop_plugin = "#8D6AD5"
+binary = "#CDC0B5"
+unknown = "#9F8E86"

@@ -1,0 +1,72 @@
+# Hellfire Cyan
+# Strong-color Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#00D9FF"
+directory = "#00B7FF"
+file = "#F0FBFF"
+symlink = "#00FFD0"
+muted = "#637985"
+error = "#FF2E48"
+query = "#00EFFF"
+search_match = "#FF4CC6"
+classification = "#FFFFFF"
+date = "#47C9FF"
+user = "#8296A1"
+size = "#00F0D6"
+
+[frames]
+search = "#00E6FF"
+details = "#FF5A1F"
+metadata = "#00B7FF"
+entries = "#E71B36"
+selection = "#A3DF00"
+popup = "#00D9FF"
+parent_brackets = "#00D9FF"
+parent_text = "#FFE84A"
+
+[selection]
+text = "#FFFFFF"
+background = "#5A1B32"
+
+[scrollbar]
+thumb = "#FF3550"
+track = "#332534"
+
+[permissions]
+read = "#637985"
+write = "#00B7FF"
+execute = "#FF5A1F"
+file_type = "#DCECF2"
+missing = "#3E505A"
+special = "#FFE84A"
+
+[icons]
+directory = "#D4FF31"
+symlink = "#00FFD0"
+rust = "#FF5B28"
+python = "#2F8EFF"
+shell = "#26E97A"
+source = "#5F75FF"
+java = "#FF3F59"
+javascript = "#FFE72E"
+web = "#FF2FC6"
+config = "#00D0C0"
+archive = "#FF7C2A"
+document = "#D9E9EF"
+spreadsheet = "#27D95F"
+presentation = "#FF7031"
+image = "#FF2ADB"
+audio = "#3A6FFF"
+video = "#8D38FF"
+font = "#B65FFF"
+database = "#00BFB5"
+log = "#8E9EA7"
+backup = "#A94BFF"
+certificate = "#FFD82E"
+disk_image = "#6273FF"
+torrent = "#25D786"
+desktop_plugin = "#7257FF"
+binary = "#CEDDE4"
+unknown = "#96A8B1"

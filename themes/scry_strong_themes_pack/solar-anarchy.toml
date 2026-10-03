@@ -1,0 +1,72 @@
+# Solar Anarchy
+# Strong-color Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#FF5A00"
+directory = "#FFD43B"
+file = "#FFF3E8"
+symlink = "#00FFD1"
+muted = "#8F6A55"
+error = "#FF2D55"
+query = "#FFF04D"
+search_match = "#FF4FC3"
+classification = "#FFFFFF"
+date = "#FFCF5A"
+user = "#A77B63"
+size = "#4FF0D8"
+
+[frames]
+search = "#FF7A00"
+details = "#FF3D00"
+metadata = "#FFB000"
+entries = "#D41A00"
+selection = "#A6E000"
+popup = "#FF5A00"
+parent_brackets = "#FF5A00"
+parent_text = "#FFF04D"
+
+[selection]
+text = "#FFFFFF"
+background = "#6E1E12"
+
+[scrollbar]
+thumb = "#FF4A00"
+track = "#4A1D10"
+
+[permissions]
+read = "#8F6A55"
+write = "#FFD43B"
+execute = "#FF5A00"
+file_type = "#F0DFD3"
+missing = "#5A3D2D"
+special = "#FFF04D"
+
+[icons]
+directory = "#9BFF2E"
+symlink = "#00FFD1"
+rust = "#FF4A21"
+python = "#3195FF"
+shell = "#27E87A"
+source = "#647EFF"
+java = "#FF3F55"
+javascript = "#FFE92E"
+web = "#FF35B8"
+config = "#00D0C0"
+archive = "#FF7A1F"
+document = "#F0E1D7"
+spreadsheet = "#2BD95E"
+presentation = "#FF742E"
+image = "#FF2FD5"
+audio = "#3E7CFF"
+video = "#8F3CFF"
+font = "#BD64FF"
+database = "#00BFB2"
+log = "#AF866F"
+backup = "#A852FF"
+certificate = "#FFDD2E"
+disk_image = "#6579FF"
+torrent = "#28D784"
+desktop_plugin = "#735BFF"
+binary = "#E3D1C5"
+unknown = "#B38A72"

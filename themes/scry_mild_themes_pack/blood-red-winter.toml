@@ -1,0 +1,72 @@
+# Blood Red Winter
+# Complete Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#9C3142"
+directory = "#9EC6E8"
+file = "#D9E1E8"
+symlink = "#74D1CC"
+muted = "#73808A"
+error = "#F04C5E"
+query = "#A7D9E7"
+search_match = "#D1749C"
+classification = "#F3F7FA"
+date = "#A6CBE4"
+user = "#8B969E"
+size = "#87D2CF"
+
+[frames]
+search = "#7AA8C0"
+details = "#A74755"
+metadata = "#7F8FA1"
+entries = "#A52D43"
+selection = "#98A8BA"
+popup = "#B2374B"
+parent_brackets = "#B2374B"
+parent_text = "#EAD85E"
+
+[selection]
+text = "#FFFFFF"
+background = "#542638"
+
+[scrollbar]
+thumb = "#B93C52"
+track = "#2E2730"
+
+[permissions]
+read = "#74828C"
+write = "#9EC6E8"
+execute = "#C24C64"
+file_type = "#D4DDE4"
+missing = "#48535B"
+special = "#E6D261"
+
+[icons]
+directory = "#C7D84E"
+symlink = "#74D1CC"
+rust = "#E07658"
+python = "#84B6E2"
+shell = "#7BC596"
+source = "#8299D2"
+java = "#D95E69"
+javascript = "#E6CF55"
+web = "#CD70B0"
+config = "#69C4BC"
+archive = "#D98B5A"
+document = "#CFD8DF"
+spreadsheet = "#73C186"
+presentation = "#DD8B63"
+image = "#CA73BF"
+audio = "#7B9ED6"
+video = "#9B71C7"
+font = "#B18ACF"
+database = "#66BCB8"
+log = "#929DA5"
+backup = "#A278A4"
+certificate = "#DEC85D"
+disk_image = "#8494C2"
+torrent = "#73B08A"
+desktop_plugin = "#8F79BA"
+binary = "#C1CCD3"
+unknown = "#9AA6AE"

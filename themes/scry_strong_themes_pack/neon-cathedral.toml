@@ -1,0 +1,72 @@
+# Neon Cathedral
+# Strong-color Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#B000FF"
+directory = "#4FC3FF"
+file = "#F4ECFF"
+symlink = "#00FFD0"
+muted = "#756A87"
+error = "#FF3B6B"
+query = "#FF4FE1"
+search_match = "#7E5CFF"
+classification = "#FFFFFF"
+date = "#56C7FF"
+user = "#9B8EAB"
+size = "#00F0D8"
+
+[frames]
+search = "#FF2CC3"
+details = "#9B00FF"
+metadata = "#4C35FF"
+entries = "#6E00D9"
+selection = "#00C989"
+popup = "#B000FF"
+parent_brackets = "#B000FF"
+parent_text = "#FFE04B"
+
+[selection]
+text = "#FFFFFF"
+background = "#4C176E"
+
+[scrollbar]
+thumb = "#D13CFF"
+track = "#2A123A"
+
+[permissions]
+read = "#756A87"
+write = "#4FC3FF"
+execute = "#FF4FE1"
+file_type = "#E9DDF5"
+missing = "#493D58"
+special = "#FFE04B"
+
+[icons]
+directory = "#D7FF3F"
+symlink = "#00FFD0"
+rust = "#FF6E3D"
+python = "#3E9CFF"
+shell = "#31E985"
+source = "#6E7DFF"
+java = "#FF4F6D"
+javascript = "#FFE43A"
+web = "#FF2FCF"
+config = "#00D7C7"
+archive = "#FF9A3D"
+document = "#E9DDF5"
+spreadsheet = "#2BDB72"
+presentation = "#FF8B3D"
+image = "#FF3DEB"
+audio = "#4F79FF"
+video = "#A73CFF"
+font = "#C86DFF"
+database = "#00C5BE"
+log = "#A99DB6"
+backup = "#D04DFF"
+certificate = "#FFD93D"
+disk_image = "#7A72FF"
+torrent = "#33E58A"
+desktop_plugin = "#8F5CFF"
+binary = "#D7CCDF"
+unknown = "#A798B3"

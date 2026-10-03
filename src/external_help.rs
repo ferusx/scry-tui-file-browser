@@ -194,6 +194,12 @@ pub fn print_console_config() -> io::Result<()> {
 pub fn print_console_config() -> io::Result<()> {
     let mut output = io::stdout().lock();
 
+    let os_name = if cfg!(target_os = "openbsd") {
+        "OpenBSD"
+    } else {
+        "NetBSD"
+    };
+
     writeln!(
         output,
         "Scry does not support the {} physical console.",

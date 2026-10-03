@@ -1,0 +1,72 @@
+# Midnight Commander
+# Strong-color Scry theme
+# Colors use hexadecimal #RRGGBB notation.
+
+[ui]
+frame = "#00A6FF"
+directory = "#35C8FF"
+file = "#F2F4F7"
+symlink = "#00FFD5"
+muted = "#7A8B9A"
+error = "#FF4D6D"
+query = "#00E5FF"
+search_match = "#FF67D8"
+classification = "#FFFFFF"
+date = "#6FD2FF"
+user = "#A7B2BC"
+size = "#42F5E9"
+
+[frames]
+search = "#00B7FF"
+details = "#008CFF"
+metadata = "#00D4C7"
+entries = "#005DFF"
+selection = "#00D27A"
+popup = "#00A6FF"
+parent_brackets = "#00A6FF"
+parent_text = "#FFE75A"
+
+[selection]
+text = "#FFFFFF"
+background = "#173A7A"
+
+[scrollbar]
+thumb = "#00A6FF"
+track = "#16324A"
+
+[permissions]
+read = "#7C8B96"
+write = "#35C8FF"
+execute = "#00D27A"
+file_type = "#E6EDF3"
+missing = "#435563"
+special = "#FFE75A"
+
+[icons]
+directory = "#FFD43B"
+symlink = "#00FFD5"
+rust = "#FF7A3D"
+python = "#41A8FF"
+shell = "#31E981"
+source = "#6D8BFF"
+java = "#FF5C5C"
+javascript = "#FFE04A"
+web = "#FF4ED2"
+config = "#00D4C7"
+archive = "#FF9E3D"
+document = "#E6EDF3"
+spreadsheet = "#2FE074"
+presentation = "#FF8A3D"
+image = "#F84DFF"
+audio = "#4B8BFF"
+video = "#9D4DFF"
+font = "#C47BFF"
+database = "#00C7C7"
+log = "#AEB8C2"
+backup = "#C45CFF"
+certificate = "#FFD93D"
+disk_image = "#7289DA"
+torrent = "#39E58C"
+desktop_plugin = "#8E6BFF"
+binary = "#DDE6EE"
+unknown = "#B7C1CA"
