@@ -994,7 +994,21 @@ prevent the application from starting. In such an event, the application will st
 
 Users can create their own Scry themes by copying one of the existing theme files, renaming the copy, and changing its color values. Starting from an existing theme is recommended because it shows the complete set of available color settings and provides a ready-made example of the expected structure.
 
+### Where to find the installed themes
+
+Packaged installations place **Scry's** themes in the system data directory used by the operating system:
+
+Linux: `/usr/share/scry/themes/`
+
+OpenBSD and FreeBSD: `/usr/Local/share/scry/themes/`
+
+NetBSD: `/usr/pkg/share/scry/themes/`
+
 Custom themes should be placed in `~/.config/scry/themes` and can then be selected with the top-level theme setting in `scry.toml`.
+
+When `XDG_CONFIG_HOME` is set, the personal theme directory is:
+
+`$XDG_CONFIG_HOME/scry/themes/`
 
 ## Acknowledgements
 
